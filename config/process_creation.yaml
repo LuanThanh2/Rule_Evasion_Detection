@@ -1,0 +1,33 @@
+# Configuration for Process Creation event type experiments
+# Paths are relative to the project root (rule_evasion_detection/)
+
+data:
+  benign_train: ~/data/benign/process_creation/benign_train.txt
+  benign_valid: ~/data/benign/process_creation/benign_train.txt  # dùng tạm cùng file khi chưa có valid set
+  benign_field: process.command_line
+  events_dir: ~/data/sigma/events_hayabusa/windows/process_creation
+  rules_dir: ~/data/sigma/rules/windows/process_creation
+  search_fields:
+    - process.command_line
+
+training:
+  malicious_samples: matches          # rule_filters | matches
+  vectorization: tfidf               # tfidf | count | hashing | binary_count | scaled_count
+  ngram_range: [1, 1]                # unigrams
+  search_params: true                # use GridSearchCV
+  scoring: f1                        # f1 | mcc
+  cv_folds: 5
+  num_jobs: 3
+
+scaling:
+  mcc_scaling: true
+  mcc_threshold: 0.1
+  num_mcc_samples: 50
+
+evaluation:
+  num_thresholds: 50
+
+output:
+  dir: models/process_creation
+  result_name: misuse_svc_rules_f1
+  attr_result_name: attr_svc_rules

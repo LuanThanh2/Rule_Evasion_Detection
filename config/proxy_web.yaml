@@ -1,0 +1,32 @@
+# Configuration for Proxy Web event type experiments
+
+data:
+  benign_train: data/benign/proxy_web/train.txt
+  benign_valid: data/benign/proxy_web/valid.txt
+  benign_field: url
+  events_dir: data/sigma/events_hayabusa/windows/proxy_web
+  rules_dir: data/sigma/rules/windows/proxy_web
+  search_fields:
+    - url
+
+training:
+  malicious_samples: matches
+  vectorization: tfidf
+  ngram_range: [1, 1]
+  search_params: true
+  scoring: f1
+  cv_folds: 5
+  num_jobs: 3
+
+scaling:
+  mcc_scaling: true
+  mcc_threshold: 0.1
+  num_mcc_samples: 50
+
+evaluation:
+  num_thresholds: 50
+
+output:
+  dir: models/proxy_web
+  result_name: misuse_svc_rules_f1
+  attr_result_name: attr_svc_rules

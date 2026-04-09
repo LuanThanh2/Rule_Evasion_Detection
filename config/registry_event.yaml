@@ -1,0 +1,32 @@
+# Configuration for Registry Event type experiments
+
+data:
+  benign_train: ~/data/benign/registry_event/benign_train.txt
+  benign_valid: ~/data/benign/registry_event/benign_train.txt
+  benign_field: winlog.event_data.TargetObject
+  events_dir: ~/data/sigma/events_hayabusa/windows/registry_event
+  rules_dir: ~/data/sigma/rules/windows/registry_event
+  search_fields:
+    - winlog.event_data.TargetObject
+
+training:
+  malicious_samples: matches
+  vectorization: tfidf
+  ngram_range: [1, 1]
+  search_params: true
+  scoring: f1
+  cv_folds: 5
+  num_jobs: 3
+
+scaling:
+  mcc_scaling: true
+  mcc_threshold: 0.1
+  num_mcc_samples: 50
+
+evaluation:
+  num_thresholds: 50
+
+output:
+  dir: models/registry_event
+  result_name: misuse_svc_rules_f1
+  attr_result_name: attr_svc_rules

@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""Validate a trained misuse classification model.
+
+Loads a TrainingResult, applies the feature extractor to validation data
+(benign + evasions), and computes decision_function values.
+
+Pipeline:
+  1. Load TrainingResult from .zip
+  2. Load benign validation samples + evasion events
+  3. Transform using saved vectorizer
+  4. Calculate decision_function values
+  5. Save ValidationResult (.zip)
+
+Usage:
+  python scripts/validate.py --config config/process_creation.yaml
+  python scripts/validate.py --result-path models/train_rslt_*.zip \\
+                             --benign-samples ../data/socbed/.../validation \\
+                             --events-dir ... --rules-dir ...
+"""
+
+import os
+import sys
+import argparse
+import logging
+import numpy as np
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from red.data import (
+    load_rule_set,
+    benign_samples_iter,
+    count_benign_samples,
+    extract_commandlines,
+    get_all_evasions,
+    get_all_matches,
+    create_labels,
+)
+from red.normalize import normalize_samples
+from red.persist import load_result, save_result
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+logger = logging.getLogger("validate")
+
+
+def validation_samples_iter(benign_path, malicious_samples):
+    """Yield validation samples: benign first, then malicious."""
+    for sample in benign_samples_iter(benign_path):
+        yield sample
+    for sample in malicious_samples:
+        yield sample
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Validate misuse classification model")
+    parser.add_argument("--config", type=str, help="Path to YAML config file")
+    parser.add_argument("--result-path", type=str, help="Path to TrainingResult .zip")
+    parser.add_argument("--benign-samples", type=str, help="Path to benign validation samples")
+    parser.add_argument("--events-dir", type=str, help="Path to events directory")
+    parser.add_argument("--rules-dir", type=str, help="Path to rules directory")
+    parser.add_argument("--malicious-type", type=str, default="evasions",
+                        choices=["evasions", "matches"])
+    parser.add_argument("--out-dir", type=str, default="models")
+    parser.add_argument("--result-name", type=str)
+    args = parser.parse_args()
+
+    # Load config if provided
+    if args.config:
+        import yaml
+        with open(args.config, "r") as f:
+            cfg = yaml.safe_load(f)
+        data_cfg = cfg.get("data", {})
+        out_cfg = cfg.get("output", {})
+        args.benign_samples = args.benign_samples or data_cfg.get("benign_valid")
+        args.events_dir = args.events_dir or data_cfg.get("events_dir")
+        args.rules_dir = args.rules_dir or data_cfg.get("rules_dir")
+        args.out_dir = out_cfg.get("dir", args.out_dir)
+        if not args.result_path:
+            args.result_path = out_cfg.get("train_result_path")
+
+    if not args.result_path:
+        parser.error("--result-path is required")
+    if not args.benign_samples or not args.events_dir or not args.rules_dir:
+        parser.error("--benign-samples, --events-dir, and --rules-dir are required")
+
+    # ── Step 1: Load TrainingResult ──
+    logger.info("Loading training result from %s", args.result_path)
+    train_result = load_result(args.result_path)
+    estimator = train_result["estimator"]
+    vectorizer = train_result["vectorizer"]
+
+    # ── Step 2: Load validation data ──
+    logger.info("Loading rule set data...")
+    rule_set = load_rule_set(args.events_dir, args.rules_dir)
+
+    if args.malicious_type == "evasions":
+        events = get_all_evasions(rule_set)
+    else:
+        events = get_all_matches(rule_set)
+
+    malicious_samples = extract_commandlines(events)
+    malicious_normalized = normalize_samples(malicious_samples)
+
+    num_benign = count_benign_samples(args.benign_samples)
+    logger.info(
+        "Validation data: %d benign + %d %s",
+        num_benign, len(malicious_normalized), args.malicious_type,
+    )
+
+    # ── Step 3: Transform validation data ──
+    logger.info("Transforming validation data...")
+    feature_vectors = vectorizer.transform(
+        validation_samples_iter(args.benign_samples, malicious_normalized)
+    )
+    labels = create_labels(num_benign, len(malicious_normalized))
+
+    # ── Step 4: Calculate decision function values ──
+    logger.info("Calculating decision function values...")
+    df_values = estimator.decision_function(feature_vectors)
+
+    logger.info(
+        "Decision function: min=%.4f, max=%.4f, mean=%.4f",
+        df_values.min(), df_values.max(), df_values.mean(),
+    )
+
+    # ── Step 5: Save ValidationResult ──
+    result_name = args.result_name or train_result.get("config", {}).get("result_name", "model")
+    valid_result = {
+        "estimator": estimator,
+        "vectorizer": vectorizer,
+        "scaler": train_result.get("scaler"),
+        "shift": train_result.get("shift", 0.0),
+        "predict": df_values,
+        "labels": labels,
+        "num_benign": num_benign,
+        "num_malicious": len(malicious_normalized),
+        "config": train_result.get("config", {}),
+    }
+
+    info = {
+        "result_name": result_name,
+        "num_benign": num_benign,
+        "num_malicious": len(malicious_normalized),
+        "df_min": float(df_values.min()),
+        "df_max": float(df_values.max()),
+        "df_mean": float(df_values.mean()),
+    }
+
+    save_result(valid_result, f"valid_rslt_{result_name}", args.out_dir, info=info)
+    logger.info("Validation complete.")
+
+
+if __name__ == "__main__":
+    main()
