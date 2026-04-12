@@ -1,16 +1,19 @@
 # Configuration for Proxy Web event type experiments
 
 data:
-  benign_train: data/benign/proxy_web/train.txt
-  benign_valid: data/benign/proxy_web/valid.txt
+  benign_train: ~/data/benign/proxy_web/benign_train.txt
   benign_field: url
-  events_dir: data/sigma/events_hayabusa/windows/proxy_web
-  rules_dir: data/sigma/rules/windows/proxy_web
+  events_dir: ~/data/sigma/events_hayabusa/windows/proxy_web
+  rules_dir: ~/data/sigma/rules/proxyweb/proxy_generic
   search_fields:
     - url
+    - c-uri
+    - cs-uri-stem
+    - cs-uri-query
+  max_benign_samples: 10000
 
 training:
-  malicious_samples: matches
+  malicious_samples: rule_filters
   vectorization: tfidf
   ngram_range: [1, 1]
   search_params: true

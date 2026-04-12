@@ -33,9 +33,10 @@ logger = logging.getLogger(__name__)
 class RuleData:
     """Holds data for a single Sigma rule."""
     name: str
-    filters: list = field(default_factory=list)      # raw filter strings from YAML
-    matches: list = field(default_factory=list)       # match event dicts
-    evasions: list = field(default_factory=list)      # evasion event dicts
+    filters: list = field(default_factory=list)       # AMIDES filter strings from YAML
+    matches: list = field(default_factory=list)        # match event dicts
+    evasions: list = field(default_factory=list)       # evasion event dicts
+    sigma_values: list = field(default_factory=list)   # values extracted from raw Sigma detection
 
 
 # ---------------------------------------------------------------------------
@@ -169,14 +170,29 @@ def load_benign_samples(path: str, field: Optional[str] = None) -> List[str]:
     return samples
 
 
-def benign_samples_iter(path: str, field: Optional[str] = None):
-    """Yield benign samples one at a time (memory efficient, auto-detects format)."""
-    yield from _iter_benign_file(path, field)
+def benign_samples_iter(path: str, field: Optional[str] = None, max_samples: Optional[int] = None):
+    """Yield benign samples one at a time (memory efficient, auto-detects format).
+
+    Parameters
+    ----------
+    max_samples : int, optional
+        Cap the number of samples yielded. Useful when benign data is very large
+        (e.g., 1.5M URLs) and would cause OOM in SVM training.
+    """
+    count = 0
+    for sample in _iter_benign_file(path, field):
+        yield sample
+        count += 1
+        if max_samples and count >= max_samples:
+            break
 
 
-def count_benign_samples(path: str, field: Optional[str] = None) -> int:
+def count_benign_samples(path: str, field: Optional[str] = None, max_samples: Optional[int] = None) -> int:
     """Count benign samples without loading all into memory."""
-    return sum(1 for _ in _iter_benign_file(path, field))
+    count = sum(1 for _ in _iter_benign_file(path, field))
+    if max_samples:
+        return min(count, max_samples)
+    return count
 
 
 # ---------------------------------------------------------------------------
@@ -324,73 +340,117 @@ MATCH_REGEX = re.compile(r"^.+_Match_\d+\.json$")
 EVASION_REGEX = re.compile(r"^.+_Evasion_.+_\d+\.json$")
 
 
-def load_rule_set(events_dir: str, rules_dir: str) -> Dict[str, RuleData]:
+def load_rule_set(events_dir: str, rules_dir: str,
+                  evasions_dir: Optional[str] = None) -> Dict[str, RuleData]:
     """Load a complete rule set from events and rules directories.
 
     Parameters
     ----------
     events_dir : str
-        Path to directory containing per-rule subdirectories with
-        JSON match/evasion files and properties.yml.
+        Path to directory containing per-rule subdirectories with match JSON files.
     rules_dir : str
         Path to directory containing per-rule YAML files.
+    evasions_dir : str, optional
+        Separate directory for evasion JSON files (mirrors events_dir structure).
+        If None, evasions are loaded from events_dir (legacy AMIDES layout).
 
     Returns
     -------
     dict of str → RuleData
         Mapping from rule name to its data.
     """
+    # Pre-build a map: stem → full path for all YAMLs under rules_dir (recursive)
+    yaml_map: Dict[str, str] = {}
+    if os.path.isdir(rules_dir):
+        for dirpath, _, filenames in os.walk(rules_dir):
+            for fname in filenames:
+                if fname.endswith(".yml"):
+                    stem = fname[:-4]
+                    yaml_map[stem] = os.path.join(dirpath, fname)
+
     rule_set = {}
 
-    if not os.path.isdir(events_dir):
-        raise FileNotFoundError(f"Events directory not found: {events_dir}")
+    events_dir_exists = os.path.isdir(events_dir) if events_dir else False
 
-    for rule_dir_name in sorted(os.listdir(events_dir)):
-        rule_events_path = os.path.join(events_dir, rule_dir_name)
-        if not os.path.isdir(rule_events_path):
-            continue
+    if events_dir_exists:
+        # Normal mode: discover rules from events_dir subdirectories
+        rule_names = sorted(
+            d for d in os.listdir(events_dir)
+            if os.path.isdir(os.path.join(events_dir, d))
+        )
+        for rule_dir_name in rule_names:
+            rule_events_path = os.path.join(events_dir, rule_dir_name)
+            rule_yaml_path = yaml_map.get(rule_dir_name, os.path.join(rules_dir, f"{rule_dir_name}.yml"))
+            rule_evasions_path = (
+                os.path.join(evasions_dir, rule_dir_name)
+                if evasions_dir and os.path.isdir(os.path.join(evasions_dir, rule_dir_name))
+                else None
+            )
+            try:
+                rule_data = _load_single_rule(
+                    rule_dir_name, rule_events_path, rule_yaml_path,
+                    evasions_path=rule_evasions_path,
+                )
+                if rule_data is not None:
+                    rule_set[rule_data.name] = rule_data
+            except Exception as e:
+                logger.warning("Skipping rule %s: %s", rule_dir_name, e)
+        logger.info("Loaded %d rules from %s", len(rule_set), events_dir)
+    else:
+        # rule_filters-only mode: discover rules from rules_dir YAML files
+        if not os.path.isdir(rules_dir):
+            raise FileNotFoundError(
+                f"Neither events_dir ({events_dir}) nor rules_dir ({rules_dir}) found"
+            )
+        logger.info("events_dir not found — loading rules from rules_dir only: %s", rules_dir)
+        for rule_dir_name, rule_yaml_path in sorted(yaml_map.items()):
+            try:
+                rule_data = _load_single_rule_from_yaml(rule_dir_name, rule_yaml_path)
+                if rule_data is not None:
+                    rule_set[rule_data.name] = rule_data
+            except Exception as e:
+                logger.warning("Skipping rule %s: %s", rule_dir_name, e)
+        logger.info("Loaded %d rules from %s", len(rule_set), rules_dir)
 
-        rule_yaml_path = os.path.join(rules_dir, f"{rule_dir_name}.yml")
-        try:
-            rule_data = _load_single_rule(rule_dir_name, rule_events_path, rule_yaml_path)
-            if rule_data is not None:
-                rule_set[rule_data.name] = rule_data
-        except Exception as e:
-            logger.warning("Skipping rule %s: %s", rule_dir_name, e)
-
-    logger.info(
-        "Loaded %d rules from %s", len(rule_set), events_dir
-    )
     return rule_set
 
 
-def _load_single_rule(
-    dir_name: str, events_path: str, rule_yaml_path: str
-) -> Optional[RuleData]:
-    """Load matches, evasions, and rule filter for a single rule."""
-    rule_data = RuleData(name=dir_name)
-
-    # Load matches and evasions from JSON files
-    for fname in sorted(os.listdir(events_path)):
-        if fname == "properties.yml":
-            continue
-        fpath = os.path.join(events_path, fname)
+def _load_json_events(path: str, rule_data: "RuleData"):
+    """Load match and evasion JSON files from a directory into rule_data."""
+    if not path or not os.path.isdir(path):
+        return
+    for fname in sorted(os.listdir(path)):
         if not fname.endswith(".json"):
             continue
-
+        fpath = os.path.join(path, fname)
         try:
             with open(fpath, "r", encoding="utf-8") as f:
                 event = json.load(f)
         except (json.JSONDecodeError, IOError) as e:
             logger.debug("Skipping %s: %s", fpath, e)
             continue
-
         if MATCH_REGEX.match(fname):
             if isinstance(event, dict):
                 rule_data.matches.append(event)
         elif EVASION_REGEX.match(fname):
             if isinstance(event, dict):
                 rule_data.evasions.append(event)
+
+
+def _load_single_rule(
+    dir_name: str, events_path: str, rule_yaml_path: str,
+    evasions_path: Optional[str] = None,
+) -> Optional[RuleData]:
+    """Load matches, evasions, and rule filter for a single rule."""
+    rule_data = RuleData(name=dir_name)
+
+    # Load matches from events_path (always)
+    _load_json_events(events_path, rule_data)
+
+    # Load evasions from separate dir if provided, else from events_path
+    if evasions_path:
+        _load_json_events(evasions_path, rule_data)
+    # (if evasions_path is None, evasions from events_path already loaded above)
 
     # Load rule filter from YAML
     if os.path.isfile(rule_yaml_path):
@@ -419,6 +479,68 @@ def _load_single_rule(
     return rule_data
 
 
+def _extract_sigma_detection_values(detection: dict, search_fields: set) -> list:
+    """Extract string values from a raw Sigma detection block for matching fields.
+
+    Handles field specs like 'c-uri|contains', 'url|startswith', 'cs-uri-stem', etc.
+    Skips the 'condition' key. Works recursively for nested groups.
+    """
+    values = []
+    if not isinstance(detection, dict):
+        return values
+    for key, content in detection.items():
+        if key == "condition":
+            continue
+        if isinstance(content, dict):
+            # Named group: {field_spec: value, ...}
+            for field_spec, field_value in content.items():
+                field_name = field_spec.split("|")[0]
+                if field_name not in search_fields:
+                    continue
+                if isinstance(field_value, str):
+                    values.append(field_value)
+                elif isinstance(field_value, list):
+                    values.extend(v for v in field_value if isinstance(v, str))
+        elif isinstance(content, list):
+            # List of sub-groups or keywords — recurse each dict
+            for item in content:
+                if isinstance(item, dict):
+                    values.extend(_extract_sigma_detection_values(item, search_fields))
+    return values
+
+
+def _load_single_rule_from_yaml(dir_name: str, rule_yaml_path: str) -> Optional[RuleData]:
+    """Load rule filter only (no match events) — used when events_dir is absent."""
+    rule_data = RuleData(name=dir_name)
+    if not os.path.isfile(rule_yaml_path):
+        return None
+    try:
+        with open(rule_yaml_path, "r", encoding="utf-8") as f:
+            rules_yaml = list(yaml.safe_load_all(f))
+        rules_list = []
+        for item in rules_yaml:
+            if isinstance(item, list):
+                rules_list.extend(item)
+            elif isinstance(item, dict):
+                rules_list.append(item)
+        for rule in rules_list:
+            if isinstance(rule, dict):
+                if "filter" in rule:
+                    rule_data.filters.append(rule["filter"])
+                if "pre_detector" in rule:
+                    title = rule["pre_detector"].get("title")
+                    if title:
+                        rule_data.name = title
+                # Store raw Sigma detection block for later field extraction
+                if "detection" in rule:
+                    rule_data.sigma_values.append(rule["detection"])  # stored as dict, extracted later
+                if "title" in rule:
+                    rule_data.name = rule["title"]
+    except Exception as e:
+        logger.debug("Could not load rule YAML %s: %s", rule_yaml_path, e)
+    return rule_data if (rule_data.filters or rule_data.sigma_values) else None
+
+
 # ---------------------------------------------------------------------------
 # High-level data preparation helpers
 # ---------------------------------------------------------------------------
@@ -429,15 +551,56 @@ def get_all_filter_values(
 ) -> List[str]:
     """Extract all filter field values across the entire rule set.
 
-    For each rule, parse its filter strings and extract values for the
-    given search fields. Results are wrapped as single-field event dicts.
+    Handles two formats:
+    - AMIDES filter strings (parsed via Luqum)
+    - Raw Sigma detection blocks (extracted by field name matching)
     """
     values = []
+    search_fields_set = set(search_fields)
     for rule_data in rule_set.values():
+        # AMIDES-format filter strings
         for filt in rule_data.filters:
             vals = extract_filter_values(filt, search_fields)
             values.extend(vals)
+        # Raw Sigma detection dicts
+        for detection in rule_data.sigma_values:
+            if isinstance(detection, dict):
+                vals = _extract_sigma_detection_values(detection, search_fields_set)
+                values.extend(vals)
     logger.info("Extracted %d filter values for fields %s", len(values), search_fields)
+    return values
+
+
+def get_all_yaml_filter_values(rules_dir: str, search_fields: List[str]) -> List[str]:
+    """Extract filter/detection values from ALL YAML files under rules_dir (recursive).
+
+    Used when rules_dir filenames don't match events_dir subdir names
+    (e.g., powershell: Hayabusa titles vs Sigma file stems).
+    """
+    values = []
+    search_fields_set = set(search_fields)
+    if not os.path.isdir(rules_dir):
+        return values
+    for dirpath, _, filenames in os.walk(rules_dir):
+        for fname in filenames:
+            if not fname.endswith(".yml"):
+                continue
+            fpath = os.path.join(dirpath, fname)
+            try:
+                with open(fpath, "r", encoding="utf-8") as f:
+                    docs = list(yaml.safe_load_all(f))
+                for doc in docs:
+                    if not isinstance(doc, dict):
+                        continue
+                    if "filter" in doc:
+                        vals = extract_filter_values(doc["filter"], search_fields)
+                        values.extend(vals)
+                    if "detection" in doc:
+                        vals = _extract_sigma_detection_values(doc["detection"], search_fields_set)
+                        values.extend(vals)
+            except Exception as e:
+                logger.debug("Skipping %s: %s", fpath, e)
+    logger.info("Extracted %d yaml filter values from %s", len(values), rules_dir)
     return values
 
 

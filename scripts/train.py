@@ -38,6 +38,7 @@ from red.data import (
     count_benign_samples,
     extract_commandlines,
     get_all_filter_values,
+    get_all_yaml_filter_values,
     get_all_matches,
     create_labels,
 )
@@ -57,23 +58,40 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 
-def create_malicious_samples(rule_set, malicious_type, search_fields):
+def create_malicious_samples(rule_set, malicious_type, search_fields, rules_dir=None, extra_path=None):
     """Create normalized malicious sample list from rule set."""
-    if malicious_type == "matches":
+    samples = []
+    if malicious_type in ("matches", "both"):
         events = get_all_matches(rule_set)
-        samples = extract_commandlines(events, search_fields)
-    else:  # rule_filters
-        samples = get_all_filter_values(rule_set, search_fields)
+        match_samples = extract_commandlines(events, search_fields)
+        logger.info("Match samples: %d", len(match_samples))
+        samples += match_samples
+    if malicious_type in ("rule_filters", "both"):
+        # Scan all YAMLs in rules_dir directly (bypass name-matching with events_dir)
+        filter_samples = get_all_yaml_filter_values(rules_dir, search_fields) if rules_dir else []
+        if not filter_samples:
+            # Fallback to rule_set-based extraction
+            filter_samples = get_all_filter_values(rule_set, search_fields)
+        logger.info("Rule filter samples: %d", len(filter_samples))
+        samples += filter_samples
 
+    # Load extra malicious samples from file (e.g. malicious .ps1 scripts)
+    if extra_path and os.path.isfile(extra_path):
+        with open(extra_path, "r", encoding="utf-8", errors="ignore") as f:
+            extra = [line.strip() for line in f if line.strip()]
+        logger.info("Extra malicious samples from file: %d", len(extra))
+        samples += extra
+
+    samples = list(set(samples))  # deduplicate
     logger.info("Raw malicious samples: %d (%s)", len(samples), malicious_type)
     normalized = normalize_samples(samples)
     logger.info("Normalized malicious samples: %d", len(normalized))
     return normalized
 
 
-def training_samples_iter(benign_path, malicious_samples, benign_field=None):
+def training_samples_iter(benign_path, malicious_samples, benign_field=None, max_benign=None):
     """Yield all training samples: benign first, then malicious."""
-    for sample in benign_samples_iter(benign_path, benign_field):
+    for sample in benign_samples_iter(benign_path, benign_field, max_samples=max_benign):
         yield sample
     for sample in malicious_samples:
         yield sample
@@ -87,7 +105,7 @@ def main():
     parser.add_argument("--rules-dir", type=str, help="Path to rules directory")
     parser.add_argument("--model-type", type=str, default="misuse", choices=["misuse"])
     parser.add_argument("--malicious-samples", type=str, default="rule_filters",
-                        choices=["rule_filters", "matches"])
+                        choices=["rule_filters", "matches", "both"])
     parser.add_argument("--search-fields", type=str, nargs="+",
                         default=["process.command_line"])
     parser.add_argument("--vectorization", type=str, default="tfidf",
@@ -101,6 +119,8 @@ def main():
     parser.add_argument("--model-params", type=str, help="JSON file with fixed SVC params")
     parser.add_argument("--benign-field", type=str, default=None,
                         help="Dot-separated field path to extract from JSON/CSV benign data")
+    parser.add_argument("--max-benign-samples", type=int, default=None,
+                        help="Cap number of benign training samples (useful for very large datasets)")
     parser.add_argument("--mcc-scaling", action="store_true", default=True)
     parser.add_argument("--mcc-threshold", type=float, default=0.1)
     parser.add_argument("--out-dir", type=str, default="models")
@@ -118,8 +138,11 @@ def main():
         args.benign_samples = args.benign_samples or data_cfg.get("benign_train")
         args.events_dir = args.events_dir or data_cfg.get("events_dir")
         args.rules_dir = args.rules_dir or data_cfg.get("rules_dir")
+        args.evasions_dir = data_cfg.get("evasions_dir")
         args.search_fields = data_cfg.get("search_fields", args.search_fields)
         args.benign_field = data_cfg.get("benign_field", None)
+        args.max_benign_samples = data_cfg.get("max_benign_samples", None)
+        args.malicious_extra = data_cfg.get("malicious_extra", None)
         args.malicious_samples = train_cfg.get("malicious_samples", args.malicious_samples)
         args.vectorization = train_cfg.get("vectorization", args.vectorization)
         args.search_params = train_cfg.get("search_params", args.search_params)
@@ -148,20 +171,26 @@ def main():
 
     # ── Step 1: Load data ──
     logger.info("Loading rule set data...")
-    rule_set = load_rule_set(args.events_dir, args.rules_dir)
+    evasions_dir = os.path.expanduser(getattr(args, "evasions_dir", None) or "")
+    evasions_dir = evasions_dir if os.path.isdir(evasions_dir) else None
+    rule_set = load_rule_set(args.events_dir, args.rules_dir, evasions_dir=evasions_dir)
 
     # ── Step 2: Create malicious samples ──
+    extra_path = os.path.expanduser(getattr(args, "malicious_extra", None) or "")
+    extra_path = extra_path if os.path.isfile(extra_path) else None
     malicious_samples = create_malicious_samples(
-        rule_set, args.malicious_samples, args.search_fields
+        rule_set, args.malicious_samples, args.search_fields,
+        rules_dir=args.rules_dir, extra_path=extra_path
     )
 
     # ── Step 3: Create vectorizer and transform ──
     logger.info("Fitting vectorizer (%s)...", args.vectorization)
     vectorizer = create_vectorizer(args.vectorization, ngram_range=ngram_range)
 
-    num_benign = count_benign_samples(args.benign_samples, args.benign_field)
+    max_benign = getattr(args, "max_benign_samples", None)
+    num_benign = count_benign_samples(args.benign_samples, args.benign_field, max_samples=max_benign)
     feature_vectors = vectorizer.fit_transform(
-        training_samples_iter(args.benign_samples, malicious_samples, args.benign_field)
+        training_samples_iter(args.benign_samples, malicious_samples, args.benign_field, max_benign=max_benign)
     )
     labels = create_labels(num_benign, len(malicious_samples))
 

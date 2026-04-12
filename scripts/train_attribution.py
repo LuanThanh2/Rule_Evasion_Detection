@@ -81,6 +81,7 @@ def main():
         args.benign_samples = args.benign_samples or data_cfg.get("benign_train")
         args.events_dir = args.events_dir or data_cfg.get("events_dir")
         args.rules_dir = args.rules_dir or data_cfg.get("rules_dir")
+        args.evasions_dir = data_cfg.get("evasions_dir")
         args.search_fields = data_cfg.get("search_fields", args.search_fields)
         args.vectorization = train_cfg.get("vectorization", args.vectorization)
         args.mcc_scaling = scale_cfg.get("mcc_scaling", args.mcc_scaling)
@@ -120,7 +121,9 @@ def main():
     logger.info("Using SVC params: %s", svc_params)
 
     # Load rule set
-    rule_set = load_rule_set(args.events_dir, args.rules_dir)
+    evasions_dir = os.path.expanduser(getattr(args, "evasions_dir", None) or "")
+    evasions_dir = evasions_dir if os.path.isdir(evasions_dir) else None
+    rule_set = load_rule_set(args.events_dir, args.rules_dir, evasions_dir=evasions_dir)
     num_benign = count_benign_samples(args.benign_samples)
 
     # Train per-rule models

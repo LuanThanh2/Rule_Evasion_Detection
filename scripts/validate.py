@@ -33,6 +33,7 @@ from red.data import (
     extract_commandlines,
     get_all_evasions,
     get_all_matches,
+    get_all_yaml_filter_values,
     create_labels,
 )
 from red.normalize import normalize_samples
@@ -42,9 +43,9 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelna
 logger = logging.getLogger("validate")
 
 
-def validation_samples_iter(benign_path, malicious_samples):
+def validation_samples_iter(benign_path, malicious_samples, benign_field=None, max_benign=None):
     """Yield validation samples: benign first, then malicious."""
-    for sample in benign_samples_iter(benign_path):
+    for sample in benign_samples_iter(benign_path, benign_field, max_samples=max_benign):
         yield sample
     for sample in malicious_samples:
         yield sample
@@ -58,7 +59,10 @@ def main():
     parser.add_argument("--events-dir", type=str, help="Path to events directory")
     parser.add_argument("--rules-dir", type=str, help="Path to rules directory")
     parser.add_argument("--malicious-type", type=str, default="evasions",
-                        choices=["evasions", "matches"])
+                        choices=["evasions", "matches", "both"])
+    parser.add_argument("--search-fields", type=str, nargs="+", default=None)
+    parser.add_argument("--benign-field", type=str, default=None)
+    parser.add_argument("--max-benign-samples", type=int, default=None)
     parser.add_argument("--out-dir", type=str, default="models")
     parser.add_argument("--result-name", type=str)
     args = parser.parse_args()
@@ -70,17 +74,32 @@ def main():
             cfg = yaml.safe_load(f)
         data_cfg = cfg.get("data", {})
         out_cfg = cfg.get("output", {})
-        args.benign_samples = args.benign_samples or data_cfg.get("benign_valid")
+        args.benign_samples = args.benign_samples or data_cfg.get("benign_valid") or data_cfg.get("benign_train")
         args.events_dir = args.events_dir or data_cfg.get("events_dir")
         args.rules_dir = args.rules_dir or data_cfg.get("rules_dir")
+        args.evasions_dir = data_cfg.get("evasions_dir")
+        args.search_fields = data_cfg.get("search_fields", args.search_fields)
+        args.benign_field = data_cfg.get("benign_field", args.benign_field)
+        args.max_benign_samples = data_cfg.get("max_benign_samples", args.max_benign_samples)
         args.out_dir = out_cfg.get("dir", args.out_dir)
+        args.result_name = args.result_name or out_cfg.get("result_name")
         if not args.result_path:
             args.result_path = out_cfg.get("train_result_path")
 
     if not args.result_path:
         parser.error("--result-path is required")
-    if not args.benign_samples or not args.events_dir or not args.rules_dir:
-        parser.error("--benign-samples, --events-dir, and --rules-dir are required")
+    if not args.benign_samples:
+        parser.error("--benign-samples is required")
+
+    # Expand ~ in paths
+    args.benign_samples = os.path.expanduser(args.benign_samples)
+    if args.events_dir:
+        args.events_dir = os.path.expanduser(args.events_dir)
+    if args.rules_dir:
+        args.rules_dir = os.path.expanduser(args.rules_dir)
+    args.out_dir = os.path.expanduser(args.out_dir)
+
+    search_fields = args.search_fields
 
     # ── Step 1: Load TrainingResult ──
     logger.info("Loading training result from %s", args.result_path)
@@ -89,27 +108,43 @@ def main():
     vectorizer = train_result["vectorizer"]
 
     # ── Step 2: Load validation data ──
-    logger.info("Loading rule set data...")
-    rule_set = load_rule_set(args.events_dir, args.rules_dir)
+    malicious_samples = []
 
-    if args.malicious_type == "evasions":
-        events = get_all_evasions(rule_set)
-    else:
-        events = get_all_matches(rule_set)
+    if args.events_dir and args.rules_dir:
+        logger.info("Loading rule set data...")
+        evasions_dir = os.path.expanduser(getattr(args, "evasions_dir", None) or "")
+        evasions_dir = evasions_dir if os.path.isdir(evasions_dir) else None
+        rule_set = load_rule_set(args.events_dir, args.rules_dir, evasions_dir=evasions_dir)
 
-    malicious_samples = extract_commandlines(events)
+        if args.malicious_type in ("evasions", "both"):
+            events = get_all_evasions(rule_set)
+            malicious_samples += extract_commandlines(events, search_fields)
+            logger.info("Evasion samples: %d", len(malicious_samples))
+
+        if args.malicious_type == "matches":
+            events = get_all_matches(rule_set)
+            malicious_samples += extract_commandlines(events, search_fields)
+            logger.info("Match samples: %d", len(malicious_samples))
+
+    if args.malicious_type == "both" and args.rules_dir:
+        filter_samples = get_all_yaml_filter_values(args.rules_dir, search_fields or [])
+        logger.info("Rule filter samples: %d", len(filter_samples))
+        malicious_samples += filter_samples
+
+    malicious_samples = list(set(malicious_samples))
     malicious_normalized = normalize_samples(malicious_samples)
 
-    num_benign = count_benign_samples(args.benign_samples)
+    max_benign = args.max_benign_samples
+    num_benign = count_benign_samples(args.benign_samples, args.benign_field, max_samples=max_benign)
     logger.info(
-        "Validation data: %d benign + %d %s",
+        "Validation data: %d benign + %d malicious (%s)",
         num_benign, len(malicious_normalized), args.malicious_type,
     )
 
     # ── Step 3: Transform validation data ──
     logger.info("Transforming validation data...")
     feature_vectors = vectorizer.transform(
-        validation_samples_iter(args.benign_samples, malicious_normalized)
+        validation_samples_iter(args.benign_samples, malicious_normalized, args.benign_field, max_benign)
     )
     labels = create_labels(num_benign, len(malicious_normalized))
 

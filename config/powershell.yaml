@@ -5,12 +5,14 @@ data:
   benign_valid: ~/data/benign/powershell/benign_train.txt
   benign_field: winlog.event_data.ScriptBlockText
   events_dir: ~/data/sigma/events_hayabusa/windows/powershell
+  evasions_dir: ~/data/sigma/evasions/windows/powershell
   rules_dir: ~/data/sigma/rules/windows/powershell
   search_fields:
     - winlog.event_data.ScriptBlockText
+  malicious_extra: ~/data/benign/powershell/malicious_extra.txt
 
 training:
-  malicious_samples: matches
+  malicious_samples: both
   vectorization: tfidf
   ngram_range: [1, 1]
   search_params: true
@@ -29,4 +31,5 @@ evaluation:
 output:
   dir: models/powershell
   result_name: misuse_svc_rules_f1
+  train_result_path: models/powershell/train_rslt_misuse_svc_rules_f1.zip
   attr_result_name: attr_svc_rules

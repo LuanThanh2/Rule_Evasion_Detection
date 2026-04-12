@@ -5,12 +5,13 @@ data:
   benign_valid: ~/data/benign/registry_event/benign_train.txt
   benign_field: winlog.event_data.TargetObject
   events_dir: ~/data/sigma/events_hayabusa/windows/registry_event
-  rules_dir: ~/data/sigma/rules/windows/registry_event
+  evasions_dir: ~/data/sigma/evasions/windows/registry_event
+  rules_dir: ~/data/sigma/rules/windows/registry
   search_fields:
     - winlog.event_data.TargetObject
 
 training:
-  malicious_samples: matches
+  malicious_samples: both
   vectorization: tfidf
   ngram_range: [1, 1]
   search_params: true
@@ -29,4 +30,5 @@ evaluation:
 output:
   dir: models/registry_event
   result_name: misuse_svc_rules_f1
+  train_result_path: models/registry_event/train_rslt_misuse_svc_rules_f1.zip
   attr_result_name: attr_svc_rules

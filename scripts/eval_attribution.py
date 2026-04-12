@@ -51,6 +51,7 @@ def main():
         out_cfg = cfg.get("output", {})
         args.events_dir = args.events_dir or data_cfg.get("events_dir")
         args.rules_dir = args.rules_dir or data_cfg.get("rules_dir")
+        args.evasions_dir = data_cfg.get("evasions_dir")
         args.out_dir = out_cfg.get("dir", args.out_dir)
         if not args.result_path:
             args.result_path = out_cfg.get("attr_result_path")
@@ -67,7 +68,9 @@ def main():
     logger.info("Loaded %d rule models", len(rule_models))
 
     # ── Step 2: Load evasion data ──
-    rule_set = load_rule_set(args.events_dir, args.rules_dir)
+    evasions_dir = os.path.expanduser(getattr(args, "evasions_dir", None) or "")
+    evasions_dir = evasions_dir if os.path.isdir(evasions_dir) else None
+    rule_set = load_rule_set(args.events_dir, args.rules_dir, evasions_dir=evasions_dir)
 
     # Build evasion → rule mapping
     evasion_to_rule = {}

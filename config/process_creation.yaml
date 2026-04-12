@@ -6,12 +6,13 @@ data:
   benign_valid: ~/data/benign/process_creation/benign_train.txt  # dùng tạm cùng file khi chưa có valid set
   benign_field: process.command_line
   events_dir: ~/data/sigma/events_hayabusa/windows/process_creation
+  evasions_dir: ~/data/sigma/evasions/windows/process_creation
   rules_dir: ~/data/sigma/rules/windows/process_creation
   search_fields:
     - process.command_line
 
 training:
-  malicious_samples: matches          # rule_filters | matches
+  malicious_samples: both          # rule_filters | matches
   vectorization: tfidf               # tfidf | count | hashing | binary_count | scaled_count
   ngram_range: [1, 1]                # unigrams
   search_params: true                # use GridSearchCV
@@ -30,4 +31,5 @@ evaluation:
 output:
   dir: models/process_creation
   result_name: misuse_svc_rules_f1
+  train_result_path: models/process_creation/train_rslt_misuse_svc_rules_f1.zip
   attr_result_name: attr_svc_rules
