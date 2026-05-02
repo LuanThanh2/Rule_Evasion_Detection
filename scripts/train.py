@@ -44,7 +44,7 @@ from red.data import (
 )
 from red.normalize import normalize_samples
 from red.features import create_vectorizer
-from red.models import train_svc_gridsearch, train_svc_fixed
+from red.models import train_svc_gridsearch, train_svc_fixed, train_ensemble
 from red.evaluate import create_mcc_scaler
 from red.persist import save_result
 
@@ -113,6 +113,12 @@ def main():
     parser.add_argument("--ngram-range", type=str, default="(1,1)")
     parser.add_argument("--search-params", action="store_true",
                         help="Use GridSearchCV for hyperparameter optimization")
+    parser.add_argument("--ensemble", action="store_true",
+                        help="Train ensemble (SVM + LR + CNB) instead of single SVM")
+    parser.add_argument("--ensemble-members", type=str, nargs="+",
+                        default=["svm", "lr", "cnb"],
+                        choices=["svm", "lr", "cnb"],
+                        help="Which base classifiers to include in the ensemble")
     parser.add_argument("--scoring", type=str, default="f1", choices=["f1", "mcc"])
     parser.add_argument("--cv", type=int, default=5)
     parser.add_argument("--num-jobs", type=int, default=3)
@@ -146,6 +152,8 @@ def main():
         args.malicious_samples = train_cfg.get("malicious_samples", args.malicious_samples)
         args.vectorization = train_cfg.get("vectorization", args.vectorization)
         args.search_params = train_cfg.get("search_params", args.search_params)
+        args.ensemble = train_cfg.get("ensemble", args.ensemble)
+        args.ensemble_members = train_cfg.get("ensemble_members", args.ensemble_members)
         args.scoring = train_cfg.get("scoring", args.scoring)
         args.cv = train_cfg.get("cv_folds", args.cv)
         args.num_jobs = train_cfg.get("num_jobs", args.num_jobs)
@@ -201,7 +209,18 @@ def main():
     )
 
     # ── Step 4: Train model ──
-    if args.search_params:
+    if args.ensemble:
+        logger.info("Training ENSEMBLE with members: %s", args.ensemble_members)
+        estimator, member_params, member_scores = train_ensemble(
+            feature_vectors, labels,
+            scoring=args.scoring,
+            cv=args.cv,
+            n_jobs=args.num_jobs,
+            members=tuple(args.ensemble_members),
+        )
+        best_params = member_params
+        best_score = member_scores
+    elif args.search_params:
         estimator, best_params, best_score = train_svc_gridsearch(
             feature_vectors, labels,
             scoring=args.scoring,

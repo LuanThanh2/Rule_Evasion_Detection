@@ -4,12 +4,19 @@ Trains one binary SVC per Sigma rule (benign vs. rule_X filter/matches),
 then for each evasion event, scores it against all rule models and ranks
 by decision_function value to find the most likely evaded rule.
 
+Also provides a training-free CosineRuleAttributor that ranks rules by
+cosine similarity between the evasion's TF-IDF vector and each rule's
+filter-value vectors (in a shared vector space). Useful for rules with
+too few filter values to train a stable per-rule SVM, and as a
+complementary signal that can be fused with SVM rankings via RRF.
+
 Evaluation metrics: top-k hit rate (k=1, 5, 10, ..., N).
 """
 
 import logging
 import numpy as np
 from typing import Dict, List, Tuple
+from sklearn.metrics.pairwise import cosine_similarity
 
 logger = logging.getLogger(__name__)
 
@@ -177,3 +184,109 @@ def process_evasions_batch(
     logger.info("Attribution evaluation: %s", eval_result.summary())
 
     return eval_result, all_results
+
+
+# ---------------------------------------------------------------------------
+# Cosine-similarity rule attribution (training-free)
+# ---------------------------------------------------------------------------
+
+class CosineRuleAttributor:
+    """Rank rules for an evasion sample by cosine similarity.
+
+    For each rule, we keep the TF-IDF vectors of its filter values in a
+    SHARED vector space (one vectorizer fitted on all rules' filter
+    values combined). Scoring an evasion = cosine similarity between
+    the evasion's TF-IDF vector and each filter-value vector, taking
+    the **maximum** across the rule's filter values.
+
+    Strategy choice: max-cosine (vs. centroid) is more sensitive to
+    matching a specific filter pattern, which is what we want for
+    attribution — the evasion typically targets one specific filter,
+    not the centroid of all of them.
+    """
+
+    def __init__(self, vectorizer, rule_filter_matrices: Dict[str, "csr_matrix"]):
+        self.vectorizer = vectorizer
+        self.rule_filter_matrices = rule_filter_matrices
+
+    @classmethod
+    def fit(cls, rule_filter_values: Dict[str, List[str]], vectorizer):
+        """Build a CosineRuleAttributor from {rule_name → list of normalized filters}.
+
+        Vectorizer is fitted on the UNION of all rules' filter values so
+        TF-IDF vectors are comparable across rules.
+        """
+        all_filters = []
+        for filters in rule_filter_values.values():
+            all_filters.extend(filters)
+
+        if not all_filters:
+            raise ValueError("No filter values to fit cosine attributor on")
+
+        vectorizer.fit(all_filters)
+
+        rule_filter_matrices = {}
+        for rule_name, filters in rule_filter_values.items():
+            if filters:
+                rule_filter_matrices[rule_name] = vectorizer.transform(filters)
+
+        logger.info(
+            "CosineRuleAttributor fitted on %d rules, %d total filter values",
+            len(rule_filter_matrices), len(all_filters),
+        )
+        return cls(vectorizer, rule_filter_matrices)
+
+    def score_samples(self, normalized_samples: List[str]) -> List[List[Tuple[str, float]]]:
+        """Score samples against all rules.
+
+        Returns
+        -------
+        list of list of (rule_name, max_cosine_similarity)
+            Outer index = sample, inner list sorted by similarity desc.
+        """
+        sample_vectors = self.vectorizer.transform(normalized_samples)
+        results = []
+
+        for i in range(sample_vectors.shape[0]):
+            sample_vec = sample_vectors[i]
+            scores = {}
+            for rule_name, rule_matrix in self.rule_filter_matrices.items():
+                sims = cosine_similarity(sample_vec, rule_matrix)
+                scores[rule_name] = float(sims.max()) if sims.size > 0 else 0.0
+            ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+            results.append(ranked)
+
+        return results
+
+
+# ---------------------------------------------------------------------------
+# Rank fusion — combine SVM and Cosine rankings
+# ---------------------------------------------------------------------------
+
+def reciprocal_rank_fusion(
+    ranked_lists: List[List[Tuple[str, float]]],
+    k: int = 60,
+) -> List[Tuple[str, float]]:
+    """Combine multiple rule rankings via Reciprocal Rank Fusion.
+
+    RRF score for each rule = Σ 1 / (k + rank_in_list_i).
+    The result is robust to score-scale differences between methods
+    (SVM decision values vs. cosine [0,1]) — only the rank matters.
+
+    Parameters
+    ----------
+    ranked_lists : list of list of (rule_name, score)
+        Each list ranks the same set of rules by a different method.
+    k : int
+        Smoothing constant. 60 is the standard default from the
+        original RRF paper (Cormack et al., 2009).
+
+    Returns
+    -------
+    list of (rule_name, rrf_score) sorted desc.
+    """
+    rrf_scores: Dict[str, float] = {}
+    for ranking in ranked_lists:
+        for rank, (rule_name, _) in enumerate(ranking, start=1):
+            rrf_scores[rule_name] = rrf_scores.get(rule_name, 0.0) + 1.0 / (k + rank)
+    return sorted(rrf_scores.items(), key=lambda x: x[1], reverse=True)

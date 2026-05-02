@@ -44,3 +44,6 @@ datasets/
 models/
 figures/
 outputs/
+
+# Claude Code
+.claude/settings.local.json

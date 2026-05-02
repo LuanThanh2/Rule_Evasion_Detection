@@ -1,7 +1,11 @@
-"""SVM model training with hyperparameter optimization.
+"""SVM / LR / CNB model training with hyperparameter optimization.
 
 Supports GPU acceleration via RAPIDS cuML if available,
 falls back to sklearn CPU automatically.
+
+Also provides an EnsembleClassifier that combines decision-function
+scores from heterogeneous base classifiers into a single calibrated
+score, compatible with the rest of the pipeline (validate / evaluate).
 
 GPU mode (RAPIDS cuML):
     pip install cuml-cu12  # or matching CUDA version
@@ -14,6 +18,8 @@ import logging
 import numpy as np
 from sklearn.model_selection import GridSearchCV, StratifiedKFold
 from sklearn.metrics import f1_score, matthews_corrcoef, make_scorer
+from sklearn.linear_model import LogisticRegression
+from sklearn.naive_bayes import ComplementNB
 from tqdm import tqdm
 
 logger = logging.getLogger(__name__)
@@ -177,3 +183,177 @@ def _iter_param_grid(param_grid):
     keys = list(param_grid.keys())
     for values in product(*param_grid.values()):
         yield dict(zip(keys, values))
+
+
+# ---------------------------------------------------------------------------
+# Logistic Regression — probabilistic linear classifier
+# ---------------------------------------------------------------------------
+
+LR_PARAM_GRID = {
+    "C": np.logspace(-2, 1, num=20),
+    "class_weight": ["balanced", None],
+}
+
+
+def train_lr_gridsearch(X, y, param_grid=None, scoring="f1", cv=5):
+    """Train LogisticRegression with manual grid search + tqdm progress."""
+    if param_grid is None:
+        param_grid = LR_PARAM_GRID
+
+    scorer_fn = SCORERS.get(scoring, f1_score)
+    param_list = list(_iter_param_grid(param_grid))
+    best_score = -np.inf
+    best_params = None
+
+    with tqdm(total=len(param_list), desc="GridSearch (LR)", unit="param", ncols=80) as pbar:
+        for params in param_list:
+            kf = StratifiedKFold(n_splits=cv)
+            scores = []
+            for train_idx, val_idx in kf.split(X, y):
+                lr = LogisticRegression(
+                    solver="liblinear", max_iter=1000, **params,
+                )
+                lr.fit(X[train_idx], y[train_idx])
+                pred = lr.predict(X[val_idx])
+                scores.append(scorer_fn(y[val_idx], pred))
+            mean_score = float(np.mean(scores))
+            if mean_score > best_score:
+                best_score = mean_score
+                best_params = params
+            pbar.set_postfix({"best": f"{best_score:.4f}"})
+            pbar.update(1)
+
+    logger.info("LR best params: %s  best score: %.4f", best_params, best_score)
+    estimator = LogisticRegression(solver="liblinear", max_iter=1000, **best_params)
+    estimator.fit(X, y)
+    return estimator, best_params, best_score
+
+
+# ---------------------------------------------------------------------------
+# Complement Naive Bayes — text-friendly, fast, handles imbalance
+# ---------------------------------------------------------------------------
+
+def train_cnb(X, y, alpha=1.0):
+    """Train ComplementNB. Requires non-negative features (TF-IDF/Count are OK)."""
+    cnb = ComplementNB(alpha=alpha)
+    cnb.fit(X, y)
+    logger.info("Trained ComplementNB with alpha=%.4f", alpha)
+    return cnb
+
+
+# ---------------------------------------------------------------------------
+# Ensemble — soft-voting over heterogeneous classifiers
+# ---------------------------------------------------------------------------
+
+class EnsembleClassifier:
+    """Weighted soft-voting ensemble exposing decision_function().
+
+    Each base classifier produces a raw score:
+      - if it has decision_function(): use that directly
+      - else: derive log-odds from predict_proba (log(p1 / p0))
+
+    Raw scores are z-score normalised on training data so that classifiers
+    with different output scales contribute comparably. The final
+    decision_function is the weighted average of normalised scores.
+
+    The class is intentionally compatible with the existing pipeline:
+    validate.py only requires .decision_function(X), and create_mcc_scaler
+    re-maps the output to [0, 1] downstream.
+    """
+
+    def __init__(self, classifiers, weights=None):
+        self.classifiers = dict(classifiers)
+        self.weights = dict(weights) if weights else {n: 1.0 for n in self.classifiers}
+        self.score_means: dict = {}
+        self.score_stds: dict = {}
+
+    def _raw_scores(self, name, X):
+        clf = self.classifiers[name]
+        if hasattr(clf, "decision_function"):
+            return np.asarray(clf.decision_function(X)).ravel()
+        proba = clf.predict_proba(X)
+        eps = 1e-9
+        return np.log((proba[:, 1] + eps) / (proba[:, 0] + eps))
+
+    def calibrate(self, X):
+        """Compute per-classifier mean/std of raw scores on training data."""
+        for name in self.classifiers:
+            scores = self._raw_scores(name, X)
+            self.score_means[name] = float(scores.mean())
+            std = float(scores.std())
+            self.score_stds[name] = std if std > 1e-12 else 1.0
+            logger.info(
+                "Ensemble calibration [%s]: mean=%.4f std=%.4f",
+                name, self.score_means[name], self.score_stds[name],
+            )
+
+    def decision_function(self, X):
+        total = np.zeros(X.shape[0], dtype=np.float64)
+        total_weight = 0.0
+        for name in self.classifiers:
+            scores = self._raw_scores(name, X)
+            mean = self.score_means.get(name, 0.0)
+            std = self.score_stds.get(name, 1.0)
+            normalized = (scores - mean) / std
+            w = float(self.weights.get(name, 1.0))
+            total += w * normalized
+            total_weight += w
+        return total / total_weight if total_weight > 0 else total
+
+    def predict(self, X):
+        return (self.decision_function(X) >= 0).astype(int)
+
+    def get_params(self, deep=True):
+        return {
+            "members": list(self.classifiers.keys()),
+            "weights": self.weights,
+            "score_means": self.score_means,
+            "score_stds": self.score_stds,
+        }
+
+
+def train_ensemble(X, y, scoring="f1", cv=5, n_jobs=-1, members=("svm", "lr", "cnb")):
+    """Train the requested base classifiers and wrap them in an EnsembleClassifier.
+
+    Returns
+    -------
+    ensemble : EnsembleClassifier
+    member_params : dict
+        Best hyperparameters per member (for logging / persistence).
+    member_scores : dict
+        Cross-validated best score per member.
+    """
+    classifiers = {}
+    member_params = {}
+    member_scores = {}
+
+    if "svm" in members:
+        logger.info("Training SVM member...")
+        svc, svc_params, svc_score = train_svc_gridsearch(
+            X, y, scoring=scoring, cv=cv, n_jobs=n_jobs,
+        )
+        classifiers["svm"] = svc
+        member_params["svm"] = svc_params
+        member_scores["svm"] = svc_score
+
+    if "lr" in members:
+        logger.info("Training Logistic Regression member...")
+        lr, lr_params, lr_score = train_lr_gridsearch(
+            X, y, scoring=scoring, cv=cv,
+        )
+        classifiers["lr"] = lr
+        member_params["lr"] = lr_params
+        member_scores["lr"] = lr_score
+
+    if "cnb" in members:
+        logger.info("Training ComplementNB member...")
+        cnb = train_cnb(X, y)
+        classifiers["cnb"] = cnb
+        member_params["cnb"] = {"alpha": 1.0}
+        member_scores["cnb"] = None  # no CV search
+
+    ensemble = EnsembleClassifier(classifiers=classifiers)
+    ensemble.calibrate(X)
+
+    logger.info("Ensemble built with members: %s", list(classifiers.keys()))
+    return ensemble, member_params, member_scores

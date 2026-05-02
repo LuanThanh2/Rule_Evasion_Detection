@@ -39,6 +39,7 @@ from red.normalize import normalize_samples
 from red.features import create_vectorizer
 from red.models import train_svc_fixed
 from red.evaluate import create_mcc_scaler
+from red.attribution import CosineRuleAttributor
 from red.persist import save_result, load_result
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -66,6 +67,9 @@ def main():
     parser.add_argument("--ngram-range", type=str, default="(1,1)")
     parser.add_argument("--mcc-scaling", action="store_true", default=True)
     parser.add_argument("--mcc-threshold", type=float, default=0.1)
+    parser.add_argument("--cosine", action="store_true", default=True,
+                        help="Also build cosine attributor alongside per-rule SVMs")
+    parser.add_argument("--no-cosine", dest="cosine", action="store_false")
     parser.add_argument("--out-dir", type=str, default="models")
     parser.add_argument("--result-name", type=str, default="attr_svc_rules")
     args = parser.parse_args()
@@ -126,28 +130,27 @@ def main():
     rule_set = load_rule_set(args.events_dir, args.rules_dir, evasions_dir=evasions_dir)
     num_benign = count_benign_samples(args.benign_samples)
 
-    # Train per-rule models
-    rule_models = {}
-    trained_count = 0
-
+    # Pre-collect normalized filter values per rule (used by both SVM and Cosine)
+    rule_filters_normalized = {}
     for rule_name, rule_data in rule_set.items():
         if len(rule_data.evasions) == 0:
             continue
-
-        # Get malicious samples for this rule
         rule_filter_values = []
         for filt in rule_data.filters:
             vals = extract_filter_values(filt, args.search_fields)
             rule_filter_values.extend(vals)
-
         if len(rule_filter_values) == 0:
             logger.warning("Rule %s has no filter values, skipping", rule_name)
             continue
+        normalized = normalize_samples(rule_filter_values)
+        if normalized:
+            rule_filters_normalized[rule_name] = normalized
 
-        malicious_normalized = normalize_samples(rule_filter_values)
-        if len(malicious_normalized) == 0:
-            continue
+    # Train per-rule SVM models
+    rule_models = {}
+    trained_count = 0
 
+    for rule_name, malicious_normalized in rule_filters_normalized.items():
         # Create vectorizer and transform
         vectorizer = create_vectorizer(args.vectorization, ngram_range=ngram_range)
         feature_vectors = vectorizer.fit_transform(
@@ -180,13 +183,27 @@ def main():
 
     logger.info("Trained %d rule models", trained_count)
 
+    # Build cosine attributor on a SHARED vector space (all rules' filter values)
+    cosine_attributor = None
+    if args.cosine and rule_filters_normalized:
+        logger.info("Building cosine attributor on shared vector space...")
+        cosine_vectorizer = create_vectorizer(args.vectorization, ngram_range=ngram_range)
+        cosine_attributor = CosineRuleAttributor.fit(
+            rule_filters_normalized, cosine_vectorizer,
+        )
+
     # Save
-    result = {"rule_models": rule_models, "svc_params": svc_params}
+    result = {
+        "rule_models": rule_models,
+        "cosine_attributor": cosine_attributor,
+        "svc_params": svc_params,
+    }
     info = {
         "result_name": args.result_name,
         "num_rules": trained_count,
         "svc_params": svc_params,
         "rules": list(rule_models.keys()),
+        "cosine_enabled": cosine_attributor is not None,
     }
     save_result(result, f"train_rslt_{args.result_name}", args.out_dir, info=info)
     logger.info("Attribution training complete.")

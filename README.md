@@ -1,537 +1,454 @@
 # Rule Evasion Detection (RED)
 
-Reimplementation and extension of the AMIDES pipeline for detecting SIEM rule evasion.
-Uses SVM-based misuse classification and rule attribution across multiple Windows event types.
+Mở rộng và tái cài đặt pipeline **AMIDES** (Uetz et al., USENIX Security 2024) để phát hiện và quy kết evasion của luật Sigma trên Windows event logs.
+
+**Đóng góp mới so với AMIDES gốc:**
+- Stage 1: **Ensemble Classifier** (SVM + Logistic Regression + Complement Naive Bayes) thay cho SVM đơn lẻ
+- Stage 2: **Cosine Similarity** kết hợp với per-rule SVM qua **Reciprocal Rank Fusion**
 
 ---
 
-## Project Structure
+## Mục lục
 
-```
-rule_evasion_detection/
-├── README.md
-├── requirements.txt
-├── run_all.sh
-├── config/
-│   ├── process_creation.yaml     # Process Creation experiments
-│   ├── registry_event.yaml       # Registry Event experiments
-│   ├── powershell.yaml           # PowerShell ScriptBlock experiments
-│   └── proxy_web.yaml            # Proxy/Web URL experiments
-├── red/                          # Core library
-│   ├── __init__.py
-│   ├── data.py                   # Data loading (benign, Sigma rules, events)
-│   ├── normalize.py              # Text normalization pipeline
-│   ├── features.py               # TF-IDF/Count vectorization
-│   ├── models.py                 # SVC training (CPU/GPU/Intel acceleration)
-│   ├── evaluate.py               # Threshold sweep & MCC scaling
-│   ├── attribution.py            # Per-rule attribution evaluation
-│   ├── visualize.py              # PR curves & attribution plots
-│   └── persist.py                # Save/load models (pickle + zip)
-└── scripts/
-    ├── train.py                  # Train misuse classifier (C1/C2)
-    ├── validate.py               # Validate model with evasions
-    ├── evaluate.py               # MCC scaling + threshold sweep
-    ├── train_attribution.py      # Train per-rule models (C3)
-    ├── eval_attribution.py       # Evaluate rule attribution
-    ├── plot.py                   # Generate figures
-    ├── run_pipeline.py           # Run all steps end-to-end
-    ├── generate_evasions.py      # Generate evasion events from match events
-    ├── hayabusa_to_matches.py    # Convert Hayabusa JSONL → AMIDES match events
-    ├── otrf_to_matches.py        # Convert OTRF datasets → AMIDES match events
-    ├── lmd_to_benign.py          # Convert LMD Collections CSV → benign samples
-    ├── mpsd_to_benign.py         # Convert MPSD .ps1 files → benign PowerShell samples
-    ├── mpsd_to_malicious.py      # Filter MPSD malicious .ps1 by Sigma patterns
-    ├── secrepo_to_benign.py      # Extract URLs from Squid access.log → benign samples
-    └── train_all.sh              # Shell script to train all event types
-```
+1. [Cài đặt](#cài-đặt)
+2. [Thuật toán sử dụng](#thuật-toán-sử-dụng)
+3. [Pipeline tổng quan](#pipeline-tổng-quan)
+4. [Cách chạy](#cách-chạy)
+5. [Chuẩn bị dữ liệu](#chuẩn-bị-dữ-liệu)
+6. [Cấu trúc thư mục](#cấu-trúc-thư-mục)
+7. [Config file](#config-file)
 
 ---
 
-## Installation
+## Cài đặt
 
 ```bash
 cd rule_evasion_detection
 pip install -r requirements.txt
 ```
 
-Dependencies: `numpy`, `scikit-learn`, `matplotlib`, `seaborn`, `pyyaml`, `luqum`,
-`scikit-learn-intelex` (Intel CPU acceleration), `tqdm`
-
-### Optional GPU acceleration
-
+**Tăng tốc tùy chọn:**
 ```bash
-# NVIDIA GPU (RAPIDS cuML — requires CUDA)
+# NVIDIA GPU (RAPIDS cuML — cần CUDA)
 pip install cuml-cu12
+
+# Intel CPU (scikit-learn-intelex)
+pip install scikit-learn-intelex  # đã có trong requirements.txt
 ```
 
-The training code auto-detects the best available backend:
-NVIDIA GPU (cuML) > Intel CPU (scikit-learn-intelex) > plain scikit-learn CPU.
+Hệ thống tự động chọn backend: `NVIDIA GPU > Intel CPU > CPU thường`.
 
 ---
 
-## Supported Event Types
+## Thuật toán sử dụng
 
-| Event Type        | Field extracted                   | Config file              |
-|-------------------|-----------------------------------|--------------------------|
-| `process_creation`| `process.command_line`            | `config/process_creation.yaml` |
-| `registry_event`  | `winlog.event_data.TargetObject`  | `config/registry_event.yaml`   |
-| `powershell`      | `winlog.event_data.ScriptBlockText` | `config/powershell.yaml`     |
-| `proxy_web`       | `url` / `c-uri` / `cs-uri-stem`  | `config/proxy_web.yaml`        |
+### Tiền xử lý văn bản — Text Normalization
+
+Mọi chuỗi đầu vào (command line, script, registry path, URL) đều qua 6 bước chuẩn hóa trước khi học:
+
+```
+"powershell.exe -Exec Bypass -File C:\temp\0xABCD1234.ps1"
+    │
+    ├─ 1. Lọc ký tự đặc biệt: bỏ " ^ ` '
+    ├─ 2. Lowercase
+    ├─ 3. Tokenize: tách theo \w+ → ["powershell", "exe", "exec", "bypass", "file", "c", "temp", "0xABCD1234", "ps1"]
+    ├─ 4. Lọc token hex/số dài > 3 ký tự: bỏ "0xABCD1234"
+    ├─ 5. Lọc token chuỗi dài > 30 ký tự
+    └─ 6. Sort + join bằng dấu phẩy
+    
+→ "bypass,c,exe,exec,file,powershell,ps1,temp"
+```
+
+**Mục đích:** Chuẩn hóa giúp các biến thể evasion nhỏ (thay đổi hoa/thường, thêm khoảng trắng...) vẫn cho ra token giống nhau, giảm nhiễu cho SVM.
 
 ---
 
-## Quick Start
+### TF-IDF Vectorization
+
+Chuyển chuỗi token đã chuẩn hóa thành vector số để mô hình ML xử lý:
+
+```
+"bypass,c,exe,exec,file,powershell,ps1,temp"
+    │
+    └─ comma_tokenizer (tách theo dấu phẩy)
+    └─ TF-IDF: trọng số = tần suất token × log nghịch đảo tần suất tài liệu
+    
+→ vector thưa [0, 0.32, 0, 0.71, 0, 0.45, ...]  (chiều = số token trong từ điển)
+```
+
+Token xuất hiện nhiều ở malicious nhưng ít ở benign → trọng số TF-IDF cao → SVM dễ phân biệt.
+
+---
+
+### Stage 1 — Ensemble Classifier (Misuse Detection)
+
+Phát hiện event có đáng ngờ không (benign vs. malicious).
+
+#### SVM — Support Vector Machine
+Tìm siêu phẳng (hyperplane) phân chia benign và malicious với **khoảng cách lớn nhất** (max margin):
+
+```
+Không gian TF-IDF:
+
+  benign  ●  ●  ●          margin
+             ●      ← ─────────── → ─ ─ hyperplane
+                        ■  ■  ■  malicious
+                     ■
+```
+
+- Kernel linear phù hợp dữ liệu text thưa chiều cao
+- `class_weight=balanced`: bù trọng số khi benign >> malicious
+- **GridSearchCV** tìm tham số `C` tốt nhất trong 50 giá trị ∈ [0.01, 10]
+
+#### Logistic Regression (LR)
+Thay vì tìm margin, LR ước tính **xác suất** một event là malicious:
+
+```
+P(malicious | x) = sigmoid(w·x + b)
+
+Nếu P ≥ 0.5 → malicious, ngược lại → benign
+```
+
+- Cùng dạng tuyến tính như SVM nhưng nhìn từ góc xác suất
+- `decision_function` = log-odds = log(P(mal)/P(ben))
+- Bổ sung góc nhìn khác cho Ensemble, giảm false positive
+
+#### Complement Naive Bayes (CNB)
+Học từ **tập bù** — thay vì hỏi "token này có trong malicious không?", hỏi "token này có **không phổ biến** ở benign không?":
+
+```
+Score malicious ∝ Σ log P(token | KHÔNG phải benign)
+```
+
+- Thiết kế đặc biệt cho dữ liệu **mất cân bằng** (benign >> malicious) — phù hợp project này
+- Không cần GridSearch, train rất nhanh
+
+#### EnsembleClassifier — Kết hợp 3 mô hình
+
+```
+TF-IDF vector
+    ├─→ SVM.decision_function()    → score_svm  (raw distance)
+    ├─→ LR.decision_function()     → score_lr   (log-odds)
+    └─→ CNB: log(P(mal)/P(ben))    → score_cnb
+
+    ↓ z-score normalize từng thành viên (trên training data)
+    ↓ weighted average
+    
+→ ensemble_score
+
+    ↓ MCC Scaler (MinMaxScale → [0,1])
+    
+→ final_score ∈ [0,1]
+    
+    ↓ so với threshold
+    
+→ BENIGN hoặc SUSPICIOUS
+```
+
+**Lý do Ensemble tốt hơn SVM đơn lẻ:** 3 thuật toán "suy nghĩ" theo 3 cơ chế khác nhau — khi 1 thằng sai, 2 thằng kia bù lại.
+
+#### MCC Scaler — Hiệu chỉnh ngưỡng
+Sau khi có ensemble score, dùng **MCC (Matthews Correlation Coefficient)** để tìm vùng hoạt động tốt nhất và chuẩn hóa về [0,1]:
+
+```
+1. Quét 50 ngưỡng trên training data → tính MCC từng ngưỡng
+2. Tìm vùng MCC > threshold (0.1)
+3. Tạo MinMaxScaler đối xứng quanh điểm MCC tối ưu
+4. Áp dụng: shift → scale → clip[0,1]
+```
+
+---
+
+### Stage 2 — Rule Attribution
+
+Khi Stage 1 phát hiện event là SUSPICIOUS, Stage 2 xác định **luật Sigma nào** bị evasion.
+
+#### Per-rule SVM
+Mỗi luật Sigma có 1 SVM binary riêng, train trên: benign vs. filter values của luật đó:
+
+```
+Rule_A: train SVM(benign, ["cscript", "vbs", "wscript"])
+Rule_B: train SVM(benign, ["mimikatz", "sekurlsa"])
+...
+
+Với evasion mới:
+→ transform bằng vectorizer của từng rule
+→ decision_function() → score cho từng rule
+→ sort → SVM ranking
+```
+
+**Yếu điểm:** Mỗi rule có vectorizer riêng → không so sánh được score giữa các rule; rule ít filter values → train không ổn định.
+
+#### Cosine Similarity
+Thay vì train model, đo **độ giống nhau** trực tiếp giữa vector TF-IDF của evasion và các filter values của từng rule trong **không gian vector chung**:
+
+```
+1. Fit 1 TF-IDF vectorizer dùng chung (tất cả filter values của mọi rule)
+
+2. Với evasion e và rule R có filter values [f1, f2, f3]:
+   cos_score(R) = max(cosine(vec(e), vec(f1)),
+                      cosine(vec(e), vec(f2)),
+                      cosine(vec(e), vec(f3)))
+
+3. Sort theo cos_score → Cosine ranking
+```
+
+**Ưu điểm:** Không cần train, xử lý tốt rule ít data, tất cả rules cùng scale.
+
+#### Reciprocal Rank Fusion (RRF) — Kết hợp 2 ranking
+
+```
+SVM ranking:    [Rule_B(rank=1), Rule_A(rank=2), Rule_C(rank=3)]
+Cosine ranking: [Rule_A(rank=1), Rule_B(rank=2), Rule_C(rank=3)]
+
+RRF score(rule) = Σ  1 / (60 + rank_in_list_i)
+
+Rule_B: 1/(60+1) + 1/(60+2) = 0.0164 + 0.0161 = 0.0325
+Rule_A: 1/(60+2) + 1/(60+1) = 0.0161 + 0.0164 = 0.0325
+Rule_C: 1/(60+3) + 1/(60+3) = 0.0159 + 0.0159 = 0.0317
+
+→ Final: [Rule_B, Rule_A, Rule_C]  (RRF chỉ dùng thứ hạng, không dùng score trực tiếp)
+```
+
+**Ưu điểm RRF:** Không bị ảnh hưởng bởi scale khác nhau giữa SVM score và Cosine score.
+
+---
+
+## Pipeline tổng quan
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                    CHUẨN BỊ DỮ LIỆU                        │
+│                                                             │
+│  Benign:                                                    │
+│    LMD Collections (CSV) ──→ lmd_to_benign.py              │
+│    MPSD PowerShell .ps1   ──→ mpsd_to_benign.py            │
+│    SecRepo Squid log      ──→ secrepo_to_benign.py         │
+│                                                             │
+│  Malicious:                                                 │
+│    Hayabusa JSONL         ──→ hayabusa_to_matches.py        │
+│    Sigma rule YAML        ──→ trích xuất filter values      │
+│    Match events           ──→ generate_evasions.py          │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│              STAGE 1 — MISUSE DETECTION                     │
+│                                                             │
+│  train.py                                                   │
+│    Normalize → TF-IDF → [SVM + LR + CNB] → Ensemble        │
+│    → MCC Scaler → lưu train_rslt_*.zip                      │
+│                                                             │
+│  validate.py                                                │
+│    Load model → transform validation data                   │
+│    → decision_function() → lưu valid_rslt_*.zip            │
+│                                                             │
+│  evaluate.py                                                │
+│    Scale scores → sweep 51 thresholds                       │
+│    → P/R/F1/MCC tại mỗi threshold → lưu eval_rslt_*.zip    │
+└─────────────────────────────────────────────────────────────┘
+                          │ nếu score ≥ threshold
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│             STAGE 2 — RULE ATTRIBUTION                      │
+│                                                             │
+│  train_attribution.py                                       │
+│    Per-rule SVM (mỗi rule 1 model riêng)                    │
+│    + CosineRuleAttributor (shared vectorizer)               │
+│    → lưu train_rslt_attr_*.zip                              │
+│                                                             │
+│  eval_attribution.py --method hybrid                        │
+│    SVM ranking + Cosine ranking                             │
+│    → RRF Fusion → Top-K rules                               │
+│    → Top-1/5/10 hit rate → lưu eval_attr_*.zip             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Cách chạy
+
+### Chạy nhanh toàn bộ pipeline
 
 ```bash
-# Run complete pipeline for process creation events
 python scripts/run_pipeline.py --config config/process_creation.yaml
-
-# Skip attribution (faster)
-python scripts/run_pipeline.py --config config/process_creation.yaml --skip-attribution
-
-# Skip plots
-python scripts/run_pipeline.py --config config/process_creation.yaml --skip-plots
 ```
 
----
-
-## Pipeline Overview
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│                     DATA PREPARATION                         │
-│                                                              │
-│  Benign data sources:                                        │
-│    LMD Collections (CSV) ──→ lmd_to_benign.py               │
-│    MPSD PowerShell .ps1   ──→ mpsd_to_benign.py             │
-│    SecRepo Squid log      ──→ secrepo_to_benign.py          │
-│                                                              │
-│  Match event sources:                                        │
-│    Hayabusa JSONL         ──→ hayabusa_to_matches.py         │
-│    OTRF Security-Datasets ──→ otrf_to_matches.py            │
-│                                                              │
-│  Evasion generation:                                         │
-│    Match events           ──→ generate_evasions.py           │
-│      (remove_exe, double_space, backtick_insert, ...)        │
-└──────────────────────────────────────────────────────────────┘
-                           │
-                           ▼
-┌──────────────────────────────────────────────────────────────┐
-│                   TRAINING PIPELINE                          │
-│                                                              │
-│  1. Load data (data.py)                                      │
-│     ├── Benign: txt / jsonl / json / csv (multi-format)      │
-│     ├── Rule filters: AMIDES YAML or raw Sigma detection     │
-│     └── Match/Evasion events: per-rule JSON files            │
-│                                                              │
-│  2. Normalize (normalize.py)                                 │
-│     Filter dummy → lowercase → tokenize → filter            │
-│     numeric/long tokens → sort → comma-join                  │
-│                                                              │
-│  3. Vectorize (features.py)                                  │
-│     TF-IDF / Count / Binary / Hashing / Scaled Count         │
-│                                                              │
-│  4A. Misuse Classification C1/C2 (train.py)                  │
-│      GridSearchCV over C ∈ logspace(-2,1,50), class_weight   │
-│      → best SVC + MCC-based scaler                           │
-│                                                              │
-│  4B. Rule Attribution C3 (train_attribution.py)              │
-│      Per-rule binary SVC (benign vs rule_i) → rank by df     │
-│                                                              │
-│  5. Evaluate & Plot                                          │
-│     Threshold sweep P/R/F1/MCC → PR-Threshold plot           │
-│     Top-k hit rates → Attribution distribution + CDF plot    │
-└──────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Core Library (`red/`)
-
-### `red/data.py` — Data Loading
-
-**Benign sample loading** (multi-format, memory-efficient):
-- `load_benign_samples(path, field)` — Load all at once into list
-- `benign_samples_iter(path, field, max_samples)` — Yield one at a time (avoids OOM for large datasets)
-- `count_benign_samples(path, field, max_samples)` — Count without loading
-- Supported formats: `.txt` (plain text), `.jsonl`/`.ndjson`, `.json`, `.csv`
-- `field`: dot-separated path e.g. `"process.command_line"`, `"winlog.event_data.TargetObject"`
-
-**Rule set loading**:
-- `load_rule_set(events_dir, rules_dir, evasions_dir)` — Load rules with matches and evasions
-  - Supports separate `evasions_dir` (generated evasions separate from match events)
-  - Falls back to rules-only mode when `events_dir` is absent
-- `RuleData` dataclass: `name`, `filters`, `matches`, `evasions`, `sigma_values`
-
-**Sigma filter/detection extraction**:
-- `extract_filter_values(filter_str, search_fields)` — Parse AMIDES Lucene filter via luqum
-- `get_all_filter_values(rule_set, search_fields)` — Across all rules (AMIDES + raw Sigma)
-- `get_all_yaml_filter_values(rules_dir, search_fields)` — Scan all YAMLs directly (handles mismatched filenames)
-- `_extract_sigma_detection_values(detection, search_fields)` — From raw Sigma detection blocks
-
-**Helpers**: `extract_commandlines()`, `get_all_matches()`, `get_all_evasions()`, `create_labels()`
-
----
-
-### `red/normalize.py` — Text Normalization
-
-`Normalizer` class performs a 6-step pipeline:
-1. `FilterDummyCharacters`: Remove `"`, `^`, `` ` ``, `'`
-2. `Lowercase`
-3. `Tokenize`: Split on `\w+` word boundaries
-4. `FilterNumeric`: Remove hex/numeric tokens > `max_num_len` (default 3) chars
-5. `FilterStrings`: Remove tokens > `max_str_len` (default 30) chars
-6. Sort alphabetically + comma-join
-
-`normalize_samples(samples)` — Batch normalize, drop empties.
-
----
-
-### `red/features.py` — Feature Extraction
-
-`create_vectorizer(method, ngram_range, analyzer)` — Create sklearn vectorizer:
-
-| Method         | Description                                      |
-|----------------|--------------------------------------------------|
-| `tfidf`        | TF-IDF (default)                                 |
-| `count`        | Raw token counts                                 |
-| `binary_count` | Binary presence/absence                          |
-| `hashing`      | HashingVectorizer (memory-efficient)             |
-| `scaled_count` | CountVectorizer + MaxAbsScaler pipeline          |
-
-`comma_tokenizer(text)` — Split normalized sample on commas.
-
----
-
-### `red/models.py` — SVM Training
-
-Auto-detects acceleration backend at import:
-- **NVIDIA GPU**: RAPIDS cuML SVC (fastest for large datasets)
-- **Intel CPU**: scikit-learn-intelex patched SVC
-- **Plain CPU**: standard scikit-learn SVC
-
-`train_svc_gridsearch(X, y, param_grid, scoring, cv, n_jobs)`:
-- Default grid: `C ∈ logspace(-2, 1, 50)`, `kernel=linear`, `class_weight ∈ [balanced, None]`
-- tqdm progress bar during grid search
-- GPU mode: grid search on CPU → final fit on GPU
-- Returns: `(estimator, best_params, best_score)`
-
-`train_svc_fixed(X, y, C, kernel, class_weight)` — Train with fixed parameters.
-
----
-
-### `red/evaluate.py` — Evaluation & MCC Scaling
-
-`create_mcc_scaler(df_values, labels, num_samples, mcc_threshold)`:
-- Two-pass scan: coarse → refine within MCC > threshold range
-- Makes range symmetric around 0
-- Calculates shift to center MCC optimum at 0.5
-- Returns `(MinMaxScaler, shift)`
-
-`scale_df_values(df_values, scaler, shift)` — Apply shift + scale, clip to [0, 1].
-
-`BinaryEvaluation(num_thresholds)`:
-- `.evaluate(labels, scaled_scores)` — Sweep `num_thresholds+1` thresholds, compute P/R/F1/MCC/TP/FP/TN/FN
-- `.optimal_threshold_idx()` — Index of max F1
-- `.default_threshold_idx()` — Index of threshold 0.5
-- `.summary()` — Dict with metrics at optimal and default thresholds
-
----
-
-### `red/attribution.py` — Rule Attribution
-
-`RuleAttributionEvaluation(num_rules)`:
-- `.evaluate_single(true_rule, ranked_attributions)` — Score one evasion
-- `.calculate_hit_rates()` — Convert counts to rates
-- `.summary()` — Top-1/5/10 cumulative hit rates + TP/FP/TN/FN
-
-`score_evasion(sample_vector, rule_models)` — Score one sample against all rule models, return sorted list.
-
-`process_evasions_batch(normalized_samples, evasion_to_rule, rule_models)` — Batch evaluation with per-rule transform.
-
----
-
-### `red/visualize.py` — Plotting
-
-`plot_pr_threshold(evaluations, labels, output_path, title)`:
-- 2×2 subplot: Precision / Recall / F1-Score / MCC vs. threshold
-- Marks optimal threshold (per evaluation) and default 0.5
-
-`plot_attribution(top_n_hits, output_path, title)`:
-- Bar chart: distribution of attribution ranks
-- Line: cumulative distribution (CDF)
-
----
-
-### `red/persist.py` — Persistence
-
-`save_result(obj, name, output_dir, info)` — Pickle → ZIP (max compression) + JSON sidecar.
-
-`load_result(path)` — Load from ZIP archive.
-
-File naming convention:
-- `train_rslt_<name>.zip` — TrainingResult
-- `valid_rslt_<name>.zip` — ValidationResult
-- `eval_rslt_<name>.zip` — EvaluationResult
-- `<name>_info.json` — Human-readable metadata sidecar
-
----
-
-## Scripts (`scripts/`)
-
-### `scripts/train.py` — Train Misuse Classifier
+### Chạy từng bước (Stage 1)
 
 ```bash
-python scripts/train.py --config config/process_creation.yaml
+# Bước 1: Train model (Ensemble)
+python scripts/train.py --config config/process_creation.yaml --ensemble
 
-# CLI args (override config):
-python scripts/train.py \
-  --benign-samples ~/data/benign/process_creation/benign_train.txt \
-  --events-dir ~/data/sigma/events_hayabusa/windows/process_creation \
-  --rules-dir ~/data/sigma/rules/windows/process_creation \
-  --malicious-samples both \       # rule_filters | matches | both
-  --vectorization tfidf \
-  --search-params \
-  --scoring f1 \
-  --cv 5 \
-  --mcc-scaling \
-  --max-benign-samples 50000 \     # cap benign count (avoids OOM)
-  --out-dir models/process_creation \
-  --result-name misuse_svc_rules_f1
+# Bước 1 thay thế: Train SVM đơn lẻ (baseline)
+python scripts/train.py --config config/process_creation.yaml --search-params
+
+# Bước 2: Validate (tính decision_function trên validation set)
+python scripts/validate.py --config config/process_creation.yaml
+
+# Bước 3: Evaluate (threshold sweep → metrics)
+python scripts/evaluate.py --config config/process_creation.yaml
 ```
 
-**Output**: `models/process_creation/train_rslt_misuse_svc_rules_f1.zip`
-
----
-
-### `scripts/validate.py` — Validate Model
+### Stage 2 — Rule Attribution
 
 ```bash
-python scripts/validate.py \
-  --config config/process_creation.yaml \
-  --result-path models/process_creation/train_rslt_misuse_svc_rules_f1.zip
+# Train per-rule SVM + Cosine attributor
+python scripts/train_attribution.py --config config/process_creation.yaml
+
+# Evaluate với 3 method để so sánh
+python scripts/eval_attribution.py --config config/process_creation.yaml --method svm
+python scripts/eval_attribution.py --config config/process_creation.yaml --method cosine
+python scripts/eval_attribution.py --config config/process_creation.yaml --method hybrid
 ```
 
-**Output**: `models/process_creation/valid_rslt_misuse_svc_rules_f1.zip`
-
----
-
-### `scripts/evaluate.py` — Threshold Sweep Evaluation
+### Thí nghiệm so sánh (cho luận văn)
 
 ```bash
-python scripts/evaluate.py \
-  --config config/process_creation.yaml \
-  --result-path models/process_creation/valid_rslt_misuse_svc_rules_f1.zip \
-  --num-thresholds 50
+# So sánh SVM đơn vs Ensemble
+python scripts/train.py --config config/process_creation.yaml --search-params \
+    --result-name svm_only
+python scripts/train.py --config config/process_creation.yaml --ensemble \
+    --result-name ensemble_full
+
+# So sánh Attribution methods
+python scripts/eval_attribution.py --config config/process_creation.yaml --method svm
+python scripts/eval_attribution.py --config config/process_creation.yaml --method cosine
+python scripts/eval_attribution.py --config config/process_creation.yaml --method hybrid
 ```
 
-**Output**: `models/process_creation/eval_rslt_misuse_svc_rules_f1.zip`
-
----
-
-### `scripts/train_attribution.py` — Train Per-Rule Models
+### Chạy tất cả event types
 
 ```bash
-python scripts/train_attribution.py \
-  --config config/process_creation.yaml \
-  --model-params models/process_creation/train_rslt_misuse_svc_rules_f1.zip
+bash run_all.sh
 ```
 
-**Output**: `models/process_creation/train_rslt_attr_svc_rules.zip`
-
----
-
-### `scripts/eval_attribution.py` — Evaluate Rule Attribution
+### Sinh đồ thị
 
 ```bash
-python scripts/eval_attribution.py \
-  --config config/process_creation.yaml \
-  --result-path models/process_creation/train_rslt_attr_svc_rules.zip
-```
-
-**Output**: `models/process_creation/eval_attr_attr_svc_rules.zip`
-
----
-
-### `scripts/plot.py` — Generate Figures
-
-```bash
-# PR-Threshold plot
 python scripts/plot.py pr \
-  --result-paths models/process_creation/eval_rslt_misuse_svc_rules_f1.zip \
-  --output figures/figure_3_misuse_classification.pdf
+    --result-paths models/process_creation/eval_rslt_*.zip \
+    --output figures/stage1_pr_threshold.pdf
 
-# Attribution plot
 python scripts/plot.py attr \
-  --result-path models/process_creation/eval_attr_attr_svc_rules.zip \
-  --output figures/figure_4_rule_attribution.pdf
+    --result-path models/process_creation/eval_attr_hybrid_*.zip \
+    --output figures/stage2_attribution.pdf
 ```
 
 ---
 
-### `scripts/run_pipeline.py` — Run Complete Pipeline
+## Chuẩn bị dữ liệu
+
+### Benign data
 
 ```bash
-python scripts/run_pipeline.py --config config/process_creation.yaml
-python scripts/run_pipeline.py --config config/process_creation.yaml --skip-attribution
-python scripts/run_pipeline.py --config config/process_creation.yaml --skip-plots
+# Process creation + Registry (từ LMD Collections)
+python scripts/lmd_to_benign.py \
+    --lmd-dir ~/datasets/LMD_Collections \
+    --output-dir ~/data/benign
+
+# PowerShell (từ MPSD)
+python scripts/mpsd_to_benign.py \
+    --mpsd-dir ~/datasets/mpsd/powershell_benign_dataset \
+    --output-dir ~/data/benign/powershell
+
+# Web proxy URLs (từ SecRepo Squid log)
+python scripts/secrepo_to_benign.py \
+    --input ~/datasets/access.log \
+    --output-dir ~/data/benign/proxy_web
 ```
 
-Runs all steps sequentially: train → validate → evaluate → attribution → plot.
+### Match events
 
----
+```bash
+# Từ Hayabusa output
+python scripts/hayabusa_to_matches.py \
+    --input hayabusa_matches.jsonl \
+    --output-dir ~/data/sigma/events_hayabusa/windows/process_creation \
+    --event-type process_creation
+```
 
-## Data Preparation Scripts
-
-### `scripts/generate_evasions.py` — Generate Evasion Events
-
-Generates evasion variants of match events by applying transformation techniques that bypass Sigma rule patterns.
+### Evasion variants
 
 ```bash
 python scripts/generate_evasions.py --config config/process_creation.yaml
 python scripts/generate_evasions.py --config config/registry_event.yaml
 python scripts/generate_evasions.py --config config/powershell.yaml
-python scripts/generate_evasions.py --config config/process_creation.yaml --dry-run
-```
-
-Supported transformations by event type:
-
-| Event Type        | Techniques                                                                          |
-|-------------------|-------------------------------------------------------------------------------------|
-| `process_creation`| `remove_exe`, `double_space`, `quote_wrap_flags`, `case_upper`, `case_lower`, `env_systemroot`, `env_temp`, `long_flag_o` |
-| `registry_event`  | `hklm_expand`, `hklm_abbrev`, `hku_expand`, `hku_abbrev`, `case_lower`, `case_upper`, `trailing_backslash` |
-| `powershell`      | `backtick_insert`, `case_mix`, `concat_keywords`, `double_space`, `env_comspec`     |
-
-Each technique is verified to actually bypass the rule (evasion discarded if it still matches any rule pattern).
-Output: `evasions_dir/<rule_name>/<rule>_Evasion_<technique>_<n>.json`
-
----
-
-### `scripts/hayabusa_to_matches.py` — Hayabusa JSONL → Match Events
-
-Converts Hayabusa security scanner JSONL output to AMIDES-format per-rule match JSON files.
-
-```bash
-python scripts/hayabusa_to_matches.py \
-  --input hayabusa_matches.jsonl \
-  --output-dir ~/data/sigma/events_hayabusa/windows/process_creation \
-  --event-type process_creation
-
-python scripts/hayabusa_to_matches.py \
-  --input hayabusa_registry.jsonl \
-  --output-dir ~/data/sigma/events_hayabusa/windows/registry_event \
-  --event-type registry_event
-
-python scripts/hayabusa_to_matches.py \
-  --input hayabusa_powershell.jsonl \
-  --output-dir ~/data/sigma/events_hayabusa/windows/powershell \
-  --event-type powershell
-```
-
-Enriches events with AMIDES-compatible fields (`process.command_line`, `winlog.event_data.TargetObject`, etc.).
-Groups by `RuleTitle`, normalizes to snake_case dir name, writes `<rule>_Match_<n>.json`.
-
----
-
-### `scripts/otrf_to_matches.py` — OTRF Datasets → Match Events
-
-Converts OTRF Security-Datasets JSON files to AMIDES-format match events by matching CommandLine values against Sigma rule patterns.
-
-```bash
-python scripts/otrf_to_matches.py \
-  --otrf-dir ~/data/Security-Datasets/datasets/atomic/windows \
-  --rules-dir ~/data/sigma/rules/windows/process_creation \
-  --output-dir ~/data/sigma/events_otrf/windows/process_creation
-```
-
-Handles multiple OTRF JSON formats (Winlogbeat ECS, raw WEL, simplified Sysmon).
-Supports wildcard matching (`*`) in Sigma patterns.
-
----
-
-### `scripts/lmd_to_benign.py` — LMD Collections → Benign Samples
-
-Converts Lateral Movement Dataset (LMD) Collections CSV files to per-event-type benign sample text files.
-
-```bash
-python scripts/lmd_to_benign.py \
-  --lmd-dir ~/datasets/benign_data/Lateral-Movement-Dataset--LMD_Collections \
-  --output-dir ~/data/benign
-```
-
-Maps EventID → event type: `1 → process_creation`, `12/13/14 → registry_event`.
-Deduplicates samples automatically. Processes both LMD-2022 and LMD-2023 subsets.
-
----
-
-### `scripts/mpsd_to_benign.py` — MPSD PowerShell → Benign Samples
-
-Converts das-lab/mpsd PowerShell benign `.ps1` files to `benign_train.txt`.
-Each file becomes one line (newlines collapsed to spaces).
-
-```bash
-python scripts/mpsd_to_benign.py \
-  --mpsd-dir ~/datasets/benign_data/mpsd/powershell_benign_dataset \
-  --output-dir ~/data/benign/powershell
 ```
 
 ---
 
-### `scripts/mpsd_to_malicious.py` — MPSD PowerShell → Malicious Samples
+## Cấu trúc thư mục
 
-Filters das-lab/mpsd malicious `.ps1` files by Sigma rule patterns for `ScriptBlockText`.
-Only keeps files that would have triggered at least one Sigma rule.
-
-```bash
-python scripts/mpsd_to_malicious.py \
-  --mpsd-dir ~/datasets/malicious_data/mpsd/malicious_pure \
-  --rules-dir ~/data/sigma/rules/windows/powershell \
-  --output ~/data/benign/powershell/malicious_extra.txt
+```
+rule_evasion_detection/
+├── red/                          # Core library
+│   ├── normalize.py              # 6-step text normalization
+│   ├── features.py               # TF-IDF / Count vectorizers, comma_tokenizer
+│   ├── models.py                 # SVM + LR + CNB + EnsembleClassifier
+│   ├── evaluate.py               # BinaryEvaluation, MCC scaler
+│   ├── attribution.py            # RuleAttributionEvaluation, CosineRuleAttributor, RRF
+│   ├── data.py                   # Data loading (txt/jsonl/json/csv, Sigma rules)
+│   ├── persist.py                # save/load pickle+ZIP
+│   └── visualize.py              # PR curves, attribution plots
+├── scripts/
+│   ├── train.py                  # Stage 1 training (--ensemble flag)
+│   ├── validate.py               # Transform + decision_function
+│   ├── evaluate.py               # MCC scale + threshold sweep
+│   ├── train_attribution.py      # Stage 2: per-rule SVM + Cosine
+│   ├── eval_attribution.py       # --method svm|cosine|hybrid
+│   ├── generate_evasions.py      # Tạo evasion variants
+│   ├── run_pipeline.py           # Chạy toàn bộ pipeline
+│   ├── plot.py                   # Sinh đồ thị
+│   ├── hayabusa_to_matches.py    # Hayabusa JSONL → match events
+│   ├── lmd_to_benign.py          # LMD CSV → benign_train.txt
+│   ├── mpsd_to_benign.py         # MPSD .ps1 → benign PowerShell
+│   ├── mpsd_to_malicious.py      # MPSD malicious .ps1 filter
+│   └── secrepo_to_benign.py      # Squid log → URL benign
+├── config/
+│   ├── process_creation.yaml
+│   ├── registry_event.yaml
+│   ├── powershell.yaml
+│   └── proxy_web.yaml
+├── data/                         # Dữ liệu (không commit)
+│   ├── benign/
+│   ├── sigma/rules/
+│   ├── sigma/events_hayabusa/
+│   └── sigma/evasions/
+├── models/                       # Output model .zip (không commit)
+├── requirements.txt
+└── run_all.sh
 ```
 
 ---
 
-### `scripts/secrepo_to_benign.py` — SecRepo Squid Log → Benign URLs
-
-Extracts HTTP/HTTPS URLs from Squid `access.log` format for proxy/web experiments.
-Skips `CONNECT` (HTTPS tunnels) and non-HTTP entries.
-
-```bash
-python scripts/secrepo_to_benign.py \
-  --input ~/datasets/benign_data/access.log/access.log \
-  --output-dir ~/data/benign/proxy_web
-```
-
----
-
-## Config File Format
+## Config file
 
 ```yaml
 data:
   benign_train: ~/data/benign/process_creation/benign_train.txt
   benign_valid: ~/data/benign/process_creation/benign_train.txt
-  benign_field: process.command_line          # dot-path to extract from JSON/CSV
+  benign_field: process.command_line      # dot-path để extract từ JSON/CSV
   events_dir: ~/data/sigma/events_hayabusa/windows/process_creation
-  evasions_dir: ~/data/sigma/evasions/windows/process_creation   # separate evasions dir
+  evasions_dir: ~/data/sigma/evasions/windows/process_creation
   rules_dir: ~/data/sigma/rules/windows/process_creation
   search_fields:
     - process.command_line
-  max_benign_samples: 50000                  # optional cap (proxy_web has 1.5M URLs)
-  malicious_extra: ~/data/benign/powershell/malicious_extra.txt  # extra malicious samples
 
 training:
-  malicious_samples: both       # rule_filters | matches | both
-  vectorization: tfidf           # tfidf | count | binary_count | hashing | scaled_count
+  malicious_samples: both         # rule_filters | matches | both
+  vectorization: tfidf            # tfidf | count | binary_count | hashing | scaled_count
   ngram_range: [1, 1]
-  search_params: true            # GridSearchCV (false = fixed default params)
-  scoring: f1                    # f1 | mcc
+  search_params: true             # GridSearchCV
+  ensemble: false                 # true = dùng SVM+LR+CNB Ensemble
+  ensemble_members: [svm, lr, cnb]
+  scoring: f1                     # f1 | mcc
   cv_folds: 5
   num_jobs: 3
 
 scaling:
   mcc_scaling: true
   mcc_threshold: 0.1
-  num_mcc_samples: 50
 
 evaluation:
   num_thresholds: 50
@@ -544,62 +461,21 @@ output:
 
 ---
 
-## Data Format
+## Loại sự kiện hỗ trợ
 
-### Benign Samples
-
-Supports multiple formats (auto-detected by file extension):
-
-```
-# .txt — one value per line
-C:\Windows\System32\cmd.exe /c ipconfig
-powershell.exe -ExecutionPolicy Bypass -File script.ps1
-
-# .jsonl — one JSON object per line
-{"process": {"command_line": "cmd.exe /c whoami"}}
-
-# .csv — header required, column found by benign_field name
-CommandLine,User,Host
-"cmd.exe /c dir",SYSTEM,WORKSTATION
-```
-
-### Match/Evasion Events (JSON)
-
-```json
-{
-  "process": {
-    "command_line": "cscript.exe //nologo malicious.vbs"
-  },
-  "winlog": {
-    "event_data": {
-      "CommandLine": "cscript.exe //nologo malicious.vbs",
-      "Image": "C:\\Windows\\System32\\cscript.exe"
-    }
-  }
-}
-```
-
-Files named: `<rule>_Match_<n>.json`, `<rule>_Evasion_<technique>_<n>.json`
-
-### Sigma Rules (AMIDES YAML format)
-
-```yaml
-- filter: 'process.command_line:"cscript" AND process.command_line:"malicious"'
-  pre_detector:
-    title: "Suspicious CScript Execution"
-```
-
-Also supports standard Sigma HQ YAML format (with `detection:` blocks).
+| Event Type | Field | Config | Benign source |
+|---|---|---|---|
+| `process_creation` | `process.command_line` | `config/process_creation.yaml` | LMD Collections |
+| `registry_event` | `winlog.event_data.TargetObject` | `config/registry_event.yaml` | LMD Collections |
+| `powershell` | `winlog.event_data.ScriptBlockText` | `config/powershell.yaml` | MPSD |
+| `proxy_web` | `c-uri` / URL | `config/proxy_web.yaml` | SecRepo Squid |
 
 ---
 
-## Pipeline Mapping to AMIDES Paper
+## Tham khảo
 
-| Paper Section | Experiment                                     | Scripts                                              | Output                     |
-|---------------|------------------------------------------------|------------------------------------------------------|----------------------------|
-| C1            | Misuse Classification (rule_filters)           | `train.py` → `validate.py` → `evaluate.py`          | Figure 3 (PR-Threshold)    |
-| C2            | Misuse Classification (matches)                | `train.py --malicious-samples matches` → ...         | Figure 3                   |
-| C3            | Rule Attribution                               | `train_attribution.py` → `eval_attribution.py`       | Figure 4 (Distribution+CDF)|
-| —             | Evasion generation (own extension)             | `generate_evasions.py`                               | Evasion JSON files         |
-| —             | Data preparation (own extension)               | `hayabusa_to_matches.py`, `lmd_to_benign.py`, etc.   | Benign/match datasets      |
-| Visualization | All plots                                      | `plot.py pr` / `plot.py attr`                        | PDF figures                |
+- Uetz et al., *"AMIDES: Adaptive Misuse Detection and Evasion"*, USENIX Security 2024
+- SigmaHQ: [github.com/SigmaHQ/sigma](https://github.com/SigmaHQ/sigma)
+- LMD Collections: Lateral Movement Dataset 2022/2023
+- MPSD: [github.com/das-lab/mpsd](https://github.com/das-lab/mpsd)
+- Hayabusa: [github.com/Yamato-Security/hayabusa](https://github.com/Yamato-Security/hayabusa)

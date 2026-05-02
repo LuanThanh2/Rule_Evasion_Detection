@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from red.data import load_rule_set, extract_commandlines
 from red.normalize import Normalizer
-from red.attribution import RuleAttributionEvaluation
+from red.attribution import RuleAttributionEvaluation, reciprocal_rank_fusion
 from red.persist import load_result, save_result
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
@@ -40,6 +40,11 @@ def main():
     parser.add_argument("--result-path", type=str, help="Path to attribution TrainingResult .zip")
     parser.add_argument("--events-dir", type=str)
     parser.add_argument("--rules-dir", type=str)
+    parser.add_argument("--method", type=str, default="svm",
+                        choices=["svm", "cosine", "hybrid"],
+                        help="Scoring method: svm (per-rule SVM), cosine (similarity), or hybrid (RRF fusion)")
+    parser.add_argument("--rrf-k", type=int, default=60,
+                        help="RRF smoothing constant (only used by hybrid method)")
     parser.add_argument("--out-dir", type=str, default="models")
     args = parser.parse_args()
 
@@ -65,7 +70,15 @@ def main():
     logger.info("Loading attribution models from %s", args.result_path)
     multi_result = load_result(args.result_path)
     rule_models = multi_result["rule_models"]
-    logger.info("Loaded %d rule models", len(rule_models))
+    cosine_attributor = multi_result.get("cosine_attributor")
+    logger.info("Loaded %d rule models (cosine: %s)",
+                len(rule_models), "available" if cosine_attributor else "missing")
+
+    if args.method in ("cosine", "hybrid") and cosine_attributor is None:
+        parser.error(
+            f"--method {args.method} requires a cosine attributor in the result file. "
+            "Re-run train_attribution.py with --cosine (default)."
+        )
 
     # ── Step 2: Load evasion data ──
     evasions_dir = os.path.expanduser(getattr(args, "evasions_dir", None) or "")
@@ -88,40 +101,68 @@ def main():
     # ── Step 3: Normalize and score ──
     sorted_evasions = sorted(evasion_to_rule.keys())
     normalized = [normalizer.normalize(ev) for ev in sorted_evasions]
+    logger.info("Scoring with method: %s", args.method)
 
-    # Score each sample against all rule models
-    sample_results = [{} for _ in sorted_evasions]
+    # SVM rankings (computed when method is svm or hybrid)
+    svm_rankings = None
+    if args.method in ("svm", "hybrid"):
+        sample_results = [{} for _ in sorted_evasions]
+        for rule_name, model in rule_models.items():
+            vectorizer = model["vectorizer"]
+            estimator = model["estimator"]
+            transformed = vectorizer.transform(normalized)
+            df_values = estimator.decision_function(transformed)
+            for i in range(len(sorted_evasions)):
+                sample_results[i][rule_name] = float(df_values[i])
+        svm_rankings = [
+            sorted(scores.items(), key=lambda x: x[1], reverse=True)
+            for scores in sample_results
+        ]
 
-    for rule_name, model in rule_models.items():
-        vectorizer = model["vectorizer"]
-        estimator = model["estimator"]
+    # Cosine rankings (computed when method is cosine or hybrid)
+    cosine_rankings = None
+    if args.method in ("cosine", "hybrid"):
+        cosine_rankings = cosine_attributor.score_samples(normalized)
 
-        transformed = vectorizer.transform(normalized)
-        df_values = estimator.decision_function(transformed)
-
-        for i in range(len(sorted_evasions)):
-            sample_results[i][rule_name] = float(df_values[i])
+    # Final ranking depends on method
+    if args.method == "svm":
+        per_sample_ranked = svm_rankings
+    elif args.method == "cosine":
+        per_sample_ranked = cosine_rankings
+    else:  # hybrid
+        per_sample_ranked = [
+            reciprocal_rank_fusion([svm_r, cos_r], k=args.rrf_k)
+            for svm_r, cos_r in zip(svm_rankings, cosine_rankings)
+        ]
 
     # ── Step 4: Evaluate rankings ──
     eval_result = RuleAttributionEvaluation(num_rules=len(rule_models))
 
     for i, evasion in enumerate(sorted_evasions):
         true_rule = evasion_to_rule[evasion]
-        ranked = sorted(sample_results[i].items(), key=lambda x: x[1], reverse=True)
-        eval_result.evaluate_single(true_rule, ranked)
+        eval_result.evaluate_single(true_rule, per_sample_ranked[i])
 
     eval_result.calculate_hit_rates()
 
     summary = eval_result.summary()
-    logger.info("Attribution results: %s", summary)
+    summary["method"] = args.method
+    if args.method == "hybrid":
+        summary["rrf_k"] = args.rrf_k
+    logger.info("Attribution results (%s): %s", args.method, summary)
 
     # ── Step 5: Save ──
     result_name = os.path.basename(args.result_path).replace("train_rslt_", "").replace(".zip", "")
     eval_data = {
         "evaluation": eval_result,
         "summary": summary,
+        "method": args.method,
     }
-    save_result(eval_data, f"eval_attr_{result_name}", args.out_dir, info=summary)
+    save_result(
+        eval_data,
+        f"eval_attr_{args.method}_{result_name}",
+        args.out_dir,
+        info=summary,
+    )
     logger.info("Attribution evaluation complete.")
 
 
