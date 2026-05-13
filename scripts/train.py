@@ -41,6 +41,7 @@ from red.data import (
     get_all_yaml_filter_values,
     get_all_matches,
     create_labels,
+    resolve_event_paths,
 )
 from red.normalize import normalize_samples
 from red.features import create_vectorizer
@@ -58,20 +59,25 @@ def load_config(config_path):
         return yaml.safe_load(f)
 
 
-def create_malicious_samples(rule_set, malicious_type, search_fields, rules_dir=None, extra_path=None):
-    """Create normalized malicious sample list from rule set."""
+def create_malicious_samples(rule_set, malicious_type, sigma_fields, event_paths,
+                              rules_dir=None, extra_path=None):
+    """Create normalized malicious sample list from rule set.
+
+    `sigma_fields` are tên field trong Sigma YAML (vd: CommandLine).
+    `event_paths` là JSON dotted paths để đọc event dict (vd: winlog.event_data.CommandLine).
+    """
     samples = []
     if malicious_type in ("matches", "both"):
         events = get_all_matches(rule_set)
-        match_samples = extract_commandlines(events, search_fields)
+        match_samples = extract_commandlines(events, event_paths)
         logger.info("Match samples: %d", len(match_samples))
         samples += match_samples
     if malicious_type in ("rule_filters", "both"):
         # Scan all YAMLs in rules_dir directly (bypass name-matching with events_dir)
-        filter_samples = get_all_yaml_filter_values(rules_dir, search_fields) if rules_dir else []
+        filter_samples = get_all_yaml_filter_values(rules_dir, sigma_fields) if rules_dir else []
         if not filter_samples:
             # Fallback to rule_set-based extraction
-            filter_samples = get_all_filter_values(rule_set, search_fields)
+            filter_samples = get_all_filter_values(rule_set, sigma_fields)
         logger.info("Rule filter samples: %d", len(filter_samples))
         samples += filter_samples
 
@@ -107,7 +113,8 @@ def main():
     parser.add_argument("--malicious-samples", type=str, default="rule_filters",
                         choices=["rule_filters", "matches", "both"])
     parser.add_argument("--search-fields", type=str, nargs="+",
-                        default=["process.command_line"])
+                        default=["CommandLine"],
+                        help="Sigma native field names (e.g. CommandLine, ScriptBlockText)")
     parser.add_argument("--vectorization", type=str, default="tfidf",
                         choices=["tfidf", "count", "hashing", "binary_count", "scaled_count"])
     parser.add_argument("--ngram-range", type=str, default="(1,1)")
@@ -129,11 +136,17 @@ def main():
                         help="Cap number of benign training samples (useful for very large datasets)")
     parser.add_argument("--mcc-scaling", action="store_true", default=True)
     parser.add_argument("--mcc-threshold", type=float, default=0.1)
-    parser.add_argument("--out-dir", type=str, default="models")
-    parser.add_argument("--result-name", type=str, default="misuse_svc_rules_f1")
+    parser.add_argument("--out-dir", type=str, default=None)
+    parser.add_argument("--result-name", type=str, default=None,
+                        help="Override result file name (CLI takes priority over config)")
     args = parser.parse_args()
 
-    # Load config file if provided (overrides CLI args)
+    # Track which flags were explicitly set on CLI (before config loading)
+    _cli_ensemble = args.ensemble          # True only if --ensemble was passed
+    _cli_search_params = args.search_params
+    _cli_result_name = args.result_name    # None if not passed
+
+    # Load config file if provided — CLI explicit flags take priority
     if args.config:
         cfg = load_config(args.config)
         data_cfg = cfg.get("data", {})
@@ -146,24 +159,35 @@ def main():
         args.rules_dir = args.rules_dir or data_cfg.get("rules_dir")
         args.evasions_dir = data_cfg.get("evasions_dir")
         args.search_fields = data_cfg.get("search_fields", args.search_fields)
+        args.event_field_map = data_cfg.get("event_field_map", {})
         args.benign_field = data_cfg.get("benign_field", None)
         args.max_benign_samples = data_cfg.get("max_benign_samples", None)
         args.malicious_extra = data_cfg.get("malicious_extra", None)
         args.malicious_samples = train_cfg.get("malicious_samples", args.malicious_samples)
         args.vectorization = train_cfg.get("vectorization", args.vectorization)
-        args.search_params = train_cfg.get("search_params", args.search_params)
-        args.ensemble = train_cfg.get("ensemble", args.ensemble)
-        args.ensemble_members = train_cfg.get("ensemble_members", args.ensemble_members)
         args.scoring = train_cfg.get("scoring", args.scoring)
         args.cv = train_cfg.get("cv_folds", args.cv)
         args.num_jobs = train_cfg.get("num_jobs", args.num_jobs)
         args.mcc_scaling = scale_cfg.get("mcc_scaling", args.mcc_scaling)
         args.mcc_threshold = scale_cfg.get("mcc_threshold", args.mcc_threshold)
-        args.out_dir = out_cfg.get("dir", args.out_dir)
-        args.result_name = out_cfg.get("result_name", args.result_name)
+        args.out_dir = args.out_dir or out_cfg.get("dir", "models")
+
+        # CLI flag wins over config for boolean switches
+        if not _cli_ensemble:
+            args.ensemble = train_cfg.get("ensemble", False)
+        if not _cli_search_params:
+            args.search_params = train_cfg.get("search_params", args.search_params)
+        args.ensemble_members = train_cfg.get("ensemble_members", args.ensemble_members)
+
+        # CLI --result-name wins over config; config wins over hardcoded default
+        args.result_name = _cli_result_name or out_cfg.get("result_name", "ensemble_f1")
 
         ngram = train_cfg.get("ngram_range", [1, 1])
         args.ngram_range = f"({ngram[0]},{ngram[1]})"
+    else:
+        args.out_dir = args.out_dir or "models"
+        args.result_name = _cli_result_name or "ensemble_f1"
+        args.event_field_map = {}
 
     # Validate required args
     if not args.benign_samples or not args.events_dir or not args.rules_dir:
@@ -175,6 +199,32 @@ def main():
     args.rules_dir = os.path.expanduser(args.rules_dir)
     args.out_dir = os.path.expanduser(args.out_dir)
 
+    # ── Pre-flight validation: fail fast before wasting compute ──
+    if not os.path.isfile(args.benign_samples):
+        parser.error(f"Benign file not found: {args.benign_samples}")
+    if not os.path.isdir(args.rules_dir):
+        parser.error(f"Rules dir not found: {args.rules_dir}")
+    if not os.path.isdir(args.events_dir):
+        logger.warning(
+            "Events dir not found: %s — falling back to rule_filters-only mode",
+            args.events_dir,
+        )
+        if args.malicious_samples in ("matches", "both"):
+            logger.warning(
+                "malicious_samples=%s requires events_dir; will only use rule_filters",
+                args.malicious_samples,
+            )
+
+    # Verify benign file actually yields samples with the configured field
+    sample_check = list(benign_samples_iter(args.benign_samples, args.benign_field, max_samples=10))
+    if len(sample_check) == 0:
+        parser.error(
+            f"Benign file produced 0 samples — check format/field mapping: "
+            f"{args.benign_samples} (benign_field={args.benign_field})"
+        )
+    logger.info("Pre-flight check OK: benign yields samples (first sample length=%d)", len(sample_check[0]))
+
+    os.makedirs(args.out_dir, exist_ok=True)
     ngram_range = eval(args.ngram_range)
 
     # ── Step 1: Load data ──
@@ -186,8 +236,11 @@ def main():
     # ── Step 2: Create malicious samples ──
     extra_path = os.path.expanduser(getattr(args, "malicious_extra", None) or "")
     extra_path = extra_path if os.path.isfile(extra_path) else None
+    event_paths = resolve_event_paths(args.search_fields, args.event_field_map)
+    logger.info("Sigma fields: %s → event paths: %s", args.search_fields, event_paths)
     malicious_samples = create_malicious_samples(
-        rule_set, args.malicious_samples, args.search_fields,
+        rule_set, args.malicious_samples,
+        sigma_fields=args.search_fields, event_paths=event_paths,
         rules_dir=args.rules_dir, extra_path=extra_path
     )
 

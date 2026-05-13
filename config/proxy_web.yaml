@@ -5,12 +5,16 @@ data:
   benign_field: url
   events_dir: ~/data/sigma/events_hayabusa/windows/proxy_web
   rules_dir: ~/data/sigma/rules/proxyweb/proxy_generic
+  # Sigma native field names — proxy event JSON dùng cùng tên (không cần map)
   search_fields:
     - url
     - c-uri
     - cs-uri-stem
     - cs-uri-query
+  # event_field_map rỗng → fallback tên Sigma làm JSON path trực tiếp
+  event_field_map: {}
   max_benign_samples: 10000
+  max_attribution_benign: 8000     # cap Stage 2 per-rule benign
 
 training:
   malicious_samples: rule_filters
@@ -31,5 +35,5 @@ evaluation:
 
 output:
   dir: models/proxy_web
-  result_name: misuse_svc_rules_f1
-  attr_result_name: attr_svc_rules
+  result_name: ensemble_f1
+  attr_result_name: attr_ensemble

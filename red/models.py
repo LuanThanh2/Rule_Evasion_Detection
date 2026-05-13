@@ -44,10 +44,12 @@ except ImportError:
 from sklearn.svm import SVC, LinearSVC
 
 DEFAULT_PARAM_GRID = {
-    "C": np.logspace(-2, 1, num=50),
+    "C": np.logspace(-2, 1, num=20),
     "kernel": ["linear"],
-    "class_weight": ["balanced", None],
+    "class_weight": ["balanced"],
 }
+
+RANDOM_STATE = 42
 
 SCORERS = {
     "f1": f1_score,
@@ -86,33 +88,20 @@ def train_svc_gridsearch(X, y, param_grid=None, scoring="f1", cv=5, n_jobs=-1):
         estimator = _fit_gpu_svc(X, y, best_params)
         return estimator, best_params, best_score
 
-    # CPU mode with tqdm progress bar
-    param_list = list(_iter_param_grid(param_grid))
-    best_score = -np.inf
-    best_params = None
-
-    with tqdm(total=len(param_list), desc="GridSearch", unit="param", ncols=80) as pbar:
-        for params in param_list:
-            kf = StratifiedKFold(n_splits=cv)
-            scores = []
-            for train_idx, val_idx in kf.split(X, y):
-                X_tr, X_val = X[train_idx], X[val_idx]
-                y_tr, y_val = y[train_idx], y[val_idx]
-                svc = SVC(cache_size=2000, **params)
-                svc.fit(X_tr, y_tr)
-                pred = svc.predict(X_val)
-                scores.append(scorer_fn(y_val, pred))
-            mean_score = np.mean(scores)
-            if mean_score > best_score:
-                best_score = mean_score
-                best_params = params
-            pbar.set_postfix({"best": f"{best_score:.4f}", "C": params.get("C", "?")})
-            pbar.update(1)
-
-    logger.info("Best params: %s  Best score: %.4f", best_params, best_score)
-    estimator = SVC(cache_size=2000, **best_params)
-    estimator.fit(X, y)
-    return estimator, best_params, best_score
+    # CPU mode using sklearn GridSearchCV — parallel via n_jobs (huge speedup vs manual loop)
+    cv_splitter = StratifiedKFold(n_splits=cv, shuffle=True, random_state=RANDOM_STATE)
+    gs = GridSearchCV(
+        SVC(cache_size=2000, random_state=RANDOM_STATE),
+        param_grid=param_grid,
+        scoring=scorer,
+        cv=cv_splitter,
+        n_jobs=n_jobs,
+        verbose=1,
+        refit=True,
+    )
+    gs.fit(X, y)
+    logger.info("Best params: %s  Best score: %.4f", gs.best_params_, gs.best_score_)
+    return gs.best_estimator_, gs.best_params_, gs.best_score_
 
 
 def _cpu_grid_search(X, y, param_grid, scorer, cv, n_jobs):
@@ -164,7 +153,8 @@ def train_svc_fixed(X, y, C=1.0, kernel="linear", class_weight="balanced"):
     if GPU_AVAILABLE:
         return _fit_gpu_svc(X, y, {"C": C, "kernel": kernel, "class_weight": class_weight})
 
-    svc = SVC(C=C, kernel=kernel, class_weight=class_weight, cache_size=2000)
+    svc = SVC(C=C, kernel=kernel, class_weight=class_weight,
+              cache_size=2000, random_state=RANDOM_STATE)
     svc.fit(X, y)
     logger.info("Trained SVC with C=%.4f, kernel=%s, class_weight=%s", C, kernel, class_weight)
     return svc
@@ -190,43 +180,38 @@ def _iter_param_grid(param_grid):
 # ---------------------------------------------------------------------------
 
 LR_PARAM_GRID = {
-    "C": np.logspace(-2, 1, num=20),
-    "class_weight": ["balanced", None],
+    "C": np.logspace(-2, 1, num=10),
+    "class_weight": ["balanced"],
 }
 
 
-def train_lr_gridsearch(X, y, param_grid=None, scoring="f1", cv=5):
-    """Train LogisticRegression with manual grid search + tqdm progress."""
+def train_lr_gridsearch(X, y, param_grid=None, scoring="f1", cv=5, n_jobs=-1):
+    """Train LogisticRegression using sklearn GridSearchCV (parallel via n_jobs)."""
     if param_grid is None:
         param_grid = LR_PARAM_GRID
 
     scorer_fn = SCORERS.get(scoring, f1_score)
-    param_list = list(_iter_param_grid(param_grid))
-    best_score = -np.inf
-    best_params = None
+    scorer = make_scorer(scorer_fn)
 
-    with tqdm(total=len(param_list), desc="GridSearch (LR)", unit="param", ncols=80) as pbar:
-        for params in param_list:
-            kf = StratifiedKFold(n_splits=cv)
-            scores = []
-            for train_idx, val_idx in kf.split(X, y):
-                lr = LogisticRegression(
-                    solver="liblinear", max_iter=1000, **params,
-                )
-                lr.fit(X[train_idx], y[train_idx])
-                pred = lr.predict(X[val_idx])
-                scores.append(scorer_fn(y[val_idx], pred))
-            mean_score = float(np.mean(scores))
-            if mean_score > best_score:
-                best_score = mean_score
-                best_params = params
-            pbar.set_postfix({"best": f"{best_score:.4f}"})
-            pbar.update(1)
+    n_combinations = _count_combinations(param_grid)
+    logger.info(
+        "LR GridSearchCV: %d combinations × %d folds = %d fits (n_jobs=%d)",
+        n_combinations, cv, n_combinations * cv, n_jobs,
+    )
 
-    logger.info("LR best params: %s  best score: %.4f", best_params, best_score)
-    estimator = LogisticRegression(solver="liblinear", max_iter=1000, **best_params)
-    estimator.fit(X, y)
-    return estimator, best_params, best_score
+    cv_splitter = StratifiedKFold(n_splits=cv, shuffle=True, random_state=RANDOM_STATE)
+    gs = GridSearchCV(
+        LogisticRegression(solver="liblinear", max_iter=1000, random_state=RANDOM_STATE),
+        param_grid=param_grid,
+        scoring=scorer,
+        cv=cv_splitter,
+        n_jobs=n_jobs,
+        verbose=1,
+        refit=True,
+    )
+    gs.fit(X, y)
+    logger.info("LR best params: %s  best score: %.4f", gs.best_params_, gs.best_score_)
+    return gs.best_estimator_, gs.best_params_, gs.best_score_
 
 
 # ---------------------------------------------------------------------------
@@ -339,7 +324,7 @@ def train_ensemble(X, y, scoring="f1", cv=5, n_jobs=-1, members=("svm", "lr", "c
     if "lr" in members:
         logger.info("Training Logistic Regression member...")
         lr, lr_params, lr_score = train_lr_gridsearch(
-            X, y, scoring=scoring, cv=cv,
+            X, y, scoring=scoring, cv=cv, n_jobs=n_jobs,
         )
         classifiers["lr"] = lr
         member_params["lr"] = lr_params

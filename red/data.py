@@ -25,6 +25,29 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def resolve_event_paths(
+    sigma_fields: List[str],
+    event_field_map: Optional[Dict[str, List[str]]] = None,
+) -> List[str]:
+    """Translate Sigma field names → JSON paths to try when reading event dicts.
+
+    Sigma YAML dùng tên native (CommandLine, ScriptBlockText, TargetObject, ...).
+    Event JSON (Hayabusa/ECS) dùng tên dotted (winlog.event_data.CommandLine, ...).
+    Config khai báo `search_fields` (Sigma) + `event_field_map` (Sigma → list JSON paths).
+    Hàm này dùng map để resolve, fallback về tên gốc nếu không có entry.
+    """
+    if not event_field_map:
+        return list(sigma_fields)
+    paths: List[str] = []
+    for sf in sigma_fields:
+        mapped = event_field_map.get(sf)
+        if mapped:
+            paths.extend(mapped)
+        else:
+            paths.append(sf)
+    return paths
+
+
 # ---------------------------------------------------------------------------
 # Data containers
 # ---------------------------------------------------------------------------
@@ -469,6 +492,8 @@ def _load_single_rule(
                 if isinstance(rule, dict):
                     if "filter" in rule:
                         rule_data.filters.append(rule["filter"])
+                    if "detection" in rule:
+                        rule_data.sigma_values.append(rule["detection"])
                     if "pre_detector" in rule:
                         title = rule["pre_detector"].get("title")
                         if title:
@@ -477,6 +502,11 @@ def _load_single_rule(
             logger.debug("Could not load rule YAML %s: %s", rule_yaml_path, e)
 
     return rule_data
+
+
+def extract_sigma_detection_values(detection: dict, search_fields) -> list:
+    """Public wrapper: extract values from a Sigma detection block for given fields."""
+    return _extract_sigma_detection_values(detection, set(search_fields))
 
 
 def _extract_sigma_detection_values(detection: dict, search_fields: set) -> list:

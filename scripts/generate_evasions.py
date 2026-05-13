@@ -420,6 +420,7 @@ def main():
         args.rules_dir = args.rules_dir or data_cfg.get("rules_dir")
         args.evasions_dir = args.evasions_dir or data_cfg.get("evasions_dir")
         args.search_fields = args.search_fields or data_cfg.get("search_fields")
+        args.event_field_map = data_cfg.get("event_field_map", {})
         if not args.event_type:
             config_name = os.path.basename(args.config).replace(".yaml", "")
             if config_name in TRANSFORMS_BY_TYPE:
@@ -431,6 +432,12 @@ def main():
         parser.error("--event-type is required")
     if not args.search_fields:
         parser.error("--search-fields is required")
+
+    # Resolve Sigma field names → JSON event paths
+    from red.data import resolve_event_paths
+    event_field_map = getattr(args, "event_field_map", {}) or {}
+    event_paths = resolve_event_paths(args.search_fields, event_field_map)
+    logger.info("Sigma fields: %s → event paths: %s", args.search_fields, event_paths)
 
     args.events_dir = os.path.expanduser(args.events_dir)
     args.rules_dir = os.path.expanduser(args.rules_dir)
@@ -460,7 +467,7 @@ def main():
     for rule_name, rule_data in sorted(rule_set.items()):
         count = generate_evasions_for_rule(
             rule_name, rule_data, transforms,
-            args.search_fields, args.evasions_dir,
+            event_paths, args.evasions_dir,
             pattern_map=pattern_map,
             dry_run=args.dry_run,
         )

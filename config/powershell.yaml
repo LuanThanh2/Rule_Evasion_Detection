@@ -1,15 +1,22 @@
 # Configuration for PowerShell event type experiments
 
 data:
-  benign_train: ~/data/benign/powershell/benign_train.txt
-  benign_valid: ~/data/benign/powershell/benign_train.txt
+  benign_train: ~/data/benign/powershell/benign_train.txt   # 100% benign — dùng cho cả train.py + validate.py (production)
+  benign_valid: ~/data/benign/powershell/benign_train.txt   # = benign_train (production). Đổi sang benign_train_split_val.txt nếu muốn 80/20 holdout
   benign_field: winlog.event_data.ScriptBlockText
   events_dir: ~/data/sigma/events_hayabusa/windows/powershell
   evasions_dir: ~/data/sigma/evasions/windows/powershell
   rules_dir: ~/data/sigma/rules/windows/powershell
+  # Sigma native field names — dùng để parse Sigma YAML detection blocks
   search_fields:
-    - winlog.event_data.ScriptBlockText
+    - ScriptBlockText
+  # Mapping Sigma field name → list JSON paths để đọc event/log dict
+  event_field_map:
+    ScriptBlockText:
+      - winlog.event_data.ScriptBlockText
   malicious_extra: ~/data/benign/powershell/malicious_extra.txt
+  max_benign_samples: 30000        # cap Stage 1 benign — MPSD .ps1 có thể rất lớn
+  max_attribution_benign: 15000    # cap Stage 2 per-rule benign
 
 training:
   malicious_samples: both
@@ -30,6 +37,6 @@ evaluation:
 
 output:
   dir: models/powershell
-  result_name: misuse_svc_rules_f1
-  train_result_path: models/powershell/train_rslt_misuse_svc_rules_f1.zip
-  attr_result_name: attr_svc_rules
+  result_name: ensemble_f1
+  train_result_path: models/powershell/train_rslt_ensemble_f1.zip
+  attr_result_name: attr_ensemble

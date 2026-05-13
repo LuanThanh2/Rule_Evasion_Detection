@@ -147,14 +147,14 @@ class BinaryEvaluation:
         """
         for i, threshold in enumerate(self.thresholds):
             pred = np.where(scaled_scores >= threshold, 1, 0)
-            self.precision[i] = precision_score(labels, pred, zero_division=1)
-            self.recall[i] = recall_score(labels, pred)
-            self.f1_scores[i] = f1_score(labels, pred)
+            self.precision[i] = precision_score(labels, pred, zero_division=0)
+            self.recall[i] = recall_score(labels, pred, zero_division=0)
+            self.f1_scores[i] = f1_score(labels, pred, zero_division=0)
             self.mccs[i] = matthews_corrcoef(labels, pred)
-            tn, fp, fn, tp = confusion_matrix(labels, pred).ravel()
+            tn, fp, fn, tp = confusion_matrix(labels, pred, labels=[0, 1]).ravel()
             self.tn[i], self.fp[i], self.fn[i], self.tp[i] = tn, fp, fn, tp
 
-        self.no_skill = labels.sum() / len(labels)
+        self.no_skill = labels.sum() / len(labels) if len(labels) else 0.0
         logger.info("Evaluation done: %d thresholds, no_skill=%.4f", len(self.thresholds), self.no_skill)
 
     def optimal_threshold_idx(self):

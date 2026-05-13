@@ -1,6 +1,7 @@
 # Rule Evasion Detection (RED)
 
-Mở rộng và tái cài đặt pipeline **AMIDES** (Uetz et al., USENIX Security 2024) để phát hiện và quy kết evasion của luật Sigma trên Windows event logs.
+RED là hệ thống hỗ trợ phát hiện và quy kết các biến thể né tránh luật Sigma trên Windows Event Logs.
+
 
 **Đóng góp mới so với AMIDES gốc:**
 - Stage 1: **Ensemble Classifier** (SVM + Logistic Regression + Complement Naive Bayes) thay cho SVM đơn lẻ
@@ -14,15 +15,22 @@ Mở rộng và tái cài đặt pipeline **AMIDES** (Uetz et al., USENIX Securi
 2. [Thuật toán sử dụng](#thuật-toán-sử-dụng)
 3. [Pipeline tổng quan](#pipeline-tổng-quan)
 4. [Cách chạy](#cách-chạy)
-5. [Chuẩn bị dữ liệu](#chuẩn-bị-dữ-liệu)
-6. [Cấu trúc thư mục](#cấu-trúc-thư-mục)
-7. [Config file](#config-file)
+5. [ELK Integration — Phát hiện trên hệ thống thật](#elk-integration--phát-hiện-trên-hệ-thống-thật)
+6. [Chuẩn bị dữ liệu](#chuẩn-bị-dữ-liệu)
+7. [Cấu trúc thư mục](#cấu-trúc-thư-mục)
+8. [Config file](#config-file)
 
 ---
 
 ## Cài đặt
 
 ```bash
+# Tạo virtualenv (chỉ làm lần đầu)
+python3 -m venv ~/venvs/rule_evasion_env
+
+# Activate venv — BẮT BUỘC mỗi lần mở terminal mới
+source ~/venvs/rule_evasion_env/bin/activate
+
 cd rule_evasion_detection
 pip install -r requirements.txt
 ```
@@ -37,6 +45,8 @@ pip install scikit-learn-intelex  # đã có trong requirements.txt
 ```
 
 Hệ thống tự động chọn backend: `NVIDIA GPU > Intel CPU > CPU thường`.
+
+> **Lưu ý:** Mọi lệnh `python3 scripts/...` bên dưới đều giả định đã `source ~/venvs/rule_evasion_env/bin/activate` trước đó.
 
 ---
 
@@ -98,7 +108,7 @@ Không gian TF-IDF:
 
 - Kernel linear phù hợp dữ liệu text thưa chiều cao
 - `class_weight=balanced`: bù trọng số khi benign >> malicious
-- **GridSearchCV** tìm tham số `C` tốt nhất trong 50 giá trị ∈ [0.01, 10]
+- **GridSearchCV** tìm tham số `C` tốt nhất trong 20 giá trị ∈ [0.01, 10], chạy song song `n_jobs=3`
 
 #### Logistic Regression (LR)
 Thay vì tìm margin, LR ước tính **xác suất** một event là malicious:
@@ -257,9 +267,8 @@ Rule_C: 1/(60+3) + 1/(60+3) = 0.0159 + 0.0159 = 0.0317
 │    + CosineRuleAttributor (shared vectorizer)               │
 │    → lưu train_rslt_attr_*.zip                              │
 │                                                             │
-│  eval_attribution.py --method hybrid                        │
-│    SVM ranking + Cosine ranking                             │
-│    → RRF Fusion → Top-K rules                               │
+│  eval_attribution.py --method cosine  (production)          │
+│    Cosine similarity trên shared TF-IDF space               │
 │    → Top-1/5/10 hit rate → lưu eval_attr_*.zip             │
 └─────────────────────────────────────────────────────────────┘
 ```
@@ -268,60 +277,166 @@ Rule_C: 1/(60+3) + 1/(60+3) = 0.0159 + 0.0159 = 0.0317
 
 ## Cách chạy
 
-### Chạy nhanh toàn bộ pipeline
+> **Trước khi chạy bất kỳ lệnh nào**, activate virtualenv:
+> ```bash
+> source ~/venvs/rule_evasion_env/bin/activate
+> ```
+> Mọi lệnh `python3 scripts/...` bên dưới đều phải chạy trong venv đã activate.
+
+> **Khuyến nghị:** Chạy smoke test (~2-3 phút) trước khi chạy full để xác nhận dữ liệu và config đúng.
+
+### Bước 0 — Smoke test (bắt buộc lần đầu)
 
 ```bash
-python scripts/run_pipeline.py --config config/process_creation.yaml
+source ~/venvs/rule_evasion_env/bin/activate
+
+# Chạy thử với 1000 mẫu benign — xác nhận pipeline end-to-end OK
+python3 scripts/train.py --config config/process_creation.yaml \
+    --max-benign-samples 1000
+
+python3 scripts/train_attribution.py --config config/process_creation.yaml \
+    --max-attribution-benign 1000
+
+# Nếu không có lỗi → chạy full bên dưới
 ```
 
-### Chạy từng bước (Stage 1)
+Smoke test sẽ fail sớm nếu:
+- Đường dẫn file/thư mục sai
+- Format benign không đúng hoặc sai `benign_field`
+- Thiếu data (events, rules)
+
+---
+
+### Stage 1 — Misuse Detection (Ensemble SVM + LR + CNB)
+
+Config mặc định đã trỏ cả `benign_train` và `benign_valid` → cùng file 100% data
+(`benign_train.txt`) cho production. File split 80/20 (`benign_train_split_*.txt`)
+chỉ giữ để debug — đổi `benign_valid` trong config nếu muốn dùng.
 
 ```bash
-# Bước 1: Train model (Ensemble)
-python scripts/train.py --config config/process_creation.yaml --ensemble
+source ~/venvs/rule_evasion_env/bin/activate
 
-# Bước 1 thay thế: Train SVM đơn lẻ (baseline)
-python scripts/train.py --config config/process_creation.yaml --search-params
+# Cách 1 — gộp 3 bước (khuyến nghị)
+python3 scripts/run_stage1.py --config config/process_creation.yaml
 
-# Bước 2: Validate (tính decision_function trên validation set)
+# Cách 2 — chạy từng bước (debug / chỉ chạy 1 phần)
+python3 scripts/train.py    --config config/process_creation.yaml --ensemble
+python3 scripts/validate.py --config config/process_creation.yaml
+python3 scripts/evaluate.py --config config/process_creation.yaml
+```
+
+`run_stage1.py` mặc định bật `--ensemble`. Nếu cần SVM baseline để so sánh:
+
+```bash
+python3 scripts/run_stage1.py --config config/process_creation.yaml \
+    --no-ensemble --result-name svm_baseline
+```
+
+**Chạy cho event type khác** — chỉ đổi `--config`:
+
+```bash
+python3 scripts/run_stage1.py --config config/registry_event.yaml
+python3 scripts/run_stage1.py --config config/powershell.yaml
+```
+
+> **Lưu ý:** `train.py` tự validate đường dẫn và benign field trước khi chạy.
+> GridSearch chạy **song song** với `n_jobs=3` (config). Nếu OOM giảm `num_jobs: 2`.
+
+---
+
+### Stage 2 — Rule Attribution (Cosine Similarity)
+
+```bash
+source ~/venvs/rule_evasion_env/bin/activate
+
+# Train CosineRuleAttributor (+ per-rule SVM lưu kèm để so sánh, không bắt buộc dùng)
+# Checkpoint tự động mỗi 20 rules → thoát giữa chừng không mất công
+python3 scripts/train_attribution.py --config config/process_creation.yaml
+
+# Evaluate — production dùng Cosine, xuất thêm CSV/JSONL chi tiết Top-3 từng sample
+python3 scripts/eval_attribution.py --config config/process_creation.yaml \
+    --method cosine --top-k-details 3
+
+# Ví dụ riêng cho registry_event
+python3 scripts/eval_attribution.py --config config/registry_event.yaml \
+    --method cosine --top-k-details 3
+```
+
+> **Production dùng `--method cosine`** vì nhanh + chính xác nhất trên data hiện tại
+> (top-1=68.8% so với Hybrid 48.7%, SVM 23.5%). Hybrid/SVM chỉ dùng khi cần so sánh
+> trong luận văn — xem [Thuật toán sử dụng](#thuật-toán-sử-dụng).
+
+Sau khi chạy với `--top-k-details 3`, script sinh thêm:
+
+```text
+models/<event_type>/eval_attr_cosine_attr_ensemble_details_top3.csv
+models/<event_type>/eval_attr_cosine_attr_ensemble_details_top3.jsonl
+```
+
+File CSV có các cột chính: `sample`, `true_rule`, `true_rank`,
+`top_1_rule`, `top_2_rule`, `top_3_rule` và score tương ứng. Nếu file cũ
+không ghi đè được do quyền filesystem, script tự tạo biến thể như
+`*_details_top3_new.csv` và ghi đường dẫn mới vào `eval_attr_*_info.json`.
+
+> **Checkpoint:** Nếu Stage 2 bị ngắt giữa chừng, các file
+> `models/process_creation/train_rslt_attr_svc_rules_ckpt_20.zip`, `_ckpt_40.zip`, ...
+> chứa kết quả đã train. Sau khi chạy xong có thể xóa.
+
+---
+
+### Thí nghiệm so sánh cho luận văn
+
+```bash
+# --- Stage 1: SVM đơn vs Ensemble ---
+# Baseline SVM
+python scripts/train.py --config config/process_creation.yaml \
+    --result-name svm_baseline
+
 python scripts/validate.py --config config/process_creation.yaml
-
-# Bước 3: Evaluate (threshold sweep → metrics)
 python scripts/evaluate.py --config config/process_creation.yaml
-```
 
-### Stage 2 — Rule Attribution
+# Ensemble SVM+LR+CNB
+python scripts/train.py --config config/process_creation.yaml \
+    --ensemble --result-name ensemble_full
 
-```bash
-# Train per-rule SVM + Cosine attributor
-python scripts/train_attribution.py --config config/process_creation.yaml
+python scripts/validate.py --config config/process_creation.yaml
+python scripts/evaluate.py --config config/process_creation.yaml
 
-# Evaluate với 3 method để so sánh
+# --- Stage 2: So sánh Attribution methods ---
 python scripts/eval_attribution.py --config config/process_creation.yaml --method svm
 python scripts/eval_attribution.py --config config/process_creation.yaml --method cosine
 python scripts/eval_attribution.py --config config/process_creation.yaml --method hybrid
 ```
 
-### Thí nghiệm so sánh (cho luận văn)
-
-```bash
-# So sánh SVM đơn vs Ensemble
-python scripts/train.py --config config/process_creation.yaml --search-params \
-    --result-name svm_only
-python scripts/train.py --config config/process_creation.yaml --ensemble \
-    --result-name ensemble_full
-
-# So sánh Attribution methods
-python scripts/eval_attribution.py --config config/process_creation.yaml --method svm
-python scripts/eval_attribution.py --config config/process_creation.yaml --method cosine
-python scripts/eval_attribution.py --config config/process_creation.yaml --method hybrid
-```
+---
 
 ### Chạy tất cả event types
 
 ```bash
-bash run_all.sh
+source ~/venvs/rule_evasion_env/bin/activate
+
+# Linux/Mac — Stage 1 cho cả 3 event types
+for cfg in process_creation registry_event powershell; do
+    python3 scripts/run_stage1.py --config config/$cfg.yaml
+done
+
+# Full pipeline (Stage 1 + Stage 2) cho 3 event types
+for cfg in process_creation registry_event powershell; do
+    python3 scripts/run_stage1.py --config config/$cfg.yaml
+    python3 scripts/train_attribution.py --config config/$cfg.yaml
+    python3 scripts/eval_attribution.py --config config/$cfg.yaml \
+        --method cosine --top-k-details 3
+done
+
+# Windows PowerShell
+foreach ($cfg in @("process_creation","registry_event","powershell","proxy_web")) {
+    python scripts/run_stage1.py --config "config/$cfg.yaml"
+    python scripts/train_attribution.py --config "config/$cfg.yaml"
+    python scripts/eval_attribution.py --config "config/$cfg.yaml" --method cosine --top-k-details 3
+}
 ```
+
+---
 
 ### Sinh đồ thị
 
@@ -334,6 +449,94 @@ python scripts/plot.py attr \
     --result-path models/process_creation/eval_attr_hybrid_*.zip \
     --output figures/stage2_attribution.pdf
 ```
+
+---
+
+---
+
+## ELK Integration — Phát hiện trên hệ thống thật
+
+Pipeline kết nối trực tiếp với ELK Stack đang giám sát Windows, không cần Hayabusa hay xử lý offline.
+
+### Kiến trúc
+
+```
+Windows (Sysmon EID 1)
+  └── Winlogbeat / Elastic Agent ──► Elasticsearch
+                                          │
+                               detect_live.py (poll mỗi N giây)
+                                          │
+                               Stage 1: Ensemble → score
+                                          │ score ≥ threshold
+                               Stage 2: Cosine Similarity → top-K rules
+                                          │
+                               Elasticsearch (index: red-alerts)
+                                          │
+                                    Kibana Dashboard
+```
+
+### Bước 1 — Offline verify (chạy lần đầu)
+
+```bash
+# Export events từ 15m qua ra JSONL
+python scripts/elk_export.py \
+  --es-host http://10.10.20.100:9200 \
+  --es-user elastic \
+  --es-password tzxr74123 \
+  --es-index "logs-winlog*" \
+  --since 15m \
+  --out ~/detect_logs/events.jsonl
+
+
+# Index thực tế tùy agent:
+#   Winlogbeat:                 --es-index "winlogbeat-*"
+#   Elastic Agent (Sysmon):     --es-index "logs-winlog*"
+#   Elastic Agent qua Logstash: --es-index "logs-generic*"
+
+# Chạy detection (dùng Cosine — nhanh & chính xác hơn Hybrid với data hiện tại)
+python scripts/detect_batch.py \
+  --config config/process_creation.yaml \
+  --events  ~/detect_logs/events.jsonl \
+  --threshold 0.0 \
+  --method cosine \
+  --out ~/detect_logs/alerts.jsonl
+
+cat ~/detect_logs/alerts.jsonl | python -m json.tool
+```
+
+### Bước 2 — Live daemon
+
+```bash
+python scripts/detect_live.py \
+  --config config/process_creation.yaml \
+  --es-host "http://elastic:tzxr74123@10.10.20.100:9200" \
+  --es-index "logs-winlog*" \
+  --out-index red-alerts \
+  --threshold 0.0 \
+  --method cosine \
+  --interval 60
+
+```
+
+Alerts được ghi vào index `red-alerts` với các field:
+
+| Field | Mô tả |
+|---|---|
+| `red.detection_score` | Score Stage 1 (cao = suspicious) |
+| `red.top_rule` | Rule Sigma bị evasion nhiều khả năng nhất |
+| `red.top_rules[]` | Top-5 rules kèm cosine similarity score |
+| `red.command_line` | CommandLine của event |
+| `host.name` | Tên máy Windows |
+
+Vào Kibana → **Stack Management → Index Patterns** → tạo pattern `red-alerts` để visualize.
+
+### Lưu ý
+
+- **Threshold**: Mặc định `0.0` (raw decision boundary). Tăng lên `0.3`–`0.5` nếu quá nhiều false positive.
+- **Method**: Mặc định nên dùng `cosine`. Hybrid/SVM chỉ dùng khi so sánh học thuật.
+- **State file**: `.detect_live_state.json` lưu timestamp đã xử lý — restart không bị trùng lặp.
+- **Không cần** `elasticsearch-py` — dùng `requests` thuần.
+- **Event ID**: Sysmon = `1`, Windows Security Log = `4688`.
 
 ---
 
@@ -404,7 +607,10 @@ rule_evasion_detection/
 │   ├── lmd_to_benign.py          # LMD CSV → benign_train.txt
 │   ├── mpsd_to_benign.py         # MPSD .ps1 → benign PowerShell
 │   ├── mpsd_to_malicious.py      # MPSD malicious .ps1 filter
-│   └── secrepo_to_benign.py      # Squid log → URL benign
+│   ├── secrepo_to_benign.py      # Squid log → URL benign
+│   ├── elk_export.py             # Export events Elasticsearch → JSONL
+│   ├── detect_batch.py           # Batch detection: JSONL → alerts (offline)
+│   └── detect_live.py            # Live daemon: poll ES → Stage1+2 → red-alerts
 ├── config/
 │   ├── process_creation.yaml
 │   ├── registry_event.yaml
@@ -424,40 +630,63 @@ rule_evasion_detection/
 
 ## Config file
 
+Giải thích toàn bộ các key trong `config/*.yaml`:
+
 ```yaml
 data:
   benign_train: ~/data/benign/process_creation/benign_train.txt
   benign_valid: ~/data/benign/process_creation/benign_train.txt
-  benign_field: process.command_line      # dot-path để extract từ JSON/CSV
+  benign_field: process.command_line      # dot-path để extract từ JSON/CSV (bỏ qua nếu plain text)
   events_dir: ~/data/sigma/events_hayabusa/windows/process_creation
   evasions_dir: ~/data/sigma/evasions/windows/process_creation
   rules_dir: ~/data/sigma/rules/windows/process_creation
+  # Sigma native field names — dùng để parse Sigma YAML detection blocks
   search_fields:
-    - process.command_line
+    - CommandLine
+  # Mapping Sigma field name → list JSON paths để đọc event/log dict
+  event_field_map:
+    CommandLine:
+      - process.command_line
+      - winlog.event_data.CommandLine
+  max_benign_samples: 30000        # Stage 1: giới hạn benign tránh OOM/chậm (bỏ = không giới hạn)
+  max_attribution_benign: 15000    # Stage 2: giới hạn benign mỗi rule (x100+ rules → quan trọng)
 
 training:
   malicious_samples: both         # rule_filters | matches | both
   vectorization: tfidf            # tfidf | count | binary_count | hashing | scaled_count
   ngram_range: [1, 1]
-  search_params: true             # GridSearchCV
-  ensemble: false                 # true = dùng SVM+LR+CNB Ensemble
+  search_params: true             # dùng GridSearchCV để tìm C tốt nhất
+  ensemble: false                 # true = SVM+LR+CNB Ensemble, false = SVM đơn lẻ
   ensemble_members: [svm, lr, cnb]
-  scoring: f1                     # f1 | mcc
-  cv_folds: 5
-  num_jobs: 3
+  scoring: f1                     # metric để GridSearch chọn best params: f1 | mcc
+  cv_folds: 5                     # số fold trong cross-validation
+  num_jobs: 3                     # core chạy song song GridSearch (giảm xuống 2 nếu OOM)
+
+validation:
+  malicious_samples: evasions     # evasions | matches | rule_filters | both
 
 scaling:
-  mcc_scaling: true
-  mcc_threshold: 0.1
+  mcc_scaling: true               # dùng MCC calibration để scale score → [0,1]
+  mcc_threshold: 0.1              # chỉ dùng vùng df_values có MCC > ngưỡng này
 
 evaluation:
-  num_thresholds: 50
+  num_thresholds: 50              # sweep 51 điểm trong [0,1] → P/R/F1/MCC
 
 output:
   dir: models/process_creation
   result_name: misuse_svc_rules_f1
+  train_result_path: models/process_creation/train_rslt_misuse_svc_rules_f1.zip  # Stage 2 đọc từ đây
   attr_result_name: attr_svc_rules
 ```
+
+### Giá trị field per event type
+
+| Event Type | `benign_field` | `search_fields` |
+|---|---|---|
+| `process_creation` | `process.command_line` | `[CommandLine]` |
+| `registry_event` | `winlog.event_data.TargetObject` | `[TargetObject]` |
+| `powershell` | `winlog.event_data.ScriptBlockText` | `[ScriptBlockText]` |
+| `proxy_web` | `url` (plain text) | `[url, c-uri, cs-uri-stem]` |
 
 ---
 

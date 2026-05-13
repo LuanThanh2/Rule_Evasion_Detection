@@ -86,6 +86,7 @@ class RuleAttributionEvaluation:
             "num_misses": self.num_misses,
             "top_1_hit_rate": float(self.top_n_hit_rates[0]) if len(self.top_n_hit_rates) > 0 else 0,
             "top_1_cumulative": float(cumulative[0]) if len(cumulative) > 0 else 0,
+            "top_3_cumulative": float(cumulative[min(2, len(cumulative) - 1)]) if len(cumulative) > 0 else 0,
             "top_5_cumulative": float(cumulative[min(4, len(cumulative) - 1)]) if len(cumulative) > 0 else 0,
             "top_10_cumulative": float(cumulative[min(9, len(cumulative) - 1)]) if len(cumulative) > 0 else 0,
         }

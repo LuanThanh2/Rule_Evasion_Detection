@@ -2,14 +2,23 @@
 # Paths are relative to the project root (rule_evasion_detection/)
 
 data:
-  benign_train: ~/data/benign/process_creation/benign_train.txt
-  benign_valid: ~/data/benign/process_creation/benign_train.txt  # dùng tạm cùng file khi chưa có valid set
+  benign_train: ~/data/benign/process_creation/benign_train.txt   # 100% benign — dùng cho cả train.py + validate.py (production)
+  benign_valid: ~/data/benign/process_creation/benign_train.txt   # = benign_train (production). Đổi sang benign_train_split_val.txt nếu muốn 80/20 holdout
   benign_field: process.command_line
   events_dir: ~/data/sigma/events_hayabusa/windows/process_creation
   evasions_dir: ~/data/sigma/evasions/windows/process_creation
   rules_dir: ~/data/sigma/rules/windows/process_creation
+  # Sigma native field names — dùng để parse Sigma YAML detection blocks
   search_fields:
-    - process.command_line
+    - CommandLine
+  # Mapping Sigma field name → list JSON paths để đọc event/log dict
+  # Thứ tự = priority (path đầu tiên có giá trị thì dùng)
+  event_field_map:
+    CommandLine:
+      - process.command_line
+      - winlog.event_data.CommandLine
+  max_benign_samples: 30000        # cap Stage 1 benign — tránh OOM/quá chậm với LMD lớn
+  max_attribution_benign: 15000    # cap Stage 2 per-rule benign — giảm thời gian fit nhiều lần
 
 training:
   malicious_samples: both          # rule_filters | matches
@@ -30,6 +39,6 @@ evaluation:
 
 output:
   dir: models/process_creation
-  result_name: misuse_svc_rules_f1
-  train_result_path: models/process_creation/train_rslt_misuse_svc_rules_f1.zip
-  attr_result_name: attr_svc_rules
+  result_name: ensemble_f1               # tên model chính (Ensemble)
+  train_result_path: models/process_creation/train_rslt_ensemble_f1.zip
+  attr_result_name: attr_ensemble

@@ -6,3 +6,4 @@ pyyaml>=6.0
 luqum>=0.13
 scikit-learn-intelex>=2024.0
 tqdm>=4.65
+requests

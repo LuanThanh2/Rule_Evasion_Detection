@@ -42,6 +42,10 @@ scripts/              # Entry points
   lmd_to_benign.py        # LMD CSV → benign_train.txt
   mpsd_to_benign.py       # MPSD .ps1 → benign_train.txt
   secrepo_to_benign.py    # Squid access.log → benign_train.txt
+  # ELK Integration (thêm 2026-05-11)
+  elk_export.py       # Export events từ Elasticsearch → JSONL
+  detect_batch.py     # Batch detection: JSONL → alerts JSONL (offline verify)
+  detect_live.py      # Live daemon: poll ES → Stage1+2 → index alerts về ES
 
 config/               # YAML config per event type
   process_creation.yaml
@@ -76,11 +80,34 @@ models/               # Output .zip từ train/validate/evaluate
 - `.decision_function(X)` → weighted average → tương thích hoàn toàn với pipeline cũ
 - `validate.py` và `evaluate.py` không cần sửa gì khi dùng ensemble
 
+### GridSearch (models.py) — đã tối ưu
+- Dùng **sklearn GridSearchCV** thay manual loop → chạy parallel `n_jobs=3`
+- Grid C: **20 giá trị** (giảm từ 50) ∈ [0.01, 10], `class_weight=["balanced"]` (bỏ None)
+- LR grid: **10 giá trị** C; cùng GridSearchCV parallel
+- `random_state=42` cho SVC, LR, StratifiedKFold → kết quả reproducible
+- Tổng fits: SVM 20×5=100, LR 10×5=50 — giảm ~80% so với trước
+
 ### CosineRuleAttributor (attribution.py)
 - Shared TF-IDF vectorizer fitted trên UNION filter values của tất cả rules
 - Per-rule: ma trận TF-IDF của filter values (sparse)
 - Score = max(cosine_similarity(evasion_vec, rule_matrix))
 - `reciprocal_rank_fusion()` gộp SVM ranking + Cosine ranking (k=60)
+
+### train_attribution.py — tránh crash mất công
+- Cap benign per-rule: `max_attribution_benign` (default 15000) — tránh fit TF-IDF full benign cho mỗi rule
+- `benign_field` được truyền đúng vào Stage 2 (trước bị bỏ qua)
+- Checkpoint mỗi 20 rules → file `train_rslt_{name}_ckpt_20.zip`, `_ckpt_40.zip`, ...
+- `try/except` per rule → 1 rule fail không kill cả run
+- tqdm progress bar
+
+### Pre-flight validation (train.py + train_attribution.py)
+- Kiểm tra file/thư mục tồn tại trước khi bắt đầu normalize/train
+- Đọc 10 sample đầu để xác nhận `benign_field` đúng format
+- `os.makedirs(out_dir, exist_ok=True)` tự tạo thư mục output
+
+### Config fields mới (tất cả configs)
+- `data.max_benign_samples`: cap Stage 1 benign (process/registry/powershell=30000, proxy=10000)
+- `data.max_attribution_benign`: cap Stage 2 per-rule benign (process/registry/powershell=15000, proxy=8000)
 
 ### Data format cho match events
 - Directory: `events_dir/<rule_name>/<rule_name>_Match_NN.json`
@@ -96,20 +123,44 @@ models/               # Output .zip từ train/validate/evaluate
 ## Commands hay dùng
 
 ```bash
-# Chạy toàn bộ Stage 1
-python scripts/train.py --config config/process_creation.yaml --search-params
+# Smoke test TRƯỚC KHI chạy full (2-3 phút — xác nhận data/config OK)
+python scripts/train.py --config config/process_creation.yaml --max-benign-samples 1000
+python scripts/train_attribution.py --config config/process_creation.yaml --max-attribution-benign 1000
+
+# Stage 1 — Ensemble (SVM+LR+CNB)
+python scripts/train.py --config config/process_creation.yaml --ensemble
 python scripts/validate.py --config config/process_creation.yaml
 python scripts/evaluate.py --config config/process_creation.yaml
 
-# Chạy với Ensemble
-python scripts/train.py --config config/process_creation.yaml --ensemble
+# Stage 1 — SVM đơn (baseline để so sánh)
+python scripts/train.py --config config/process_creation.yaml --result-name svm_baseline
 
-# Stage 2
+# Stage 2 — attribution (checkpoint tự động mỗi 20 rules)
 python scripts/train_attribution.py --config config/process_creation.yaml
 python scripts/eval_attribution.py --config config/process_creation.yaml --method hybrid
+python scripts/eval_attribution.py --config config/process_creation.yaml --method svm
+python scripts/eval_attribution.py --config config/process_creation.yaml --method cosine
 
-# Chạy tất cả event types
-bash run_all.sh
+# ELK Integration — phát hiện trên hệ thống thật
+# Bước 1: Export events từ Elasticsearch ra JSONL
+python scripts/elk_export.py --es-host http://elk:9200 --es-index "winlogbeat-*" --since 24h --out /tmp/events.jsonl
+# Elastic Agent: đổi --es-index "logs-windows.*"
+
+# Bước 2: Batch detection (offline verify)
+python scripts/detect_batch.py --config config/process_creation.yaml --events /tmp/events.jsonl --out /tmp/alerts.jsonl
+
+# Bước 3: Live polling daemon (real-time)
+python scripts/detect_live.py --config config/process_creation.yaml \
+  --es-host http://elk:9200 --es-index "winlogbeat-*" --out-index red-alerts --interval 60
+
+# Windows PowerShell — chạy tất cả event types
+foreach ($cfg in @("process_creation","registry_event","powershell","proxy_web")) {
+    python scripts/train.py --config "config/$cfg.yaml" --ensemble
+    python scripts/validate.py --config "config/$cfg.yaml"
+    python scripts/evaluate.py --config "config/$cfg.yaml"
+    python scripts/train_attribution.py --config "config/$cfg.yaml"
+    python scripts/eval_attribution.py --config "config/$cfg.yaml" --method hybrid
+}
 ```
 
 ## Nguồn dữ liệu benign
@@ -127,3 +178,136 @@ bash run_all.sh
 scikit-learn, numpy, pyyaml, luqum, tqdm, matplotlib, seaborn
 Optional: cuml (NVIDIA GPU), sklearnex (Intel CPU acceleration)
 ```
+
+---
+
+## Roadmap luận văn (KLTN)
+
+Đề tài: *"Xây dựng hệ thống phát hiện xâm nhập và hành vi né tránh luật dựa trên mô hình học máy và AI-Agent"*
+
+### Hiện trạng (2026-05-11)
+
+| Event type | Benign | Evasion | Stage 1 | Stage 2 |
+|---|---|---|---|---|
+| process_creation | 1828 (split 1462/366) | 446 → 298 unique | ✅ Ensemble F1=1.0 | ✅ Cosine top-1=68.8% |
+| powershell | 4266 (split 3413/853) | 25 subdirs load **0** | ✅ Done | ⚠️ Debug evasion format |
+| registry_event | 11776 (split 9420/2356) | **không có** | ✅ Done | ❌ Cần generate_evasions.py |
+| proxy_web | ? | ? | ❓ Chưa kiểm tra | ❓ Chưa kiểm tra |
+
+### Bằng chứng Ensemble vượt SVM (process_creation, raw threshold=0)
+
+| Metric | SVM đơn | **Ensemble** |
+|---|---|---|
+| Recall | 94.3% | **100%** |
+| F1 | 0.9706 | **1.0000** |
+| FN | 17 | **0** |
+| → CNB cứu 17 evasion mà SVM bỏ sót | | |
+
+Sau MCC scaling, cả 2 đều F1=1.0 (data dễ tách). **Raw metrics mới phơi bày sự khác biệt** → dùng làm bằng chứng chính trong luận văn.
+
+### Các phase chưa làm
+
+#### Phase B — Stage 2: Rule Attribution ✅ DONE (process_creation)
+
+**Kết quả (83 rules, 298 evasion samples, 2026-05-10):**
+
+| Method | Top-1 | Top-3 | Top-5 | Top-10 |
+|--------|-------|-------|-------|--------|
+| SVM    | 23.5% | 53.7% | 73.2% | 87.2%  |
+| Cosine | **68.8%** | **92.6%** | **97.3%** | **99.7%** |
+| Hybrid | 48.7% | 85.9% | 91.9% | 96.0%  |
+
+**Nhận xét:** Cosine > Hybrid > SVM (ngược kỳ vọng). SVM underfitted vì fallback dùng match events (1-15 samples/rule). Cosine trên shared TF-IDF (330 filter values) mạnh hơn. Cần chạy thêm cho powershell/registry_event/proxy_web.
+
+**Còn lại:** Chạy Stage 2 cho 3 event types khác.
+
+#### Phase C — AI Agent SOC Triage (NOVELTY CHÍNH)
+
+Architecture:
+```
+SOC Triage Agent (ReAct loop, LiteLLM-based)
+├── Tools:
+│   ├── classify_event(event) → score
+│   ├── attribute_rule(event) → top-k rules
+│   ├── enrich_mitre(rule) → ATT&CK technique
+│   ├── lookup_ioc(hash/ip) → VirusTotal/AbuseIPDB
+│   ├── query_history(host) → previous alerts
+│   ├── generate_response() → Sigma patch suggestion
+│   └── escalate(severity) → TheHive/Slack
+└── LLM: Claude/GPT/Llama via LiteLLM
+```
+
+Multi-Agent (advanced): Triage → Investigation → Response → Report.
+
+Đánh giá:
+- Time-to-decision (vs analyst người)
+- Token cost/alert
+- Hallucination rate (agent có bịa rule không tồn tại?)
+- Accuracy vs ground truth
+
+#### Phase D — Adversarial Robustness
+- LLM-based evasion: dùng Claude/GPT sinh command tránh rule
+- Encoding obfuscation: base64, hex, ROT13, padding
+- Concept drift: train LMD-2022, test LMD-2023
+- Robustness curve: F1 vs noise level
+
+#### Phase E — System Engineering (ELK integration ✅ PARTIAL)
+- ✅ `elk_export.py` — export events từ ES → JSONL
+- ✅ `detect_batch.py` — batch detection offline (verify pipeline)
+- ✅ `detect_live.py` — live daemon poll ES, index alerts về `red-alerts`
+- ✅ Compatible cả Winlogbeat (`winlogbeat-*`) và Elastic Agent (`logs-windows.*`)
+- ❌ FastAPI server: `/predict`, `/attribute`, `/agent/triage`
+- ❌ React/Vue dashboard: real-time alert feed
+- ❌ Wazuh/TheHive/Cortex Analyzer integration
+- ❌ Docker compose deployment
+
+#### Phase F — Explainability + Active Learning
+- SHAP/LIME: token nào trigger detection
+- Counterfactual: "đổi token X có còn detect không?"
+- Analyst feedback loop → uncertainty sampling → retrain
+
+#### Phase G — Statistical Rigor
+- Bootstrap confidence intervals cho mọi metric
+- Wilcoxon signed-rank: Ensemble vs SVM có significant?
+- McNemar's test (paired comparison)
+
+### Timeline đề xuất
+
+| Tuần | Mục tiêu | Deliverable |
+|---|---|---|
+| 1 | Debug powershell evasion + Stage 2 process_creation | top-k bảng |
+| 2 | proxy_web + Stage 2 powershell | 4 event types |
+| 3 | Visualization + adversarial robustness | Biểu đồ |
+| 4-5 | AI Agent core (ReAct, tools, LiteLLM) | CLI demo |
+| 6 | API server + dashboard | Web UI |
+| 7 | Integration (Wazuh/TheHive nếu kịp) | E2E demo |
+| 8 | Viết luận văn nháp | Draft |
+| 9 | Polish + slide + demo video | Final |
+
+### Đóng góp khoa học (claims cho luận văn)
+
+1. Mở rộng AMIDES với **multi-event-type** (4 loại) thay vì chỉ process creation
+2. **Reciprocal Rank Fusion** SVM + Cosine cho attribution → top-k accuracy cao hơn
+3. **AI Agent SOC Triage** tự động hóa workflow analyst — novelty chính
+4. **Adversarial robustness analysis** với LLM-generated evasions
+5. **End-to-end system** từ event → detection → attribution → response → report
+6. **Bằng chứng Ensemble robust hơn SVM ở raw boundary** (5.7% recall improvement, ý nghĩa thống kê cần verify)
+
+### Vietnamese context (điểm cộng KLTN)
+
+- Vietnamese language report từ agent
+- VNCERT/Cybersecurity compliance mentions (NĐ 13/2023, NĐ 53/2022)
+- PII redaction trong logs
+- Local threat actor case study (APT32...)
+
+### Cost-Benefit Analysis (nên có trong luận văn)
+
+| Metric | Manual analyst | Pipeline + Agent |
+|---|---|---|
+| Time/alert | 5-15 phút | 5-30 giây |
+| Cost/alert | $X | token + compute |
+| FN risk | Cao (mệt) | Thấp (consistent) |
+| Scale | Linear | Auto |
+
+ROI calc cho SOC trung (1000 alerts/ngày).
+

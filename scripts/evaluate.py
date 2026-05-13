@@ -35,10 +35,14 @@ def main():
     parser = argparse.ArgumentParser(description="Evaluate model with threshold sweep")
     parser.add_argument("--config", type=str, help="Path to YAML config file")
     parser.add_argument("--result-path", type=str, help="Path to ValidationResult .zip")
+    parser.add_argument("--result-name", type=str, default=None,
+                        help="Result name to derive valid_rslt_<name>.zip (CLI overrides config)")
     parser.add_argument("--num-thresholds", type=int, default=50)
     parser.add_argument("--mcc-threshold", type=float, default=0.1)
-    parser.add_argument("--out-dir", type=str, default="models")
+    parser.add_argument("--out-dir", type=str, default=None)
     args = parser.parse_args()
+
+    _cli_result_name = args.result_name  # track CLI value before config loading
 
     if args.config:
         import yaml
@@ -47,9 +51,17 @@ def main():
         eval_cfg = cfg.get("evaluation", {})
         out_cfg = cfg.get("output", {})
         args.num_thresholds = eval_cfg.get("num_thresholds", args.num_thresholds)
-        args.out_dir = out_cfg.get("dir", args.out_dir)
+        args.out_dir = os.path.expanduser(args.out_dir or out_cfg.get("dir", "models"))
+        # CLI --result-name wins over config
+        args.result_name = _cli_result_name or out_cfg.get("result_name")
         if not args.result_path:
             args.result_path = out_cfg.get("valid_result_path")
+            if not args.result_path and args.result_name:
+                args.result_path = os.path.join(args.out_dir, f"valid_rslt_{args.result_name}.zip")
+    else:
+        args.out_dir = args.out_dir or "models"
+        if not args.result_path and args.result_name:
+            args.result_path = os.path.join(args.out_dir, f"valid_rslt_{args.result_name}.zip")
 
     if not args.result_path:
         parser.error("--result-path is required")

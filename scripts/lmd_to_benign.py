@@ -26,21 +26,37 @@ EVENT_MAP = {
     "14": ("registry_event",   "TargetObject"),
 }
 
-LMD_NORMAL_FILES = [
-    "LMD-2022/LMD-2022 [870K Elements]/Labelled LMD-2022/Labelled Subsets/Normal.csv",
-    "LMD-2023/LMD-2023 [2.3M Elements]/LMD-2023 [2.3M Elements]Checked/Labelled LMD-2023/Labelled Subsets/LMD-2023 [2.3M Elements - Normal]checked.csv",
-]
+
+def find_normal_csvs(lmd_path: Path) -> list:
+    """Tự động tìm tất cả file CSV chứa 'Normal' trong tên, bỏ qua Preprocessed."""
+    found = sorted(
+        p for p in lmd_path.rglob("*.csv")
+        if "Normal" in p.name and "Preprocessed" not in str(p)
+    )
+    return found
 
 
-def convert(lmd_dir: str, output_dir: str):
+def convert(lmd_dir: str, output_dir: str, csv_files: list = None):
     lmd_path = Path(lmd_dir)
     out_path = Path(output_dir)
+
+    if csv_files:
+        normal_files = [Path(f) for f in csv_files]
+    else:
+        normal_files = find_normal_csvs(lmd_path)
+
+    if not normal_files:
+        logger.error("Không tìm thấy file Normal CSV nào trong: %s", lmd_path)
+        return
+
+    logger.info("Tìm thấy %d file Normal CSV:", len(normal_files))
+    for p in normal_files:
+        logger.info("  %s", p)
 
     # Collect into sets for automatic deduplication
     samples = defaultdict(set)  # etype -> set of values
 
-    for rel_path in LMD_NORMAL_FILES:
-        csv_path = lmd_path / rel_path
+    for csv_path in normal_files:
         if not csv_path.exists():
             logger.warning("File not found: %s", csv_path)
             continue
@@ -71,10 +87,14 @@ def convert(lmd_dir: str, output_dir: str):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--lmd-dir", required=True)
-    parser.add_argument("--output-dir", required=True)
+    parser.add_argument("--lmd-dir", required=True,
+                        help="Thư mục gốc chứa LMD Collections (tự động tìm file Normal CSV)")
+    parser.add_argument("--output-dir", required=True,
+                        help="Thư mục output cho benign_train.txt")
+    parser.add_argument("--files", nargs="+", default=None,
+                        help="Chỉ định file CSV cụ thể (bỏ qua auto-discover)")
     args = parser.parse_args()
-    convert(args.lmd_dir, args.output_dir)
+    convert(args.lmd_dir, args.output_dir, csv_files=args.files)
 
 
 if __name__ == "__main__":

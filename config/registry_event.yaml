@@ -1,14 +1,21 @@
 # Configuration for Registry Event type experiments
 
 data:
-  benign_train: ~/data/benign/registry_event/benign_train.txt
-  benign_valid: ~/data/benign/registry_event/benign_train.txt
+  benign_train: ~/data/benign/registry_event/benign_train.txt   # 100% benign — dùng cho cả train.py + validate.py (production)
+  benign_valid: ~/data/benign/registry_event/benign_train.txt   # = benign_train (production). Đổi sang benign_train_split_val.txt nếu muốn 80/20 holdout
   benign_field: winlog.event_data.TargetObject
   events_dir: ~/data/sigma/events_hayabusa/windows/registry_event
   evasions_dir: ~/data/sigma/evasions/windows/registry_event
   rules_dir: ~/data/sigma/rules/windows/registry
+  # Sigma native field names — dùng để parse Sigma YAML detection blocks
   search_fields:
-    - winlog.event_data.TargetObject
+    - TargetObject
+  # Mapping Sigma field name → list JSON paths để đọc event/log dict
+  event_field_map:
+    TargetObject:
+      - winlog.event_data.TargetObject
+  max_benign_samples: 30000        # cap Stage 1 benign — LMD Sysmon EID 12/13/14 có thể rất lớn
+  max_attribution_benign: 15000    # cap Stage 2 per-rule benign
 
 training:
   malicious_samples: both
@@ -18,6 +25,12 @@ training:
   scoring: f1
   cv_folds: 5
   num_jobs: 3
+
+validation:
+  # Registry synthetic evasions may be absent because many registry Sigma patterns
+  # still match after simple hive/case transformations. Use Hayabusa match events
+  # as the positive validation set unless explicit evasions are generated.
+  malicious_samples: matches
 
 scaling:
   mcc_scaling: true
@@ -29,6 +42,6 @@ evaluation:
 
 output:
   dir: models/registry_event
-  result_name: misuse_svc_rules_f1
-  train_result_path: models/registry_event/train_rslt_misuse_svc_rules_f1.zip
-  attr_result_name: attr_svc_rules
+  result_name: ensemble_f1
+  train_result_path: models/registry_event/train_rslt_ensemble_f1.zip
+  attr_result_name: attr_ensemble
