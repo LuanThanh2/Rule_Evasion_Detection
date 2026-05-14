@@ -1,6 +1,8 @@
 # Rule Evasion Detection (RED)
 
-Extension của AMIDES pipeline (Uetz et al., USENIX Security 2024) — phát hiện và quy kết evasion của luật Sigma bằng SVM Ensemble + Cosine Similarity.
+RED là hệ thống hỗ trợ phát hiện các hành vi né tránh luật Sigma và quy kết event đáng ngờ về rule Sigma tương ứng trên Windows Event Logs.
+
+Project mở rộng pipeline AMIDES (Uetz et al., USENIX Security 2024) bằng Stage 1 Ensemble Classifier và Stage 2 Cosine Similarity.
 
 ## Pipeline tổng quan
 
@@ -25,27 +27,30 @@ red/                  # Core library
   features.py         # TF-IDF / Count / Hashing vectorizers, comma_tokenizer
   models.py           # SVC + LR + CNB training, EnsembleClassifier
   evaluate.py         # BinaryEvaluation, create_mcc_scaler, scale_df_values
-  attribution.py      # RuleAttributionEvaluation, CosineRuleAttributor, RRF
+  attribution.py      # RuleAttributionEvaluation, CosineRuleAttributor, RRF baseline
   data.py             # Benign loader (txt/jsonl/json/csv), load_rule_set, extract_filter_values
   persist.py          # save_result / load_result (pickle + ZIP)
   visualize.py        # plot_pr_threshold, plot_attribution
 
 scripts/              # Entry points
+  run_stage1.py       # Gộp train + validate + evaluate (khuyến nghị — 2026-05-14)
   train.py            # Stage 1 training (SVM solo or Ensemble)
   validate.py         # Transform + decision_function → df_values
   evaluate.py         # MCC scale + threshold sweep → eval result
-  train_attribution.py # Stage 2: per-rule SVM + CosineRuleAttributor
-  eval_attribution.py  # Stage 2 eval: --method svm|cosine|hybrid
+  train_attribution.py # Stage 2: CosineRuleAttributor + per-rule SVM baseline
+  eval_attribution.py  # Stage 2 eval: production --method cosine; baseline svm|hybrid
   generate_evasions.py # Tạo evasion variants từ match events
-  run_pipeline.py     # Chạy toàn bộ pipeline qua config
+  run_pipeline.py     # Chạy toàn bộ pipeline (Stage 1+2) qua config
   hayabusa_to_matches.py  # Hayabusa JSONL → per-rule JSON
   lmd_to_benign.py        # LMD CSV → benign_train.txt
   mpsd_to_benign.py       # MPSD .ps1 → benign_train.txt
   secrepo_to_benign.py    # Squid access.log → benign_train.txt
-  # ELK Integration (thêm 2026-05-11)
+  diagnose_stage1.py      # Analyze Stage 1 model F1=1.0 issue, token analysis
+  # ELK Integration (2026-05-11)
   elk_export.py       # Export events từ Elasticsearch → JSONL
   detect_batch.py     # Batch detection: JSONL → alerts JSONL (offline verify)
   detect_live.py      # Live daemon: poll ES → Stage1+2 → index alerts về ES
+  push_alerts.py      # Bulk index alerts.jsonl → Elasticsearch
 
 config/               # YAML config per event type
   process_creation.yaml
@@ -120,46 +125,65 @@ models/               # Output .zip từ train/validate/evaluate
 - `powershell`: `winlog.event_data.ScriptBlockText`
 - `proxy_web`: plain text URL (1 per line)
 
+### Config: benign_train vs benign_valid (2026-05-14)
+- **Production (default)**: `benign_valid` → `benign_train` (100% benign → F1=1.0 trên validation)
+  - Đây là deployment setup: dùng 100% data sẵn có, không holdout
+  - Metric "thật" chỉ có ý nghĩa khi đo trên real ELK events (bằng diagnose_stage1.py)
+- **Debug/Thesis (80/20)**: đổi `benign_valid` → `benign_train_split_val.txt` (20% holdout)
+  - Honest evaluation: train 80%, validate 20% không giao nhau
+
 ## Commands hay dùng
+
+> **Activate venv trước**: `source ~/venvs/rule_evasion_env/bin/activate`
 
 ```bash
 # Smoke test TRƯỚC KHI chạy full (2-3 phút — xác nhận data/config OK)
-python scripts/train.py --config config/process_creation.yaml --max-benign-samples 1000
-python scripts/train_attribution.py --config config/process_creation.yaml --max-attribution-benign 1000
+python3 scripts/train.py --config config/process_creation.yaml --max-benign-samples 1000
+python3 scripts/train_attribution.py --config config/process_creation.yaml --max-attribution-benign 1000
 
-# Stage 1 — Ensemble (SVM+LR+CNB)
-python scripts/train.py --config config/process_creation.yaml --ensemble
-python scripts/validate.py --config config/process_creation.yaml
-python scripts/evaluate.py --config config/process_creation.yaml
+# Stage 1 — Production (Ensemble SVM+LR+CNB, 100% benign)
+python3 scripts/run_stage1.py --config config/process_creation.yaml
 
-# Stage 1 — SVM đơn (baseline để so sánh)
-python scripts/train.py --config config/process_creation.yaml --result-name svm_baseline
+# Stage 1 — SVM baseline để so sánh
+python3 scripts/run_stage1.py --config config/process_creation.yaml --no-ensemble --result-name svm_baseline
+
+# Stage 1 — Từng bước nếu debug (vẫn dùng 100% benign → F1=1.0)
+python3 scripts/train.py --config config/process_creation.yaml --ensemble
+python3 scripts/validate.py --config config/process_creation.yaml
+python3 scripts/evaluate.py --config config/process_creation.yaml
+
+# Diagnose Stage 1 model (F1=1.0, token analysis, real ELK events)
+python3 scripts/diagnose_stage1.py --valid-result models/process_creation/valid_rslt_ensemble_f1.zip
 
 # Stage 2 — attribution (checkpoint tự động mỗi 20 rules)
-python scripts/train_attribution.py --config config/process_creation.yaml
-python scripts/eval_attribution.py --config config/process_creation.yaml --method hybrid
-python scripts/eval_attribution.py --config config/process_creation.yaml --method svm
-python scripts/eval_attribution.py --config config/process_creation.yaml --method cosine
+python3 scripts/train_attribution.py --config config/process_creation.yaml
+python3 scripts/eval_attribution.py --config config/process_creation.yaml --method cosine
 
 # ELK Integration — phát hiện trên hệ thống thật
-# Bước 1: Export events từ Elasticsearch ra JSONL
-python scripts/elk_export.py --es-host http://elk:9200 --es-index "winlogbeat-*" --since 24h --out /tmp/events.jsonl
-# Elastic Agent: đổi --es-index "logs-windows.*"
+# Bước 1: Export events từ Elasticsearch ra JSONL (15 phút qua)
+python3 scripts/elk_export.py --es-host http://10.10.20.100:9200 --es-user elastic --es-password ... \
+  --es-index "logs-winlog*" --since 15m --out ~/detect_logs/events.jsonl
+# Index names: "winlogbeat-*" (Winlogbeat) | "logs-winlog*" (Elastic Agent)
 
 # Bước 2: Batch detection (offline verify)
-python scripts/detect_batch.py --config config/process_creation.yaml --events /tmp/events.jsonl --out /tmp/alerts.jsonl
+python3 scripts/detect_batch.py --config config/process_creation.yaml \
+  --events ~/detect_logs/events.jsonl --threshold 0.0 --method cosine --out ~/detect_logs/alerts.jsonl
 
-# Bước 3: Live polling daemon (real-time)
-python scripts/detect_live.py --config config/process_creation.yaml \
-  --es-host http://elk:9200 --es-index "winlogbeat-*" --out-index red-alerts --interval 60
+# Bước 3: Live polling daemon (real-time detection)
+python3 scripts/detect_live.py --config config/process_creation.yaml \
+  --es-host "http://elastic:PASSWORD@10.10.20.100:9200" --es-index "logs-winlog*" \
+  --out-index red-alerts --threshold 0.0 --method cosine --interval 60
 
-# Windows PowerShell — chạy tất cả event types
-foreach ($cfg in @("process_creation","registry_event","powershell","proxy_web")) {
-    python scripts/train.py --config "config/$cfg.yaml" --ensemble
-    python scripts/validate.py --config "config/$cfg.yaml"
-    python scripts/evaluate.py --config "config/$cfg.yaml"
+# Linux/Mac — Stage 1 cho cả 3 event types
+for cfg in process_creation registry_event powershell; do
+    python3 scripts/run_stage1.py --config config/$cfg.yaml
+done
+
+# Windows PowerShell — chạy cả Stage 1 + Stage 2
+foreach ($cfg in @("process_creation","registry_event","powershell")) {
+    python scripts/run_stage1.py --config "config/$cfg.yaml"
     python scripts/train_attribution.py --config "config/$cfg.yaml"
-    python scripts/eval_attribution.py --config "config/$cfg.yaml" --method hybrid
+    python scripts/eval_attribution.py --config "config/$cfg.yaml" --method cosine
 }
 ```
 
@@ -185,7 +209,7 @@ Optional: cuml (NVIDIA GPU), sklearnex (Intel CPU acceleration)
 
 Đề tài: *"Xây dựng hệ thống phát hiện xâm nhập và hành vi né tránh luật dựa trên mô hình học máy và AI-Agent"*
 
-### Hiện trạng (2026-05-11)
+### Hiện trạng (2026-05-14)
 
 | Event type | Benign | Evasion | Stage 1 | Stage 2 |
 |---|---|---|---|---|
@@ -251,10 +275,18 @@ Multi-Agent (advanced): Triage → Investigation → Response → Report.
 - Concept drift: train LMD-2022, test LMD-2023
 - Robustness curve: F1 vs noise level
 
-#### Phase E — System Engineering (ELK integration ✅ PARTIAL)
-- ✅ `elk_export.py` — export events từ ES → JSONL
-- ✅ `detect_batch.py` — batch detection offline (verify pipeline)
+#### Phase E — System Engineering & Production Deploy (✅ SIGNIFICANT PROGRESS)
+**Stage 1 (2026-05-14):**
+- ✅ `run_stage1.py` — gộp train+validate+evaluate 1 lệnh (khuyến nghị dùng)
+- ✅ Config updated: `benign_valid` = `benign_train` (100% production setup)
+- ✅ Virtual environment setup docs (~/venvs/rule_evasion_env)
+- ✅ `diagnose_stage1.py` — analyze F1=1.0, token analysis, real events distribution
+
+**ELK Integration (2026-05-11):**
+- ✅ `elk_export.py` — export events từ ES → JSONL (với auth)
+- ✅ `detect_batch.py` — batch detection offline (verify pipeline, fixed MinMaxScaler & batch vectorize)
 - ✅ `detect_live.py` — live daemon poll ES, index alerts về `red-alerts`
+- ✅ `push_alerts.py` — bulk index alerts.jsonl → Elasticsearch
 - ✅ Compatible cả Winlogbeat (`winlogbeat-*`) và Elastic Agent (`logs-windows.*`)
 - ❌ FastAPI server: `/predict`, `/attribute`, `/agent/triage`
 - ❌ React/Vue dashboard: real-time alert feed
@@ -287,7 +319,7 @@ Multi-Agent (advanced): Triage → Investigation → Response → Report.
 ### Đóng góp khoa học (claims cho luận văn)
 
 1. Mở rộng AMIDES với **multi-event-type** (4 loại) thay vì chỉ process creation
-2. **Reciprocal Rank Fusion** SVM + Cosine cho attribution → top-k accuracy cao hơn
+2. **Cosine Similarity** trong không gian TF-IDF chung cho attribution → nhanh, ổn định; SVM/Hybrid-RRF giữ làm baseline so sánh
 3. **AI Agent SOC Triage** tự động hóa workflow analyst — novelty chính
 4. **Adversarial robustness analysis** với LLM-generated evasions
 5. **End-to-end system** từ event → detection → attribution → response → report
@@ -310,4 +342,3 @@ Multi-Agent (advanced): Triage → Investigation → Response → Report.
 | Scale | Linear | Auto |
 
 ROI calc cho SOC trung (1000 alerts/ngày).
-

@@ -1,11 +1,19 @@
 # Rule Evasion Detection (RED)
 
-RED là hệ thống hỗ trợ phát hiện và quy kết các biến thể né tránh luật Sigma trên Windows Event Logs.
+RED là hệ thống end-to-end phát hiện hành vi né tránh luật Sigma, quy kết event về rule Sigma tương ứng, và **tự động triage bằng Multi-Agent AI** trên Windows Event Logs.
 
+**3 lớp chính:**
 
-**Đóng góp mới so với AMIDES gốc:**
-- Stage 1: **Ensemble Classifier** (SVM + Logistic Regression + Complement Naive Bayes) thay cho SVM đơn lẻ
-- Stage 2: **Cosine Similarity** kết hợp với per-rule SVM qua **Reciprocal Rank Fusion**
+| Lớp | Vai trò | Output |
+|---|---|---|
+| **Stage 1 — Misuse Detection** | Ensemble Classifier (SVM + LR + CNB) phân biệt benign vs malicious | Score ∈ [0,1] |
+| **Stage 2 — Rule Attribution** | Cosine Similarity trong TF-IDF chung — quy kết rule Sigma bị né | Top-K rules |
+| **Phase C — AI Agent SOC Triage** ⭐ | 7 specialized AI agents tự động investigate, sinh Sigma patch, đề xuất action | Vietnamese report + Sigma patch + containment plan |
+
+**Đóng góp mới so với AMIDES gốc (Uetz et al., USENIX Security 2024):**
+- **Stage 1**: Ensemble Classifier thay cho SVM đơn lẻ — recall 100% vs 94.3%
+- **Stage 2**: Cosine Similarity trong không gian TF-IDF chung — top-1 accuracy 68.8% vs SVM 23.5%
+- **Phase C**: Multi-Agent SOC Triage với **auto-generation Sigma rule patch** ⭐ — feature không có trong Elastic AI Assistant / Splunk / Sentinel
 
 ---
 
@@ -16,9 +24,10 @@ RED là hệ thống hỗ trợ phát hiện và quy kết các biến thể né
 3. [Pipeline tổng quan](#pipeline-tổng-quan)
 4. [Cách chạy](#cách-chạy)
 5. [ELK Integration — Phát hiện trên hệ thống thật](#elk-integration--phát-hiện-trên-hệ-thống-thật)
-6. [Chuẩn bị dữ liệu](#chuẩn-bị-dữ-liệu)
-7. [Cấu trúc thư mục](#cấu-trúc-thư-mục)
-8. [Config file](#config-file)
+6. [AI Agent — Multi-Agent SOC Triage](#ai-agent--multi-agent-soc-triage)
+7. [Chuẩn bị dữ liệu](#chuẩn-bị-dữ-liệu)
+8. [Cấu trúc thư mục](#cấu-trúc-thư-mục)
+9. [Config file](#config-file)
 
 ---
 
@@ -46,7 +55,19 @@ pip install scikit-learn-intelex  # đã có trong requirements.txt
 
 Hệ thống tự động chọn backend: `NVIDIA GPU > Intel CPU > CPU thường`.
 
-> **Lưu ý:** Mọi lệnh `python3 scripts/...` bên dưới đều giả định đã `source ~/venvs/rule_evasion_env/bin/activate` trước đó.
+**Cấu hình cho AI Agent (Phase C, optional):**
+```bash
+# Copy template, điền DeepSeek API key + ES credentials thật
+cp .env.example .env
+nano .env
+```
+
+Tối thiểu cần điền trong `.env`:
+- `DEEPSEEK_API_KEY` — lấy ở [platform.deepseek.com](https://platform.deepseek.com/api_keys) (~$0.27/1M tokens, ~$0.015/alert)
+- `ES_HOST`, `ES_USER`, `ES_PASSWORD` — Elasticsearch credentials
+- (Optional) `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` để Response Agent push notification
+
+> **Lưu ý:** Mọi lệnh `python3 scripts/...` và `python3 -m agent...` bên dưới đều giả định đã `source ~/venvs/rule_evasion_env/bin/activate` trước đó.
 
 ---
 
@@ -173,24 +194,8 @@ Sau khi có ensemble score, dùng **MCC (Matthews Correlation Coefficient)** đ�
 
 Khi Stage 1 phát hiện event là SUSPICIOUS, Stage 2 xác định **luật Sigma nào** bị evasion.
 
-#### Per-rule SVM
-Mỗi luật Sigma có 1 SVM binary riêng, train trên: benign vs. filter values của luật đó:
-
-```
-Rule_A: train SVM(benign, ["cscript", "vbs", "wscript"])
-Rule_B: train SVM(benign, ["mimikatz", "sekurlsa"])
-...
-
-Với evasion mới:
-→ transform bằng vectorizer của từng rule
-→ decision_function() → score cho từng rule
-→ sort → SVM ranking
-```
-
-**Yếu điểm:** Mỗi rule có vectorizer riêng → không so sánh được score giữa các rule; rule ít filter values → train không ổn định.
-
 #### Cosine Similarity
-Thay vì train model, đo **độ giống nhau** trực tiếp giữa vector TF-IDF của evasion và các filter values của từng rule trong **không gian vector chung**:
+Stage 2 production dùng **Cosine Similarity**: đo độ giống nhau trực tiếp giữa vector TF-IDF của event suspicious và các filter values của từng rule trong **không gian vector chung**:
 
 ```
 1. Fit 1 TF-IDF vectorizer dùng chung (tất cả filter values của mọi rule)
@@ -205,7 +210,20 @@ Thay vì train model, đo **độ giống nhau** trực tiếp giữa vector TF-
 
 **Ưu điểm:** Không cần train, xử lý tốt rule ít data, tất cả rules cùng scale.
 
-#### Reciprocal Rank Fusion (RRF) — Kết hợp 2 ranking
+#### Baseline/So sánh: Per-rule SVM và Hybrid/RRF
+Để phục vụ thí nghiệm so sánh, project vẫn giữ per-rule SVM và Hybrid/RRF:
+
+- **Per-rule SVM:** mỗi rule có 1 SVM binary riêng, train trên benign vs. filter values của rule đó.
+- **Hybrid/RRF:** kết hợp ranking từ SVM và Cosine bằng Reciprocal Rank Fusion.
+
+Hai chế độ này không phải cấu hình production hiện tại. Production dùng:
+
+```bash
+python3 scripts/eval_attribution.py --config config/process_creation.yaml \
+    --method cosine --top-k-details 3
+```
+
+Ví dụ RRF dùng trong phần so sánh:
 
 ```
 SVM ranking:    [Rule_B(rank=1), Rule_A(rank=2), Rule_C(rank=3)]
@@ -220,7 +238,7 @@ Rule_C: 1/(60+3) + 1/(60+3) = 0.0159 + 0.0159 = 0.0317
 → Final: [Rule_B, Rule_A, Rule_C]  (RRF chỉ dùng thứ hạng, không dùng score trực tiếp)
 ```
 
-**Ưu điểm RRF:** Không bị ảnh hưởng bởi scale khác nhau giữa SVM score và Cosine score.
+**Ưu điểm RRF:** Không bị ảnh hưởng bởi scale khác nhau giữa SVM score và Cosine score, nhưng trên dữ liệu hiện tại Cosine được chọn làm phương pháp chính vì nhanh hơn và ổn định hơn.
 
 ---
 
@@ -270,6 +288,28 @@ Rule_C: 1/(60+3) + 1/(60+3) = 0.0159 + 0.0159 = 0.0317
 │  eval_attribution.py --method cosine  (production)          │
 │    Cosine similarity trên shared TF-IDF space               │
 │    → Top-1/5/10 hit rate → lưu eval_attr_*.zip             │
+└─────────────────────────────────────────────────────────────┘
+                          │ trên hệ thống thật, real-time:
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│         ELK INTEGRATION (detect_live.py)                    │
+│  Sysmon event ──► Elasticsearch ──► RED detect ──►          │
+│                                     red-alerts index        │
+└─────────────────────────────────────────────────────────────┘
+                          │
+                          ▼
+┌─────────────────────────────────────────────────────────────┐
+│       PHASE C — AI AGENT SOC TRIAGE ⭐                       │
+│                                                             │
+│  agent/daemon.py (poll mỗi 60s)                             │
+│                                                             │
+│  Supervisor → Triage                                        │
+│              ├─ parallel(Hunt, RED Analyst, MITRE)          │
+│              └─ Response (Sigma patch + containment)        │
+│                  → Report (Vietnamese markdown)             │
+│                                                             │
+│  → lưu ai-investigations index                              │
+│  → Kibana dashboard + Telegram notify                       │
 └─────────────────────────────────────────────────────────────┘
 ```
 
@@ -349,7 +389,7 @@ python3 scripts/run_stage1.py --config config/powershell.yaml
 ```bash
 source ~/venvs/rule_evasion_env/bin/activate
 
-# Train CosineRuleAttributor (+ per-rule SVM lưu kèm để so sánh, không bắt buộc dùng)
+# Train CosineRuleAttributor (per-rule SVM vẫn lưu kèm để so sánh, không dùng production)
 # Checkpoint tự động mỗi 20 rules → thoát giữa chừng không mất công
 python3 scripts/train_attribution.py --config config/process_creation.yaml
 
@@ -538,6 +578,344 @@ Vào Kibana → **Stack Management → Index Patterns** → tạo pattern `red-a
 - **Không cần** `elasticsearch-py` — dùng `requests` thuần.
 - **Event ID**: Sysmon = `1`, Windows Security Log = `4688`.
 
+### Convert Sigma rules sang Elastic Detection Rules
+
+Elastic UI **không import trực tiếp Sigma YAML**. Luồng đúng là:
+
+```text
+Sigma .yml
+  └── sigma-cli / pySigma
+        └── Elastic Security Detection Rule .ndjson
+              └── Kibana Security → Rules → Import rules
+```
+
+Với các rule Windows hiện tại:
+
+```text
+~/data/sigma/rules/windows/
+├── process_creation
+├── powershell
+└── registry
+```
+
+chạy:
+
+```bash
+source ~/venvs/rule_evasion_env/bin/activate
+cd ~/KLTN/KLTN/Rule_Evasion_Detection/rule_evasion_detection
+
+pip install -r requirements.txt
+
+python3 scripts/convert_sigma_to_elastic.py
+```
+
+Output mặc định:
+
+```text
+/home/luanthanh/data/sigma/elastic_rules/windows_sigma_elastic.ndjson
+```
+
+Kết quả hiện tại:
+
+```text
+process_creation: 1169 Sigma rules
+powershell:        208 Sigma rules
+registry:          247 Sigma rules
+total:            1624 Elastic Detection Rule objects
+```
+
+Mặc định script dùng:
+
+```text
+target:   lucene
+pipeline: ecs_windows
+format:   siem_rule_ndjson
+```
+
+`lucene + siem_rule_ndjson` tạo Elastic **Custom Query detection rules** có thể import vào Detection Engine. Không dùng `kibana_ndjson` cho bước này vì format đó là Kibana saved search, không phải Detection Rule import.
+
+Nếu muốn giới hạn index pattern chỉ vào log Windows:
+
+```bash
+python3 scripts/convert_sigma_to_elastic.py \
+  --index-pattern "logs-winlog*" \
+  --index-pattern "winlogbeat-*"
+```
+
+Import bằng UI:
+
+```text
+Kibana → Security → Rules → Import rules
+```
+
+chọn file:
+
+```text
+/home/luanthanh/data/sigma/elastic_rules/windows_sigma_elastic.ndjson
+```
+
+Import bằng API qua Kibana port `5601`:
+
+```bash
+export KIBANA_PASSWORD='your-password'
+
+python3 scripts/convert_sigma_to_elastic.py \
+  --skip-convert \
+  --import-to-kibana \
+  --kibana-url http://10.10.20.100:5601 \
+  --kibana-user elastic \
+  --kibana-password "$KIBANA_PASSWORD" \
+  --import-chunk-size 200 \
+  --import-timeout 300
+```
+
+Hoặc convert lại và import ngay trong một lệnh:
+
+```bash
+python3 scripts/convert_sigma_to_elastic.py \
+  --import-to-kibana \
+  --kibana-url http://10.10.20.100:5601 \
+  --kibana-user elastic \
+  --kibana-password "$KIBANA_PASSWORD" \
+  --import-chunk-size 200 \
+  --import-timeout 300
+```
+
+> **Lưu ý:** Import 1624 rules một lần có thể làm client timeout dù Kibana vẫn đang ghi rule phía server. Dùng `--import-chunk-size 200 --import-timeout 300` để import theo 9 batch nhỏ, dễ theo dõi lỗi và tránh timeout. Script cũng tự normalize severity Sigma `informational` thành Elastic `low` vì Detection Engine chỉ nhận `low|medium|high|critical`.
+
+Nếu Kibana hiện:
+
+```text
+Detection engine permissions required
+```
+
+thì user hiện tại chưa có quyền Detection Engine. Dùng user `elastic` hoặc cấp role có:
+
+- Kibana Security privileges: `All`
+- Rules/Alerts privileges: `All`
+- Read index log nguồn: `logs-*`, `logs-winlog*`, `winlogbeat-*`
+- Quyền hệ thống Detection Engine theo yêu cầu của Elastic Security
+
+Sau khi import, vào:
+
+```text
+Security → Rules
+```
+
+lọc rule theo prefix `SIGMA -`, enable/disable rule cần dùng, rồi theo dõi alert ở:
+
+```text
+Security → Alerts
+```
+
+---
+
+## AI Agent — Multi-Agent SOC Triage
+
+Lớp cuối của pipeline: **7 specialized AI agents** tự động investigate mọi alert từ `red-alerts`, sinh báo cáo tiếng Việt, đề xuất Sigma patch và containment actions. Kết quả lưu vào index `ai-investigations` để Kibana visualize.
+
+### Kiến trúc
+
+```
+red-alerts (ES) ──poll mỗi 60s──►  agent/daemon.py
+                                         │
+                                         ▼
+                            ┌──────────────────────────┐
+                            │ 🎯 Supervisor Agent       │  Decide workflow
+                            └────────────┬─────────────┘
+                                         ▼
+                            ┌──────────────────────────┐
+                            │ 🔍 Triage Agent           │  Severity + FP filter
+                            └────────────┬─────────────┘
+                                         ▼
+                ┌────────────────────────┴────────────────────────┐
+                ▼ (asyncio.gather — chạy SONG SONG)                ▼
+        ┌──────────────┐   ┌────────────────┐   ┌──────────────┐
+        │ Hunt Agent   │   │ RED Analyst ⭐ │   │ MITRE Agent  │
+        │ Timeline+IOC │   │ Evasion expl.  │   │ TTP chain    │
+        └──────┬───────┘   └────────┬───────┘   └──────┬───────┘
+               └────────────┬───────┴────────────┬─────┘
+                            ▼                    ▼
+                ┌──────────────────────────────────────┐
+                │ 🛡️  Response Agent ⭐                 │
+                │  • Auto-generate Sigma patch YAML     │
+                │  • Containment actions (w/ approval)  │
+                │  • Telegram notification              │
+                └────────────────┬─────────────────────┘
+                                 ▼
+                ┌──────────────────────────────────────┐
+                │ 📝 Report Agent                       │
+                │  Vietnamese SOC report (markdown)     │
+                └────────────────┬─────────────────────┘
+                                 ▼
+                       ai-investigations (ES)
+                                 ▼
+                          Kibana Dashboard
+```
+
+### Đặc tả 7 agents
+
+| Agent | Tools | Output schema | Vai trò |
+|---|---|---|---|
+| **Supervisor** | (none) | `WorkflowPlan` | Router — decide skip_fp / quick / full_investigation |
+| **Triage** | `query_es_history`, `get_process_tree`, `lookup_mitre` | `TriageOutput` | Severity rating + FP filter |
+| **Hunt** | + `get_network_connections`, `search_threat_intel` | `HuntOutput` | Timeline, IOCs, network indicators |
+| **RED Analyst** ⭐ | `get_sigma_rule_text`, `get_evasion_tokens` | `RedAnalystOutput` | Giải thích kỹ thuật né (shorthand_flag, encoding, ...) |
+| **MITRE** | `lookup_mitre` | `MitreOutput` | Map technique + TTP kill-chain |
+| **Response** ⭐ | `get_sigma_rule_text`, `suggest_containment`, `send_telegram` | `ResponseOutput` | **Sigma patch YAML** + containment + notify |
+| **Report** | (none) | `ReportOutput` | Vietnamese markdown report |
+
+⭐ **RED Analyst + Response** là 2 agent NOVELTY chính — không tool ML nào khác (Elastic AI Assistant, Splunk ESCU, Microsoft Sentinel) có khả năng tự sinh Sigma patch từ evasion sample.
+
+### Cài đặt nhanh
+
+```bash
+source ~/venvs/rule_evasion_env/bin/activate
+cd ~/KLTN/KLTN/Rule_Evasion_Detection/rule_evasion_detection
+
+# Copy template .env, điền DeepSeek key
+cp .env.example .env
+nano .env    # → điền DEEPSEEK_API_KEY và ES credentials
+
+# Verify config load đúng
+python3 -c "import os; from dotenv import load_dotenv; load_dotenv('.env'); print('OK' if os.environ.get('DEEPSEEK_API_KEY') else 'CHƯA SET API KEY')"
+```
+
+### Cách chạy
+
+#### Bước 1 — Test 1 alert mock (offline, không cần ES)
+
+```bash
+# Chạy 7-agent pipeline trên mock alert có sẵn, in báo cáo
+python3 -m agent.run
+
+# Lưu kết quả ra JSON để inspect
+python3 -m agent.run --save /tmp/investigation.json
+```
+
+Expected: ~67 giây, ~$0.015 tokens. Output gồm severity, kill-chain timeline, Sigma patch YAML, 5–8 containment actions, báo cáo markdown tiếng Việt.
+
+#### Bước 2 — Test ES integration (cần ES reachable)
+
+```bash
+# Verify ES connection
+python3 -c "from agent.es_io import check_es_connection; check_es_connection()"
+
+# Inject 1 test alert vào red-alerts để có data process
+python3 -m agent.inject_test_alert
+
+# Dry-run: daemon poll → investigate → IN log nhưng KHÔNG ghi ES
+python3 -m agent.daemon --dry-run --max-iter 1 --interval 5
+
+# Real run: ghi vào ai-investigations
+python3 -m agent.daemon --max-iter 1 --interval 5
+
+# Verify document đã index
+curl -u elastic:PASSWORD "http://10.10.20.100:9200/ai-investigations/_search?pretty&size=1"
+```
+
+#### Bước 3 — Production daemon
+
+```bash
+# Chạy vô hạn, poll mỗi 60s, chỉ process alerts có score >= 0.5
+python3 -m agent.daemon --interval 60 --score-threshold 0.5
+
+# Ctrl+C để graceful shutdown (đợi alert hiện tại xong rồi dừng)
+```
+
+Daemon argument đầy đủ:
+
+| Flag | Default | Ý nghĩa |
+|---|---|---|
+| `--interval` | 60 | Polling interval (giây) |
+| `--max-iter` | 0 (∞) | Stop sau N iterations (0 = run forever) |
+| `--dry-run` | False | Không ghi ES |
+| `--reset-state` | False | Xóa state file, process lại từ đầu |
+| `--score-threshold` | 0.0 | Skip alerts có RED score < threshold |
+| `--batch-limit` | 20 | Số alerts max lấy về mỗi iteration |
+| `--skip-health-check` | False | Bỏ qua ES connection check |
+
+### Output: index `ai-investigations`
+
+Mỗi investigation = 1 document với structure:
+
+```json
+{
+  "investigation_id": "INV-481cc712b0f9",
+  "timestamp": "2026-05-14T15:05:13Z",
+  "trigger_alert": { ... full RED alert input ... },
+  "workflow_plan": {"workflow_type": "full_investigation", "priority": 4, ...},
+  "triage": {"severity": "CRITICAL", "confidence": 0.95, ...},
+  "hunt": {"iocs_found": ["1.2.3.4", ...], "timeline_vi": [...], ...},
+  "red_analyst": {"evasion_technique": "shorthand_flag", "confidence": 0.92, ...},
+  "mitre": {"primary_technique": "T1059.001", "ttp_chain_vi": [...], ...},
+  "response": {
+    "sigma_patch_yaml": "title: ...PATCHED...\ndetection:\n  ...",
+    "containment_actions": [
+      {"action_type": "isolate_host", "needs_approval": true, ...},
+      ...
+    ],
+    "notification_sent": true
+  },
+  "report": {"full_markdown_vi": "## 🚨 ...", ...},
+  "total_duration_ms": 77200,
+  "total_tokens": 49390,
+  "estimated_cost_usd": 0.015
+}
+```
+
+### Cost & Performance
+
+| Metric | Giá trị |
+|---|---|
+| Time per alert | ~67–77 giây (DeepSeek-V3, sequential + 1 parallel block) |
+| Tokens per alert | ~30k–50k (với prompt caching) |
+| Cost per alert | ~$0.015 USD (~350 VND) |
+| Daemon overhead | < 5% (polling + ES write) |
+
+Scale ~50 alerts/giờ → ~$0.75/giờ, ~$18/ngày. Filter `--score-threshold 0.7` giảm ~5–10× thực tế.
+
+### File structure (module `agent/`)
+
+```
+agent/
+├── __init__.py             # auto-load .env
+├── llm.py                  # Async DeepSeek/OpenAI client
+├── schemas.py              # Pydantic models (Investigation, *Output)
+├── tools.py                # 9 shared tools (ES, MITRE, Sigma, Telegram, ...)
+├── _loop.py                # Generic ReAct loop (tool exec + final parsing)
+├── orchestrator.py         # 7-agent workflow runner
+├── es_io.py                # ES read/write + state management
+├── daemon.py               # Long-running polling daemon
+├── inject_test_alert.py    # Helper: inject mock alert vào red-alerts
+├── run.py                  # CLI: chạy 1 investigation
+├── prototype.py            # Single-agent baseline (giữ để so sánh)
+├── agents/
+│   ├── supervisor.py
+│   ├── triage.py
+│   ├── hunt.py
+│   ├── red_analyst.py
+│   ├── mitre.py
+│   ├── response.py
+│   └── report.py
+└── prompts/
+    ├── supervisor.md
+    ├── triage.md
+    ├── hunt.md
+    ├── red_analyst.md
+    ├── mitre.md
+    ├── response.md
+    └── report.md
+```
+
+### Lưu ý quan trọng
+
+- **`.env`** chứa API keys — đã trong `.gitignore`, KHÔNG commit
+- **DeepSeek Pro / ChatGPT Plus subscription** không cho phép gọi API — phải dùng API key riêng
+- **Telegram notify**: mock mặc định. Set `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` để gửi thật
+- **Human-in-the-loop**: mỗi `ResponseAction` có `needs_approval=true/false`. Destructive actions (isolate, kill, disable_user) luôn cần approval — daemon hiện tại CHƯA tự execute, chỉ log đề xuất
+- **State file** `.agent_daemon_state.json` lưu timestamp đã process — restart không bị duplicate
+
 ---
 
 ## Chuẩn bị dữ liệu
@@ -579,6 +957,83 @@ python scripts/generate_evasions.py --config config/registry_event.yaml
 python scripts/generate_evasions.py --config config/powershell.yaml
 ```
 
+Các file JSON evasion được lưu sâu theo cấu trúc:
+
+```text
+event_type/rule_name/*.json
+```
+
+Vì vậy nếu kiểm tra bằng `tree -L 2` ở thư mục gốc `evasions/windows` có thể chưa thấy file JSON trực tiếp.
+
+### Export evasion scripts
+
+Script `export_evasion_scripts.py` chuyển các JSON evasion thành script PowerShell để kiểm thử trong Windows lab.
+
+Bộ script safe đã export sẵn:
+
+```text
+/home/luanthanh/data/sigma/evasion_scripts/windows
+```
+
+Kết quả hiện tại:
+
+```text
+process_creation: 446 scripts
+powershell:       131 scripts
+registry_event:    29 scripts
+total:            606 scripts
+```
+
+Manifest:
+
+```text
+/home/luanthanh/data/sigma/evasion_scripts/windows/manifest.csv
+```
+
+Export ở `safe` mode:
+
+```bash
+cd ~/KLTN/KLTN/Rule_Evasion_Detection/rule_evasion_detection
+
+python3 scripts/export_evasion_scripts.py \
+  --evasions-dir ~/data/sigma/evasions/windows \
+  --out-dir ~/data/sigma/evasion_scripts/windows \
+  --event-type all \
+  --mode safe
+```
+
+`safe` mode chỉ in nội dung ra script, chưa chạy payload. Muốn tạo script chạy thật trên Windows để sinh log, dùng `execute` mode:
+
+```bash
+python3 scripts/export_evasion_scripts.py \
+  --evasions-dir ~/data/sigma/evasions/windows \
+  --out-dir ~/data/sigma/evasion_scripts_execute/windows \
+  --event-type all \
+  --mode execute \
+  --i-understand-risk \
+  --limit-per-rule 2
+```
+
+Khuyến nghị chạy thử nhỏ trước:
+
+```bash
+python3 scripts/export_evasion_scripts.py \
+  --event-type powershell \
+  --mode execute \
+  --i-understand-risk \
+  --limit-per-rule 1
+```
+
+Trên Windows VM:
+
+```powershell
+Set-ExecutionPolicy Bypass -Scope Process -Force
+cd C:\path\to\evasion_scripts_execute\windows
+.\run_all_execute.ps1
+```
+
+> **Cảnh báo:** Chỉ chạy `execute` mode trong Windows lab/VM snapshot. Một số mẫu có hành vi nhạy như registry persistence, PowerShell suspicious, tắt firewall/defender, hoặc LSASS-related strings. Để thu log đúng, bật Sysmon ProcessCreate/RegistryEvent và PowerShell Script Block Logging, sau đó cho Elastic Agent collect các channel đó.
+
 ---
 
 ## Cấu trúc thư mục
@@ -590,18 +1045,21 @@ rule_evasion_detection/
 │   ├── features.py               # TF-IDF / Count vectorizers, comma_tokenizer
 │   ├── models.py                 # SVM + LR + CNB + EnsembleClassifier
 │   ├── evaluate.py               # BinaryEvaluation, MCC scaler
-│   ├── attribution.py            # RuleAttributionEvaluation, CosineRuleAttributor, RRF
+│   ├── attribution.py            # RuleAttributionEvaluation, CosineRuleAttributor, RRF baseline
 │   ├── data.py                   # Data loading (txt/jsonl/json/csv, Sigma rules)
 │   ├── persist.py                # save/load pickle+ZIP
 │   └── visualize.py              # PR curves, attribution plots
 ├── scripts/
+│   ├── run_stage1.py             # Gộp train + validate + evaluate (khuyến nghị)
 │   ├── train.py                  # Stage 1 training (--ensemble flag)
 │   ├── validate.py               # Transform + decision_function
 │   ├── evaluate.py               # MCC scale + threshold sweep
-│   ├── train_attribution.py      # Stage 2: per-rule SVM + Cosine
-│   ├── eval_attribution.py       # --method svm|cosine|hybrid
+│   ├── train_attribution.py      # Stage 2: Cosine + per-rule SVM baseline
+│   ├── eval_attribution.py       # production: --method cosine; baseline: svm|hybrid
 │   ├── generate_evasions.py      # Tạo evasion variants
-│   ├── run_pipeline.py           # Chạy toàn bộ pipeline
+│   ├── export_evasion_scripts.py # Export evasion JSON → PowerShell scripts
+│   ├── convert_sigma_to_elastic.py # Sigma YAML → Elastic Detection Rule NDJSON
+│   ├── run_pipeline.py           # Chạy toàn bộ pipeline (Stage 1+2)
 │   ├── plot.py                   # Sinh đồ thị
 │   ├── hayabusa_to_matches.py    # Hayabusa JSONL → match events
 │   ├── lmd_to_benign.py          # LMD CSV → benign_train.txt
@@ -610,7 +1068,29 @@ rule_evasion_detection/
 │   ├── secrepo_to_benign.py      # Squid log → URL benign
 │   ├── elk_export.py             # Export events Elasticsearch → JSONL
 │   ├── detect_batch.py           # Batch detection: JSONL → alerts (offline)
-│   └── detect_live.py            # Live daemon: poll ES → Stage1+2 → red-alerts
+│   ├── detect_live.py            # Live daemon: poll ES → Stage1+2 → red-alerts
+│   ├── diagnose_stage1.py        # Analyze Stage 1 model (F1=1.0, token analysis)
+│   └── push_alerts.py            # Bulk index alerts JSONL → Elasticsearch
+├── agent/                        # Phase C: Multi-Agent SOC Triage ⭐
+│   ├── llm.py                    # Async DeepSeek/OpenAI client
+│   ├── schemas.py                # Pydantic typed outputs
+│   ├── tools.py                  # 9 shared tools (ES, MITRE, Sigma, Telegram)
+│   ├── _loop.py                  # Generic ReAct loop
+│   ├── orchestrator.py           # 7-agent workflow runner
+│   ├── es_io.py                  # ES poll red-alerts + write ai-investigations
+│   ├── daemon.py                 # Long-running polling daemon
+│   ├── inject_test_alert.py      # Helper inject mock alert
+│   ├── run.py                    # CLI run 1 investigation
+│   ├── prototype.py              # Single-agent baseline (so sánh)
+│   ├── agents/
+│   │   ├── supervisor.py         # Router decide workflow
+│   │   ├── triage.py             # Severity + FP filter (has tools)
+│   │   ├── hunt.py               # Timeline + IOC (parallel)
+│   │   ├── red_analyst.py        # ⭐ Evasion explanation (parallel)
+│   │   ├── mitre.py              # TTP mapping (parallel)
+│   │   ├── response.py           # ⭐ Sigma patch + containment
+│   │   └── report.py             # Vietnamese markdown report
+│   └── prompts/                  # System prompts (markdown)
 ├── config/
 │   ├── process_creation.yaml
 │   ├── registry_event.yaml
@@ -620,8 +1100,12 @@ rule_evasion_detection/
 │   ├── benign/
 │   ├── sigma/rules/
 │   ├── sigma/events_hayabusa/
-│   └── sigma/evasions/
+│   ├── sigma/evasions/
+│   ├── sigma/evasion_scripts/         # Safe scripts export
+│   └── sigma/evasion_scripts_execute/ # Execute scripts export cho Windows lab
 ├── models/                       # Output model .zip (không commit)
+├── .env                          # Local config: API keys, ES creds (gitignored)
+├── .env.example                  # Template config (committed)
 ├── requirements.txt
 └── run_all.sh
 ```

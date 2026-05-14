@@ -10,10 +10,15 @@ data:
   # Sigma native field names — dùng để parse Sigma YAML detection blocks
   search_fields:
     - TargetObject
+    - Details
   # Mapping Sigma field name → list JSON paths để đọc event/log dict
   event_field_map:
     TargetObject:
       - winlog.event_data.TargetObject
+      - Details.RegKey
+    Details:
+      - winlog.event_data.Details
+      - Details.Details
   max_benign_samples: 30000        # cap Stage 1 benign — LMD Sysmon EID 12/13/14 có thể rất lớn
   max_attribution_benign: 15000    # cap Stage 2 per-rule benign
 

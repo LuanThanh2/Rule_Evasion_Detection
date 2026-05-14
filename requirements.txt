@@ -7,3 +7,11 @@ luqum>=0.13
 scikit-learn-intelex>=2024.0
 tqdm>=4.65
 requests
+
+# Sigma -> Elastic Detection Rules
+sigma-cli>=3.0.2
+pySigma-backend-elasticsearch>=2.0.2
+
+# AI Agent (Phase C — SOC Triage)
+openai>=1.50            # OpenAI-compatible client, dùng cho DeepSeek/GPT
+python-dotenv>=1.0      # load .env file

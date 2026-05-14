@@ -82,9 +82,17 @@ def enrich_event(ev: dict, event_type: str) -> dict:
         }
 
     elif event_type == "powershell":
-        script = details.get("ScriptBlockText", "") or details.get("Cmdline", "") or ""
+        script = ""
+        if isinstance(details, dict):
+            for key in ("ScriptBlockText", "ScriptBlock", "Cmdline", "CommandLine"):
+                script = details.get(key, "")
+                if script:
+                    break
         if not script and isinstance(extra, dict):
-            script = extra.get("ScriptBlockText", "")
+            for key in ("ScriptBlockText", "ScriptBlock", "Cmdline", "CommandLine"):
+                script = extra.get(key, "")
+                if script:
+                    break
         ev["winlog"] = {
             "event_data": {
                 "ScriptBlockText": script,

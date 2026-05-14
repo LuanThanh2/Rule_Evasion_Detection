@@ -84,9 +84,13 @@ def _extract_field_from_dict(obj: dict, field: Optional[str]) -> Optional[str]:
     candidates = [
         lambda o: o["process"]["command_line"],
         lambda o: o["winlog"]["event_data"]["CommandLine"],
+        lambda o: o["winlog"]["event_data"]["ScriptBlockText"],
         lambda o: o["CommandLine"],
+        lambda o: o["ScriptBlockText"],
         lambda o: o["command_line"],
         lambda o: o["Details"]["Cmdline"],
+        lambda o: o["Details"]["ScriptBlockText"],
+        lambda o: o["Details"]["ScriptBlock"],
     ]
     for fn in candidates:
         try:

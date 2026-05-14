@@ -38,6 +38,10 @@ Thumbs.db
 # Logs
 *.log
 
+# Agent daemon state
+.agent_daemon_state.json
+.detect_live_state.json
+
 # Project artifacts and generated data
 data/
 datasets/

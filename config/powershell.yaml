@@ -14,6 +14,10 @@ data:
   event_field_map:
     ScriptBlockText:
       - winlog.event_data.ScriptBlockText
+      - Details.ScriptBlockText
+      - Details.ScriptBlock
+      - Details.Cmdline
+      - ExtraFieldInfo.ScriptBlockText
   malicious_extra: ~/data/benign/powershell/malicious_extra.txt
   max_benign_samples: 30000        # cap Stage 1 benign — MPSD .ps1 có thể rất lớn
   max_attribution_benign: 15000    # cap Stage 2 per-rule benign

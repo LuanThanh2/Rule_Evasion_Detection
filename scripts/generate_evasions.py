@@ -10,8 +10,10 @@ For each Sigma rule with match events:
 Supported event types and their transformations:
   - process_creation : remove_exe, double_space, quote_wrap, case_upper, case_lower,
                        env_systemroot, env_temp
-  - registry_event   : hklm_expand, hklm_abbrev, hku_expand, case_lower, case_upper
-  - powershell       : backtick_insert, case_mix, concat_keywords
+  - registry_event   : hklm_expand, hklm_abbrev, hku_expand, controlset_alias,
+                       registry_hive_alias, command/value-data rewrites
+  - powershell       : backtick_insert, aliases, short_flags, concat_keywords,
+                       pattern-aware backtick insertion
 
 Usage:
     python scripts/generate_evasions.py --config config/process_creation.yaml
@@ -67,6 +69,14 @@ def _transforms_registry_event():
         "hklm_abbrev": _t_hklm_abbrev,
         "hku_expand": _t_hku_expand,
         "hku_abbrev": _t_hku_abbrev,
+        "controlset001": _t_controlset001,
+        "registry_machine_alias": _t_registry_machine_alias,
+        "registry_user_alias": _t_registry_user_alias,
+        "details_env_systemroot": _t_env_systemroot,
+        "details_env_public": _t_env_public,
+        "details_remove_exe": _t_remove_exe,
+        "details_powershell_aliases": _t_ps_alias_cmdlets,
+        "details_powershell_short_flags": _t_ps_short_flags,
         "case_lower": lambda t: t.lower(),
         "case_upper": lambda t: t.upper(),
         "trailing_backslash": lambda t: t.rstrip("\\") + "\\",
@@ -75,16 +85,33 @@ def _transforms_registry_event():
 def _transforms_powershell():
     return {
         "backtick_insert": _t_backtick_insert,
+        "alias_cmdlets": _t_ps_alias_cmdlets,
+        "short_flags": _t_ps_short_flags,
         "case_mix": _t_case_mix,
         "concat_keywords": _t_concat_keywords,
         "double_space": _t_double_space,
         "env_comspec": _t_env_comspec,
     }
 
+def _pattern_transforms_registry_event():
+    return {
+        "pattern_backslash_splice": _t_backslash_splice_matched_patterns,
+    }
+
+def _pattern_transforms_powershell():
+    return {
+        "pattern_backtick": _t_ps_backtick_matched_patterns,
+    }
+
 TRANSFORMS_BY_TYPE = {
     "process_creation": _transforms_process_creation,
     "registry_event": _transforms_registry_event,
     "powershell": _transforms_powershell,
+}
+
+PATTERN_TRANSFORMS_BY_TYPE = {
+    "registry_event": _pattern_transforms_registry_event,
+    "powershell": _pattern_transforms_powershell,
 }
 
 # -- process_creation transforms --
@@ -112,6 +139,10 @@ def _t_env_temp(text):
         r'%TEMP%', text
     )
 
+def _t_env_public(text):
+    """C:\\Users\\Public → %PUBLIC%"""
+    return re.sub(r'[Cc]:\\[Uu]sers\\[Pp]ublic', r'%PUBLIC%', text)
+
 def _t_long_flag_o(text):
     """curl -O → curl --remote-name"""
     return re.sub(r'\b-O\b', '--remote-name', text)
@@ -130,12 +161,53 @@ def _t_hku_expand(text):
 def _t_hku_abbrev(text):
     return re.sub(r'\bHKEY_USERS\\', r'HKU\\', text, flags=re.IGNORECASE)
 
+def _t_controlset001(text):
+    """CurrentControlSet → ControlSet001 (synthetic equivalent on many hosts)."""
+    return re.sub(r'CurrentControlSet', r'ControlSet001', text, flags=re.IGNORECASE)
+
+def _t_registry_machine_alias(text):
+    """HKLM/HKEY_LOCAL_MACHINE → \\REGISTRY\\MACHINE."""
+    result = re.sub(
+        r'\bHKEY_LOCAL_MACHINE\\',
+        lambda _: "\\REGISTRY\\MACHINE\\",
+        text,
+        flags=re.IGNORECASE,
+    )
+    result = re.sub(
+        r'\bHKLM\\',
+        lambda _: "\\REGISTRY\\MACHINE\\",
+        result,
+        flags=re.IGNORECASE,
+    )
+    return result
+
+def _t_registry_user_alias(text):
+    """HKU/HKEY_USERS → \\REGISTRY\\USER."""
+    result = re.sub(
+        r'\bHKEY_USERS\\',
+        lambda _: "\\REGISTRY\\USER\\",
+        text,
+        flags=re.IGNORECASE,
+    )
+    result = re.sub(
+        r'\bHKU\\',
+        lambda _: "\\REGISTRY\\USER\\",
+        result,
+        flags=re.IGNORECASE,
+    )
+    return result
+
 # -- powershell transforms --
 
 _PS_KEYWORDS = [
     "Invoke-Expression", "Invoke-Command", "Invoke-WebRequest",
     "DownloadString", "DownloadFile", "EncodedCommand",
-    "Net.WebClient", "FromBase64String", "powershell",
+    "Net.WebClient", "FromBase64String", "Get-Process",
+    "Get-ChildItem", "Get-Item", "Set-Item", "Remove-Item",
+    "New-Object", "Start-Process", "MiniDumpWriteDump",
+    "Add-MpPreference", "Set-MpPreference", "Get-LocalGroup",
+    "Get-LocalUser", "GzipStream", "ScriptBlock", "powershell",
+    "WindowsPowerShell", "lsass",
 ]
 
 def _t_backtick_insert(text):
@@ -170,6 +242,89 @@ def _t_concat_keywords(text):
 def _t_env_comspec(text):
     """cmd.exe → %ComSpec%"""
     return re.sub(r'\bcmd\.exe\b', r'%ComSpec%', text, flags=re.IGNORECASE)
+
+_PS_ALIASES = {
+    "Invoke-Expression": "IEX",
+    "Invoke-WebRequest": "iwr",
+    "Invoke-RestMethod": "irm",
+    "Get-Process": "gps",
+    "Get-ChildItem": "gci",
+    "Get-Item": "gi",
+    "Set-Item": "si",
+    "Remove-Item": "ri",
+    "Where-Object": "?",
+    "ForEach-Object": "%",
+    "Start-Process": "saps",
+}
+
+def _t_ps_alias_cmdlets(text):
+    """Use common PowerShell aliases for exact cmdlet names."""
+    result = text
+    for cmdlet, alias in _PS_ALIASES.items():
+        result = re.sub(rf'(?<![\w-]){re.escape(cmdlet)}(?![\w-])', alias, result, flags=re.IGNORECASE)
+    return result
+
+_PS_SHORT_FLAGS = {
+    "-EncodedCommand": "-e",
+    "-ExecutionPolicy": "-ep",
+    "-WindowStyle": "-w",
+    "-NoProfile": "-nop",
+    "-NonInteractive": "-noni",
+    "-Command": "-c",
+    "-File": "-f",
+}
+
+def _t_ps_short_flags(text):
+    """Use accepted short PowerShell parameter names."""
+    result = text
+    for long_flag, short_flag in _PS_SHORT_FLAGS.items():
+        result = re.sub(rf'(?<!\w){re.escape(long_flag)}(?!\w)', short_flag, result, flags=re.IGNORECASE)
+    return result
+
+def _ps_backtick_words(text):
+    """Insert PowerShell escape ticks inside words while preserving readability."""
+    def _obfuscate(m):
+        token = m.group(0)
+        if "`" in token or len(token) < 4:
+            return token
+        insert_at = 2 if len(token) > 4 else 1
+        return token[:insert_at] + "`" + token[insert_at:]
+
+    return re.sub(r'(?<!`)\b[A-Za-z][A-Za-z0-9_-]{3,}\b', _obfuscate, text)
+
+def _replace_matched_patterns(text, patterns, rewrite_fn):
+    """Rewrite only Sigma patterns that appear in text, longest first."""
+    result = text
+    for pattern in sorted(set(patterns), key=len, reverse=True):
+        if not pattern or len(pattern) < 3:
+            continue
+        if pattern.lower() not in result.lower():
+            continue
+        result = re.sub(
+            re.escape(pattern),
+            lambda m: rewrite_fn(m.group(0)),
+            result,
+            flags=re.IGNORECASE,
+        )
+    return result
+
+def _t_ps_backtick_matched_patterns(text, patterns):
+    """Break matched Sigma substrings with PowerShell backticks."""
+    return _replace_matched_patterns(text, patterns, _ps_backtick_words)
+
+def _t_backslash_splice_matched_patterns(text, patterns):
+    """Break registry exact path substrings by inserting an extra separator.
+
+    This is a synthetic path-splice variant for testing detectors that use exact
+    contains/endswith strings. It is intentionally conservative: only patterns
+    that already contain registry path separators are touched.
+    """
+    def _splice(value):
+        if "\\" not in value:
+            return value
+        return re.sub(r'\\+', r'\\\\', value, count=1)
+
+    return _replace_matched_patterns(text, [p for p in patterns if "\\" in p], _splice)
 
 
 # ---------------------------------------------------------------------------
@@ -293,25 +448,50 @@ def bypasses_rule(transformed: str, patterns: list) -> bool:
 
 def get_event_field_value(event: dict, search_fields: list) -> tuple:
     """Return (value, field_path) for the first non-empty field found."""
-    from red.data import _extract_field_from_dict
-    for field in search_fields:
-        val = _extract_field_from_dict(event, field)
-        if val:
-            return val, field
-    # Fallback for process_creation
-    try:
-        val = event["process"]["command_line"]
-        if val:
-            return val, "process.command_line"
-    except (KeyError, TypeError):
-        pass
-    try:
-        val = event["winlog"]["event_data"]["CommandLine"]
-        if val:
-            return val, "winlog.event_data.CommandLine"
-    except (KeyError, TypeError):
-        pass
+    values = get_event_field_values(event, search_fields)
+    if values:
+        return values[0]
     return None, None
+
+
+def get_event_field_values(event: dict, search_fields: list) -> list:
+    """Return all non-empty candidate (value, field_path) pairs for an event."""
+    from red.data import _extract_field_from_dict
+    values = []
+    seen_paths = set()
+
+    def _add(field_path):
+        if not field_path or field_path in seen_paths:
+            return
+        val = _extract_field_from_dict(event, field_path)
+        if val:
+            values.append((val, field_path))
+            seen_paths.add(field_path)
+
+    for field in search_fields:
+        _add(field)
+
+    if values:
+        return values
+
+    # Common fallbacks keep older generated data usable even when config is thin.
+    for field in (
+        "process.command_line",
+        "winlog.event_data.CommandLine",
+        "winlog.event_data.ScriptBlockText",
+        "winlog.event_data.TargetObject",
+        "winlog.event_data.Details",
+        "Details.Cmdline",
+        "Details.CommandLine",
+        "Details.ScriptBlockText",
+        "Details.ScriptBlock",
+        "Details.RegKey",
+        "Details.Details",
+        "ExtraFieldInfo.ScriptBlockText",
+    ):
+        _add(field)
+
+    return values
 
 
 def patch_event(event: dict, field_path: str, new_value: str) -> dict:
@@ -324,6 +504,31 @@ def patch_event(event: dict, field_path: str, new_value: str) -> dict:
             obj[part] = {}
         obj = obj[part]
     obj[parts[-1]] = new_value
+
+    if field_path == "winlog.event_data.TargetObject":
+        patched.setdefault("Details", {})["RegKey"] = new_value
+    elif field_path == "Details.RegKey":
+        winlog = patched.setdefault("winlog", {})
+        event_data = winlog.setdefault("event_data", {})
+        event_data["TargetObject"] = new_value
+
+    if field_path == "winlog.event_data.Details":
+        patched.setdefault("Details", {})["Details"] = new_value
+    elif field_path == "Details.Details":
+        winlog = patched.setdefault("winlog", {})
+        event_data = winlog.setdefault("event_data", {})
+        event_data["Details"] = new_value
+
+    if field_path in {
+        "Details.ScriptBlock",
+        "Details.ScriptBlockText",
+        "Details.Cmdline",
+        "ExtraFieldInfo.ScriptBlockText",
+    }:
+        winlog = patched.setdefault("winlog", {})
+        event_data = winlog.setdefault("event_data", {})
+        event_data["ScriptBlockText"] = new_value
+
     return patched
 
 
@@ -332,7 +537,8 @@ def patch_event(event: dict, field_path: str, new_value: str) -> dict:
 # ---------------------------------------------------------------------------
 
 def generate_evasions_for_rule(rule_name, rule_data, transforms, search_fields,
-                                evasions_dir, pattern_map=None, dry_run=False):
+                                evasions_dir, pattern_map=None,
+                                pattern_transforms=None, dry_run=False):
     """Generate and save evasion events for one rule into evasions_dir."""
     if not rule_data.matches:
         logger.debug("Rule %s: no match events, skipping", rule_name[:60])
@@ -343,52 +549,82 @@ def generate_evasions_for_rule(rule_name, rule_data, transforms, search_fields,
 
     rule_dir = os.path.join(evasions_dir, rule_name)
     saved = 0
+    seen_outputs = set()
 
     for match_event in rule_data.matches:
-        original_value, field_path = get_event_field_value(match_event, search_fields)
-        if not original_value or not field_path:
+        field_values = get_event_field_values(match_event, search_fields)
+        if not field_values:
             continue
 
-        # Per-event patterns: use rule-level if found, else discover from value
-        if rule_patterns:
-            patterns = rule_patterns
-        else:
-            patterns = find_patterns_in_value(original_value, pattern_map or {})
-            if not patterns:
-                logger.debug("Rule %s: no patterns found for value, skipping event", rule_name[:60])
-                continue
+        for original_value, field_path in field_values:
+            # Per-field patterns: use rule-level if found, else discover from value.
+            if rule_patterns:
+                matched_patterns = [
+                    p for p in rule_patterns
+                    if p and p.lower() in original_value.lower()
+                ]
+                if matched_patterns:
+                    patterns = matched_patterns
+                elif pattern_transforms:
+                    continue
+                else:
+                    patterns = rule_patterns
+            else:
+                patterns = find_patterns_in_value(original_value, pattern_map or {})
+                if not patterns:
+                    logger.debug(
+                        "Rule %s: no patterns found for field %s, skipping",
+                        rule_name[:60],
+                        field_path,
+                    )
+                    continue
 
-        for technique_name, transform_fn in transforms.items():
-            try:
-                transformed = transform_fn(original_value)
-            except Exception as e:
-                logger.debug("Transform %s failed: %s", technique_name, e)
-                continue
+            transform_items = list(transforms.items())
+            if pattern_transforms:
+                for technique_name, transform_fn in pattern_transforms.items():
+                    transform_items.append((
+                        technique_name,
+                        lambda value, fn=transform_fn, pats=patterns: fn(value, pats),
+                    ))
 
-            # Skip if nothing changed
-            if transformed == original_value:
-                continue
+            for technique_name, transform_fn in transform_items:
+                try:
+                    transformed = transform_fn(original_value)
+                except Exception as e:
+                    logger.debug("Transform %s failed: %s", technique_name, e)
+                    continue
 
-            # Skip if transform is not meaningful (too similar)
-            if transformed.lower() == original_value.lower():
-                continue
+                # Skip if nothing changed
+                if transformed == original_value:
+                    continue
 
-            # Verify evasion bypasses rule
-            if not bypasses_rule(transformed, patterns):
-                continue
+                # Skip if transform is not meaningful (too similar)
+                if transformed.lower() == original_value.lower():
+                    continue
 
-            # Build evasion event
-            evasion_event = patch_event(match_event, field_path, transformed)
-            evasion_event["_evasion_technique"] = technique_name
-            evasion_event["_original_value"] = original_value
+                # Verify evasion bypasses the matched rule patterns for this field
+                if not bypasses_rule(transformed, patterns):
+                    continue
 
-            if not dry_run:
-                fname = f"{rule_name}_Evasion_{technique_name}_{saved}.json"
-                fpath = os.path.join(rule_dir, fname)
-                with open(fpath, "w", encoding="utf-8") as f:
-                    json.dump(evasion_event, f, indent=2, ensure_ascii=False)
+                output_key = (id(match_event), transformed)
+                if output_key in seen_outputs:
+                    continue
+                seen_outputs.add(output_key)
 
-            saved += 1
+                # Build evasion event
+                evasion_event = patch_event(match_event, field_path, transformed)
+                evasion_event["_evasion_technique"] = technique_name
+                evasion_event["_evasion_field"] = field_path
+                evasion_event["_original_value"] = original_value
+
+                if not dry_run:
+                    os.makedirs(rule_dir, exist_ok=True)
+                    fname = f"{rule_name}_Evasion_{technique_name}_{saved}.json"
+                    fpath = os.path.join(rule_dir, fname)
+                    with open(fpath, "w", encoding="utf-8") as f:
+                        json.dump(evasion_event, f, indent=2, ensure_ascii=False)
+
+                saved += 1
 
     return saved
 
@@ -452,7 +688,13 @@ def main():
     logger.info("Evasions output dir: %s", args.evasions_dir)
 
     transforms = TRANSFORMS_BY_TYPE[args.event_type]()
-    logger.info("Event type: %s — %d transforms", args.event_type, len(transforms))
+    pattern_transforms = PATTERN_TRANSFORMS_BY_TYPE.get(args.event_type, lambda: {})()
+    logger.info(
+        "Event type: %s — %d transforms + %d pattern transforms",
+        args.event_type,
+        len(transforms),
+        len(pattern_transforms),
+    )
 
     logger.info("Building pattern map from Sigma rules...")
     pattern_map = build_title_pattern_map(args.rules_dir)
@@ -469,6 +711,7 @@ def main():
             rule_name, rule_data, transforms,
             event_paths, args.evasions_dir,
             pattern_map=pattern_map,
+            pattern_transforms=pattern_transforms,
             dry_run=args.dry_run,
         )
         if count > 0:
