@@ -9,7 +9,7 @@ Examples:
   python3 scripts/convert_sigma_to_elastic.py
 
   python3 scripts/convert_sigma_to_elastic.py \
-    --index-pattern logs-winlog* --index-pattern winlogbeat-*
+    --index-pattern logs-winlog.* --index-pattern winlogbeat-*
 
   python3 scripts/convert_sigma_to_elastic.py \
     --import-to-kibana \
@@ -46,6 +46,23 @@ ELASTIC_SEVERITIES = {"low", "medium", "high", "critical"}
 SEVERITY_FALLBACKS = {
     "informational": "low",
     "info": "low",
+}
+FIELD_PROFILES = {
+    "winlog-raw": {
+        "process.parent.command_line": "winlog.event_data.ParentCommandLine",
+        "process.parent.executable": "winlog.event_data.ParentImage",
+        "process.command_line": "winlog.event_data.CommandLine",
+        "process.executable": "winlog.event_data.Image",
+        "process.pe.original_file_name": "winlog.event_data.OriginalFileName",
+        "process.pe.description": "winlog.event_data.Description",
+        "process.pe.product": "winlog.event_data.Product",
+        "process.pe.company": "winlog.event_data.Company",
+        "process.pe.file_version": "winlog.event_data.FileVersion",
+        "process.working_directory": "winlog.event_data.CurrentDirectory",
+        "process.pid": "winlog.event_data.ProcessId",
+        "process.parent.pid": "winlog.event_data.ParentProcessId",
+        "user.name": "winlog.event_data.User",
+    },
 }
 
 
@@ -135,6 +152,8 @@ def run_sigma_convert(args: argparse.Namespace, rule_paths: List[Path], sigma_bi
         patch_rule_indices(output, args.index_pattern)
     if args.normalize_severity:
         normalize_rule_severity(output)
+    if args.field_profile:
+        patch_rule_fields(output, args.field_profile)
 
     count = count_ndjson_objects(output)
     LOGGER.info("Done. Converted %d Elastic rule object(s).", count)
@@ -198,6 +217,57 @@ def normalize_rule_severity(path: Path) -> None:
             for obj in objects:
                 handle.write(json.dumps(obj, ensure_ascii=False) + "\n")
         LOGGER.info("Normalized unsupported severities on %d rule(s)", patched)
+
+
+def patch_rule_fields(path: Path, profile: str) -> None:
+    """Rewrite converted ECS query fields for the lab's raw Winlog/Sysmon schema."""
+    field_map = FIELD_PROFILES[profile]
+    replacements = {key: 0 for key in field_map}
+    patched_rules = 0
+    objects = []
+
+    with path.open("r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            obj = json.loads(line)
+            changed = False
+
+            query = obj.get("query")
+            if isinstance(query, str):
+                new_query = query
+                for source, target in field_map.items():
+                    count = new_query.count(source)
+                    if count:
+                        replacements[source] += count
+                        new_query = new_query.replace(source, target)
+                if new_query != query:
+                    obj["query"] = new_query
+                    changed = True
+
+            required_fields = obj.get("required_fields")
+            if isinstance(required_fields, list):
+                for item in required_fields:
+                    if not isinstance(item, dict):
+                        continue
+                    name = item.get("name")
+                    if name in field_map:
+                        item["name"] = field_map[name]
+                        changed = True
+
+            if changed:
+                patched_rules += 1
+            objects.append(obj)
+
+    with path.open("w", encoding="utf-8") as handle:
+        for obj in objects:
+            handle.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+    LOGGER.info("Patched query fields using profile '%s' on %d rule(s)", profile, patched_rules)
+    for source, count in replacements.items():
+        if count:
+            LOGGER.info("  %s -> %s (%d replacement(s))", source, field_map[source], count)
 
 
 def import_to_kibana(args: argparse.Namespace) -> None:
@@ -331,6 +401,8 @@ def parse_args() -> argparse.Namespace:
                         help="Override Elastic rule index patterns. Can be repeated.")
     parser.add_argument("--normalize-severity", action=argparse.BooleanOptionalAction, default=True,
                         help="Map unsupported Elastic severities such as informational -> low")
+    parser.add_argument("--field-profile", choices=tuple(FIELD_PROFILES), default=None,
+                        help="Rewrite converted ECS fields for a local log schema, e.g. winlog-raw")
 
     parser.add_argument("--import-to-kibana", action="store_true",
                         help="Import generated NDJSON into Kibana Detection Engine")
@@ -372,6 +444,8 @@ def main() -> None:
             raise SystemExit(f"Cannot --skip-convert; output file not found: {out_path}")
         if args.normalize_severity:
             normalize_rule_severity(out_path)
+        if args.field_profile:
+            patch_rule_fields(out_path, args.field_profile)
         LOGGER.info("Using existing NDJSON: %s (%d rule object(s))", out_path, count_ndjson_objects(out_path))
     else:
         if args.rules_path:

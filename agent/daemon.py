@@ -105,8 +105,13 @@ async def daemon_loop(
     max_iter: int,
     score_threshold: float,
     batch_limit: int,
+    since: str | None,
+    no_state: bool,
+    query_string: str | None,
 ):
     state = load_state()
+    if since:
+        state["last_processed_timestamp"] = since
     iter_count = 0
 
     logger.info("═" * 70)
@@ -127,6 +132,7 @@ async def daemon_loop(
                 since_timestamp=state.get("last_processed_timestamp"),
                 limit=batch_limit,
                 score_threshold=score_threshold,
+                query_string=query_string,
             )
         except Exception as e:
             logger.exception("Poll failed: %s — retry sau %ds", e, interval)
@@ -148,7 +154,7 @@ async def daemon_loop(
                         state["last_processed_timestamp"] = alert_ts
                 else:
                     state["error_count"] = state.get("error_count", 0) + 1
-                if not dry_run:
+                if not dry_run and not no_state:
                     save_state(state)
         else:
             logger.info("[Iter %d] No new alerts (waited since %s)",
@@ -190,6 +196,12 @@ def main():
                         help="Chỉ process alerts có RED score >= threshold (default 0.0)")
     parser.add_argument("--batch-limit", type=int, default=20,
                         help="Số alerts max lấy về mỗi iteration. Default 20")
+    parser.add_argument("--since", type=str, default=None,
+                        help="Override state timestamp; process alerts with @timestamp > this ISO value")
+    parser.add_argument("--no-state", action="store_true",
+                        help="Do not save .agent_daemon_state.json; useful for demo one-shot runs")
+    parser.add_argument("--query-string", type=str, default=None,
+                        help="Optional Elasticsearch query_string filter on red-alerts")
     parser.add_argument("--skip-health-check", action="store_true",
                         help="Bỏ qua ES connection check")
     args = parser.parse_args()
@@ -221,6 +233,9 @@ def main():
             max_iter=args.max_iter,
             score_threshold=args.score_threshold,
             batch_limit=args.batch_limit,
+            since=args.since,
+            no_state=args.no_state,
+            query_string=args.query_string,
         ))
     except KeyboardInterrupt:
         logger.info("Interrupted by user")

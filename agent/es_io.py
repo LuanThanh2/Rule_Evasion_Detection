@@ -6,6 +6,7 @@ Pure requests-based — không cần elasticsearch-py.
 import os
 import json
 import logging
+import copy
 from typing import Optional
 from datetime import datetime, timezone
 
@@ -161,24 +162,109 @@ def write_investigation(inv: Investigation) -> dict:
 
 
 # ── Alert read ──────────────────────────────────────────────────────
+def _ensure_path(obj: dict, path: str) -> dict:
+    cur = obj
+    for part in path.split("."):
+        child = cur.get(part)
+        if not isinstance(child, dict):
+            child = {}
+            cur[part] = child
+        cur = child
+    return cur
+
+
+def _set_path(obj: dict, path: str, value) -> None:
+    parts = path.split(".")
+    cur = _ensure_path(obj, ".".join(parts[:-1])) if len(parts) > 1 else obj
+    cur[parts[-1]] = value
+
+
+def normalize_alert_source(src: dict) -> dict:
+    """Normalize red-alerts documents from detect_live.py and mock injectors.
+
+    detect_live.py writes dotted _source keys such as ``red.detection_score`` and
+    ``host.name``. The multi-agent prompts/schemas expect nested objects such as
+    ``red.stage1_score`` and ``host.name``. Elasticsearch can query dotted field
+    paths, but _source keeps the original dotted keys, so normalize here.
+    """
+    alert = copy.deepcopy(src)
+
+    dotted_to_nested = {
+        "host.name": "host.name",
+        "winlog.event_id": "winlog.event_id",
+        "winlog.computer_name": "winlog.computer_name",
+        "red.detection_score": "red.detection_score",
+        "red.attribution_method": "red.attribution_method",
+        "red.top_rule": "red.top_rule",
+        "red.top_rules": "red.top_rules",
+        "red.command_line": "red.command_line",
+    }
+    for dotted_key, nested_path in dotted_to_nested.items():
+        if dotted_key in alert:
+            _set_path(alert, nested_path, alert[dotted_key])
+
+    red = alert.setdefault("red", {})
+    if "stage1_score" not in red and "detection_score" in red:
+        red["stage1_score"] = red["detection_score"]
+
+    # Normalize detect_live top_rules entries: {"rule": name, "score": x}
+    # into the shape used by the AI agent examples/prompts.
+    normalized_top_rules = []
+    for item in red.get("top_rules", []) or []:
+        if not isinstance(item, dict):
+            continue
+        rule_id = item.get("rule_id") or item.get("rule")
+        score = item.get("cosine_score", item.get("score"))
+        normalized = dict(item)
+        if rule_id is not None:
+            normalized.setdefault("rule_id", rule_id)
+            normalized.setdefault("rule", rule_id)
+        if score is not None:
+            normalized.setdefault("cosine_score", score)
+            normalized.setdefault("score", score)
+        normalized_top_rules.append(normalized)
+    if normalized_top_rules:
+        red["top_rules"] = normalized_top_rules
+
+    if "top_rule" not in red and normalized_top_rules:
+        red["top_rule"] = normalized_top_rules[0].get("rule_id")
+
+    if "source_event_id" not in alert and alert.get("_es_id"):
+        alert["source_event_id"] = alert["_es_id"]
+
+    return alert
+
+
 def poll_new_alerts(
     since_timestamp: Optional[str] = None,
     limit: int = 50,
     score_threshold: float = 0.0,
+    query_string: Optional[str] = None,
 ) -> list[dict]:
     """Lấy alerts mới từ red-alerts.
 
     - since_timestamp: ISO 8601, lấy alerts có @timestamp > giá trị này
-    - score_threshold: chỉ lấy alerts có red.stage1_score >= ngưỡng
+    - score_threshold: lấy alerts có red.stage1_score hoặc red.detection_score >= ngưỡng
     """
-    must: list[dict] = []
+    filters: list[dict] = []
     if since_timestamp:
-        must.append({"range": {"@timestamp": {"gt": since_timestamp}}})
+        filters.append({"range": {"@timestamp": {"gt": since_timestamp}}})
     if score_threshold > 0:
-        must.append({"range": {"red.stage1_score": {"gte": score_threshold}}})
+        filters.append({
+            "bool": {
+                "should": [
+                    {"range": {"red.stage1_score": {"gte": score_threshold}}},
+                    {"range": {"red.detection_score": {"gte": score_threshold}}},
+                ],
+                "minimum_should_match": 1,
+            }
+        })
+    must: list[dict] = []
+    if query_string:
+        must.append({"query_string": {"query": query_string}})
 
     query = {
-        "query": {"bool": {"must": must}} if must else {"match_all": {}},
+        "query": {"bool": {"filter": filters, "must": must}} if filters or must else {"match_all": {}},
         "size": limit,
         "sort": [{"@timestamp": "asc"}],
     }
@@ -197,7 +283,7 @@ def poll_new_alerts(
     for h in hits:
         src = h["_source"]
         src["_es_id"] = h["_id"]
-        out.append(src)
+        out.append(normalize_alert_source(src))
     return out
 
 
@@ -214,7 +300,7 @@ def get_alert_by_id(es_id: str) -> Optional[dict]:
         raise RuntimeError(f"Get failed: {r.text}")
     src = r.json().get("_source", {})
     src["_es_id"] = es_id
-    return src
+    return normalize_alert_source(src)
 
 
 # ── State management ────────────────────────────────────────────────

@@ -24,6 +24,7 @@ import time
 import argparse
 import logging
 import datetime
+from urllib.parse import urlsplit, urlunsplit
 import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
@@ -36,6 +37,19 @@ from red.attribution import reciprocal_rank_fusion
 logger = logging.getLogger("detect_live")
 
 STATE_FILE = ".detect_live_state.json"
+
+
+def mask_url_password(url: str) -> str:
+    parts = urlsplit(url)
+    if not parts.password:
+        return url
+    host = parts.hostname or ""
+    if parts.port:
+        host = f"{host}:{parts.port}"
+    userinfo = parts.username or ""
+    if userinfo:
+        host = f"{userinfo}:****@{host}"
+    return urlunsplit((parts.scheme, host, parts.path, parts.query, parts.fragment))
 
 
 # ---------------------------------------------------------------------------
@@ -57,23 +71,45 @@ def es_index(es_host: str, index: str, doc: dict) -> None:
     resp.raise_for_status()
 
 
+def get_dotted(obj: dict, path: str):
+    cur = obj
+    for part in path.split("."):
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(part)
+    return cur
+
+
 def poll_new_events(es_host: str, index: str, event_id: int,
-                    since_ts: str, size: int = 500) -> tuple[list, str]:
+                    since_ts: str, size: int = 500,
+                    timestamp_field: str = "@timestamp",
+                    until_ts: str | None = None,
+                    query_string: str | None = None) -> tuple[list, str]:
+    time_range = {"gt": since_ts}
+    if until_ts:
+        time_range["lte"] = until_ts
+    filters = [
+        {"term": {"winlog.event_id": event_id}},
+        {"range": {timestamp_field: time_range}},
+    ]
+    must = []
+    if query_string:
+        must.append({"query_string": {"query": query_string}})
     query = {
         "query": {
             "bool": {
-                "filter": [
-                    {"term": {"winlog.event_id": event_id}},
-                    {"range": {"@timestamp": {"gt": since_ts}}}
-                ]
+                "filter": filters,
+                "must": must,
             }
         },
-        "sort": [{"@timestamp": "asc"}],
+        "sort": [{timestamp_field: "asc"}],
         "size": size,
     }
     hits = es_search(es_host, index, query)
     events = [h["_source"] for h in hits]
-    last_ts = hits[-1]["_source"]["@timestamp"] if hits else since_ts
+    last_ts = get_dotted(hits[-1]["_source"], timestamp_field) if hits else since_ts
+    if not last_ts:
+        last_ts = since_ts
     return events, last_ts
 
 
@@ -102,6 +138,9 @@ def score_stage1(normalized: str, estimator, vectorizer, scaler, shift: float) -
 
 def attribute_stage2(normalized: str, rule_models: dict, cosine_attributor,
                      method: str, top_k: int, rrf_k: int = 60) -> list:
+    if method == "cosine" and cosine_attributor is not None:
+        return cosine_attributor.score_samples([normalized])[0][:top_k]
+
     svm_scores = {}
     for rule_name, model in rule_models.items():
         try:
@@ -115,9 +154,6 @@ def attribute_stage2(normalized: str, rule_models: dict, cosine_attributor,
         return svm_ranking[:top_k]
 
     cosine_ranking = cosine_attributor.score_samples([normalized])[0]
-
-    if method == "cosine":
-        return cosine_ranking[:top_k]
 
     return reciprocal_rank_fusion([svm_ranking, cosine_ranking], k=rrf_k)[:top_k]
 
@@ -136,6 +172,26 @@ def load_state(path: str, default_ts: str) -> str:
 def save_state(path: str, last_ts: str) -> None:
     with open(path, "w") as f:
         json.dump({"last_ts": last_ts}, f)
+
+
+def parse_time_arg(value: str | None) -> str | None:
+    """Parse ISO timestamp or relative lookback (15m, 2h, 7d) into UTC ISO."""
+    if not value:
+        return None
+    value = value.strip()
+    if value == "now":
+        return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    unit_sec = {"m": 60, "h": 3600, "d": 86400}
+    if len(value) >= 2 and value[-1] in unit_sec:
+        seconds = unit_sec[value[-1]] * int(value[:-1])
+        return (
+            datetime.datetime.utcnow() - datetime.timedelta(seconds=seconds)
+        ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    if value.endswith("Z"):
+        return value
+    if "T" in value:
+        return value + "Z"
+    raise ValueError(f"Invalid time value '{value}'. Use 15m, 2h, now, or 2026-05-15T10:00:00Z")
 
 
 # ---------------------------------------------------------------------------
@@ -164,8 +220,23 @@ def main():
                         help="Poll interval in seconds")
     parser.add_argument("--lookback", type=str, default="1h",
                         help="Initial lookback if no state file exists (e.g. 1h, 24h)")
+    parser.add_argument("--since", type=str, default=None,
+                        help="Backfill start time. ISO UTC or relative, e.g. 2026-05-15T10:00:00Z, 30m")
+    parser.add_argument("--until", type=str, default=None,
+                        help="Backfill end time. ISO UTC, relative, or now")
+    parser.add_argument("--timestamp-field", type=str, default="@timestamp",
+                        help=("Timestamp field for polling. @timestamp is event time from the Windows log; "
+                              "event.ingested is Elastic ingest time from the ELK/ingest node clock."))
+    parser.add_argument("--query-string", type=str, default=None,
+                        help="Optional Elasticsearch query_string filter, useful for demo-focused backfills")
     parser.add_argument("--state-file", type=str, default=STATE_FILE,
                         help="File to persist last-seen timestamp between runs")
+    parser.add_argument("--reset-state", action="store_true",
+                        help="Delete state file before starting")
+    parser.add_argument("--no-state", action="store_true",
+                        help="Do not load or save state; useful for bounded backfill windows")
+    parser.add_argument("--max-iter", type=int, default=0,
+                        help="Stop after N polling iterations (0 = run forever)")
     parser.add_argument("--batch-size", type=int, default=500,
                         help="Max events to fetch per poll")
     args = parser.parse_args()
@@ -174,6 +245,7 @@ def main():
         level=logging.INFO,
         format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
     )
+    logging.getLogger("sklearnex").setLevel(logging.WARNING)
 
     # Load config
     import yaml
@@ -210,23 +282,42 @@ def main():
 
     normalizer = Normalizer()
 
+    if args.reset_state and os.path.exists(args.state_file):
+        os.remove(args.state_file)
+        logger.info("Removed state file: %s", args.state_file)
+
     # Initial timestamp
     unit_sec = {"m": 60, "h": 3600, "d": 86400}
     lookback_sec = unit_sec.get(args.lookback[-1], 3600) * int(args.lookback[:-1])
     default_ts = (
         datetime.datetime.utcnow() - datetime.timedelta(seconds=lookback_sec)
     ).strftime("%Y-%m-%dT%H:%M:%S.000Z")
-    since_ts = load_state(args.state_file, default_ts)
+    explicit_since = parse_time_arg(args.since)
+    until_ts = parse_time_arg(args.until)
+    if explicit_since:
+        since_ts = explicit_since
+    elif args.no_state:
+        since_ts = default_ts
+    else:
+        since_ts = load_state(args.state_file, default_ts)
 
-    logger.info("Starting — polling %s every %ds (since %s)", args.es_index, args.interval, since_ts)
+    logger.info("Starting — polling %s every %ds (%s > %s%s)",
+                args.es_index, args.interval, args.timestamp_field, since_ts,
+                f", <= {until_ts}" if until_ts else "")
     logger.info("Alerts → %s/%s, threshold=%.2f, method=%s",
-                args.es_host, args.out_index, args.threshold, args.method)
+                mask_url_password(args.es_host), args.out_index,
+                args.threshold, args.method)
 
     # Polling loop
+    iter_count = 0
     while True:
         try:
+            iter_count += 1
             events, last_ts = poll_new_events(
-                args.es_host, args.es_index, args.event_id, since_ts, args.batch_size
+                args.es_host, args.es_index, args.event_id, since_ts, args.batch_size,
+                timestamp_field=args.timestamp_field,
+                until_ts=until_ts,
+                query_string=args.query_string,
             )
 
             if events:
@@ -279,7 +370,8 @@ def main():
                     )
 
                 since_ts = last_ts
-                save_state(args.state_file, since_ts)
+                if not args.no_state and not explicit_since:
+                    save_state(args.state_file, since_ts)
 
                 if n_alerts:
                     logger.info("Indexed %d alerts to '%s'", n_alerts, args.out_index)
@@ -289,10 +381,15 @@ def main():
 
         except KeyboardInterrupt:
             logger.info("Interrupted — saving state and exiting.")
-            save_state(args.state_file, since_ts)
+            if not args.no_state and not explicit_since:
+                save_state(args.state_file, since_ts)
             break
         except Exception as exc:
             logger.error("Poll error: %s", exc, exc_info=True)
+
+        if args.max_iter and iter_count >= args.max_iter:
+            logger.info("Reached max_iter=%d — exiting.", args.max_iter)
+            break
 
         time.sleep(args.interval)
 

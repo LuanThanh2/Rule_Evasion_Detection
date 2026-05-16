@@ -523,14 +523,14 @@ python scripts/elk_export.py \
   --es-host http://10.10.20.100:9200 \
   --es-user elastic \
   --es-password tzxr74123 \
-  --es-index "logs-winlog*" \
+  --es-index "logs-winlog.*" \
   --since 15m \
   --out ~/detect_logs/events.jsonl
 
 
 # Index thực tế tùy agent:
 #   Winlogbeat:                 --es-index "winlogbeat-*"
-#   Elastic Agent (Sysmon):     --es-index "logs-winlog*"
+#   Elastic Agent (Sysmon):     --es-index "logs-winlog.*"
 #   Elastic Agent qua Logstash: --es-index "logs-generic*"
 
 # Chạy detection (dùng Cosine — nhanh & chính xác hơn Hybrid với data hiện tại)
@@ -546,19 +546,31 @@ cat ~/detect_logs/alerts.jsonl | python -m json.tool
 
 ### Bước 2 — Live daemon
 
+Daemon demo sạch, chỉ quét rộng family PowerShell process và ghi vào index
+riêng `red-alerts-demo` để không lẫn noise như Docker/Chrome/conhost. Query này
+chỉ giảm nhiễu nguồn vào, không lọc sẵn `-EncodedCommand`, `-e` hay các token
+evasion:
+
 ```bash
-python scripts/detect_live.py \
+python3 scripts/detect_live.py \
   --config config/process_creation.yaml \
   --es-host "http://elastic:tzxr74123@10.10.20.100:9200" \
-  --es-index "logs-winlog*" \
-  --out-index red-alerts \
-  --threshold 0.0 \
+  --es-index "logs-winlog.*" \
+  --out-index red-alerts-demo \
+  --threshold 0.5 \
   --method cosine \
-  --interval 60
-
+  --interval 60 \
+  --lookback 5m \
+  --reset-state \
+  --batch-size 500 \
+  --query-string 'winlog.event_data.Image:*powershell* OR process.name:*powershell* OR winlog.event_data.CommandLine:*powershell* OR process.command_line:*powershell*'
 ```
 
-Alerts được ghi vào index `red-alerts` với các field:
+`--interval 60` là chu kỳ poll liên tục; cửa sổ khởi động do `--lookback 5m`
+quyết định. `--reset-state` giúp demo bắt đầu từ `now-5m`, tránh kẹt
+`.detect_live_state.json` cũ.
+
+Alerts được ghi vào index `red-alerts-demo` với các field:
 
 | Field | Mô tả |
 |---|---|
@@ -568,7 +580,7 @@ Alerts được ghi vào index `red-alerts` với các field:
 | `red.command_line` | CommandLine của event |
 | `host.name` | Tên máy Windows |
 
-Vào Kibana → **Stack Management → Index Patterns** → tạo pattern `red-alerts` để visualize.
+Vào Kibana → **Stack Management → Index Patterns** → tạo pattern `red-alerts-demo` để visualize.
 
 ### Lưu ý
 
@@ -638,7 +650,7 @@ Nếu muốn giới hạn index pattern chỉ vào log Windows:
 
 ```bash
 python3 scripts/convert_sigma_to_elastic.py \
-  --index-pattern "logs-winlog*" \
+  --index-pattern "logs-winlog.*" \
   --index-pattern "winlogbeat-*"
 ```
 
@@ -693,7 +705,7 @@ thì user hiện tại chưa có quyền Detection Engine. Dùng user `elastic` 
 
 - Kibana Security privileges: `All`
 - Rules/Alerts privileges: `All`
-- Read index log nguồn: `logs-*`, `logs-winlog*`, `winlogbeat-*`
+- Read index log nguồn: `logs-*`, `logs-winlog.*`, `winlogbeat-*`
 - Quyền hệ thống Detection Engine theo yêu cầu của Elastic Security
 
 Sau khi import, vào:
