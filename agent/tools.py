@@ -11,6 +11,8 @@ from typing import Optional
 
 import requests
 
+from agent import vr_client
+
 logger = logging.getLogger("agent.tools")
 
 USE_REAL_ES = False  # set bởi orchestrator
@@ -273,6 +275,24 @@ def send_telegram(message_summary: str, severity: str = "MEDIUM") -> dict:
         return {"status": "failed", "error": str(e)}
 
 
+# ── Velociraptor forensic tools (host-level evidence) ─────────────
+# Wrap quanh agent/vr_client.py — mock mode khi VR_USE_REAL!=1
+
+def vr_process_tree_deep(client_id: str, pid: int) -> dict:
+    """Lấy cây tiến trình đầy đủ (parent chain + children + ký số) từ host qua Velociraptor."""
+    return vr_client.get_process_tree_deep(client_id=client_id, pid=int(pid))
+
+
+def vr_file_artifacts(client_id: str, since_minutes: int = 30) -> dict:
+    """Lấy file mới tạo + registry persistence từ host qua Velociraptor."""
+    return vr_client.get_file_artifacts(client_id=client_id, since_minutes=int(since_minutes))
+
+
+def vr_network_connections(client_id: str, since_minutes: int = 30) -> dict:
+    """Lấy kết nối mạng external đang active trên host qua Velociraptor."""
+    return vr_client.get_network_connections_deep(client_id=client_id, since_minutes=int(since_minutes))
+
+
 def lookup_mitre(rule_name: str) -> dict:
     """Map Sigma rule name → MITRE ATT&CK technique."""
     table = {
@@ -443,6 +463,61 @@ TOOLS_SCHEMA = {
             },
         },
     },
+    "vr_process_tree_deep": {
+        "type": "function",
+        "function": {
+            "name": "vr_process_tree_deep",
+            "description": (
+                "Velociraptor: lấy cây tiến trình SÂU từ chính host bị cảnh báo — "
+                "parent chain, children, có chữ ký số không, publisher. "
+                "Đây là BẰNG CHỨNG CỨNG (không phải đoán từ log)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "client_id": {"type": "string", "description": "Velociraptor client_id của host (vd: C.1234abcd)"},
+                    "pid": {"type": "integer", "description": "PID tiến trình cần điều tra"},
+                },
+                "required": ["client_id", "pid"],
+            },
+        },
+    },
+    "vr_file_artifacts": {
+        "type": "function",
+        "function": {
+            "name": "vr_file_artifacts",
+            "description": (
+                "Velociraptor: lấy file mới tạo + key registry mới thêm trên host trong N phút qua. "
+                "Dùng để xác định dropper, persistence (Run keys, Scheduled tasks)."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "client_id": {"type": "string"},
+                    "since_minutes": {"type": "integer", "default": 30},
+                },
+                "required": ["client_id"],
+            },
+        },
+    },
+    "vr_network_connections": {
+        "type": "function",
+        "function": {
+            "name": "vr_network_connections",
+            "description": (
+                "Velociraptor: lấy kết nối mạng external đang ACTIVE trên host (chỉ IP ngoài LAN). "
+                "Xác định C2 channel, exfiltration thật sự đang diễn ra."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "client_id": {"type": "string"},
+                    "since_minutes": {"type": "integer", "default": 30},
+                },
+                "required": ["client_id"],
+            },
+        },
+    },
 }
 
 TOOL_FNS = {
@@ -455,6 +530,9 @@ TOOL_FNS = {
     "get_evasion_tokens": get_evasion_tokens,
     "suggest_containment": suggest_containment,
     "send_telegram": send_telegram,
+    "vr_process_tree_deep": vr_process_tree_deep,
+    "vr_file_artifacts": vr_file_artifacts,
+    "vr_network_connections": vr_network_connections,
 }
 
 

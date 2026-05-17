@@ -21,13 +21,14 @@ from typing import Optional
 from agent import tools as tools_module
 from agent.llm import LLMClient
 from agent.agents import (
-    run_supervisor, run_triage,
+    run_supervisor, run_triage, run_forensic,
     run_hunt, run_red_analyst, run_mitre,
     run_response, run_report,
 )
 from agent.schemas import (
     Investigation, AgentMetadata, WorkflowPlan,
-    TriageOutput, HuntOutput, RedAnalystOutput, MitreOutput,
+    TriageOutput, ForensicOutput,
+    HuntOutput, RedAnalystOutput, MitreOutput,
     ResponseOutput, ReportOutput,
 )
 
@@ -77,7 +78,26 @@ async def investigate(
     # Early exit nếu Triage xác nhận FP
     if triage.is_false_positive:
         logger.info("→ Triage xác định FP — skip rest")
-        return _build_investigation(inv_id, alert, plan, triage, None, None, None, None, None, metadata, llm, t0)
+        return _build_investigation(inv_id, alert, plan, triage, None, None, None, None, None, None, metadata, llm, t0)
+
+    # ── Step 2.5: Forensic — bằng chứng host-level từ Velociraptor ──
+    # Chỉ chạy nếu severity đủ cao — LOW thì skip để tiết kiệm
+    forensic: Optional[ForensicOutput] = None
+    if triage.severity in ("CRITICAL", "HIGH", "MEDIUM"):
+        logger.info("─" * 60)
+        logger.info("🔬 Forensic: thu thập bằng chứng host qua Velociraptor...")
+        forensic, for_raw = await run_forensic(llm, alert, triage, verbose=verbose)
+        metadata.append(_meta_from_raw("forensic", for_raw))
+        logger.info("✓ Forensic: grade=%s, verdict=%s, persistence=%s, c2=%s",
+                    forensic.evidence_grade, forensic.forensic_verdict_vi,
+                    forensic.persistence_found, forensic.c2_confirmed)
+
+        # Forensic xác nhận benign → early exit
+        if forensic.forensic_verdict_vi == "likely_benign":
+            logger.info("→ Forensic xác định benign (evidence cứng) — close case")
+            return _build_investigation(inv_id, alert, plan, triage, forensic, None, None, None, None, None, metadata, llm, t0)
+    else:
+        logger.info("→ Severity %s — skip Forensic để tiết kiệm", triage.severity)
 
     # ── Step 3: Hunt + RED Analyst + MITRE chạy SONG SONG ──
     logger.info("─" * 60)
@@ -109,6 +129,7 @@ async def investigate(
     response, resp_raw = await run_response(
         llm, alert, triage,
         hunt=hunt, red_analyst=red_analyst, mitre=mitre,
+        forensic=forensic,
         verbose=verbose,
     )
     metadata.append(_meta_from_raw("response", resp_raw))
@@ -123,13 +144,14 @@ async def investigate(
     report, rep_raw = await run_report(
         llm, alert, triage,
         hunt=hunt, red_analyst=red_analyst, mitre=mitre, response=response,
+        forensic=forensic,
         verbose=verbose,
     )
     metadata.append(_meta_from_raw("report", rep_raw))
     logger.info("✓ Report: %s", report.title_vi)
 
     return _build_investigation(
-        inv_id, alert, plan, triage, hunt, red_analyst, mitre, response, report,
+        inv_id, alert, plan, triage, forensic, hunt, red_analyst, mitre, response, report,
         metadata, llm, t0,
     )
 
@@ -153,6 +175,7 @@ def _build_investigation(
     alert: dict,
     plan: WorkflowPlan,
     triage: Optional[TriageOutput],
+    forensic: Optional[ForensicOutput],
     hunt: Optional[HuntOutput],
     red_analyst: Optional[RedAnalystOutput],
     mitre: Optional[MitreOutput],
@@ -173,6 +196,7 @@ def _build_investigation(
         trigger_alert=alert,
         workflow_plan=plan,
         triage=triage,
+        forensic=forensic,
         hunt=hunt,
         red_analyst=red_analyst,
         mitre=mitre,

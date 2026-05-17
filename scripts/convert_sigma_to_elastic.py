@@ -61,6 +61,10 @@ FIELD_PROFILES = {
         "process.working_directory": "winlog.event_data.CurrentDirectory",
         "process.pid": "winlog.event_data.ProcessId",
         "process.parent.pid": "winlog.event_data.ParentProcessId",
+        "powershell.file.script_block_text": "winlog.event_data.ScriptBlockText",
+        "registry.path": "winlog.event_data.TargetObject",
+        "registry.value": "winlog.event_data.TargetObject",
+        "registry.data.strings": "winlog.event_data.Details",
         "user.name": "winlog.event_data.User",
     },
 }

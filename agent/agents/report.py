@@ -10,7 +10,7 @@ from typing import Optional
 from agent.llm import LLMClient
 from agent._loop import react_loop, load_prompt
 from agent.schemas import (
-    TriageOutput, ReportOutput,
+    TriageOutput, ReportOutput, ForensicOutput,
     HuntOutput, RedAnalystOutput, MitreOutput, ResponseOutput,
 )
 
@@ -25,6 +25,7 @@ async def run_report(
     red_analyst: Optional[RedAnalystOutput] = None,
     mitre: Optional[MitreOutput] = None,
     response: Optional[ResponseOutput] = None,
+    forensic: Optional[ForensicOutput] = None,
     verbose: bool = True,
 ) -> tuple[ReportOutput, dict]:
     """Generate Vietnamese SOC report dùng tất cả agent outputs."""
@@ -32,6 +33,9 @@ async def run_report(
 
     sections = ["**ALERT**:", f"```json\n{json.dumps(alert, ensure_ascii=False, indent=2)}\n```"]
     sections += ["\n**TRIAGE**:", f"```json\n{triage.model_dump_json(indent=2)}\n```"]
+    if forensic:
+        sections += ["\n**FORENSIC EVIDENCE (host-level từ Velociraptor — đưa vào timeline báo cáo)**:",
+                     f"```json\n{forensic.model_dump_json(indent=2)}\n```"]
     if hunt:
         sections += ["\n**HUNT**:", f"```json\n{hunt.model_dump_json(indent=2)}\n```"]
     if red_analyst:

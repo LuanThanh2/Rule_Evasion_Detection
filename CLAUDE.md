@@ -218,6 +218,9 @@ Optional: cuml (NVIDIA GPU), sklearnex (Intel CPU acceleration)
 | registry_event | 11776 (split 9420/2356) | **không có** | ✅ Done | ❌ Cần generate_evasions.py |
 | proxy_web | ? | ? | ❓ Chưa kiểm tra | ❓ Chưa kiểm tra |
 
+**Phase C — AI Agent SOC Triage**: ✅ Implemented (8 agents incl. Forensic, end-to-end OK).
+**Phase E — ELK Integration**: ✅ Done (RED detect_live + Elastic SIEM 1,624 Sigma rules imported + agent daemon).
+
 ### Bằng chứng Ensemble vượt SVM (process_creation, raw threshold=0)
 
 | Metric | SVM đơn | **Ensemble** |
@@ -245,29 +248,127 @@ Sau MCC scaling, cả 2 đều F1=1.0 (data dễ tách). **Raw metrics mới ph�
 
 **Còn lại:** Chạy Stage 2 cho 3 event types khác.
 
-#### Phase C — AI Agent SOC Triage (NOVELTY CHÍNH)
+#### Phase C — AI Agent SOC Triage (✅ IMPLEMENTED 2026-05-14)
 
-Architecture:
+**Status**: Multi-agent pipeline đã hoạt động end-to-end với LLM DeepSeek V3, deploy thông qua `agent/daemon.py`.
+
+**Architecture — 8 agents hierarchical** (Forensic added 2026-05-17):
+
 ```
-SOC Triage Agent (ReAct loop, LiteLLM-based)
-├── Tools:
-│   ├── classify_event(event) → score
-│   ├── attribute_rule(event) → top-k rules
-│   ├── enrich_mitre(rule) → ATT&CK technique
-│   ├── lookup_ioc(hash/ip) → VirusTotal/AbuseIPDB
-│   ├── query_history(host) → previous alerts
-│   ├── generate_response() → Sigma patch suggestion
-│   └── escalate(severity) → TheHive/Slack
-└── LLM: Claude/GPT/Llama via LiteLLM
+Supervisor (no tools) → Triage (3 tools)
+                            │
+                            ├──► is_false_positive → skip rest
+                            ▼
+                  🔬 Forensic (3 VR tools)  ← NEW: host-level evidence
+                            │
+                            ├──► verdict=likely_benign → close case
+                            ▼
+            parallel(Hunt, RED Analyst, MITRE)  ← asyncio.gather
+                            │
+                            ▼
+                       Response (3 tools, grounded by forensic)
+                            │
+                            ▼
+                       Report (no tools, forensic timeline)
+                            │
+                            ▼
+                  ai-investigations (ES)
 ```
 
-Multi-Agent (advanced): Triage → Investigation → Response → Report.
+**Module structure** (`agent/`):
+- `orchestrator.py` — Workflow runner async
+- `_loop.py` — Generic ReAct loop với local token tracking (parallel-safe)
+- `llm.py` — Async DeepSeek/OpenAI client (OpenAI-compat)
+- `schemas.py` — Pydantic models cho mọi output types
+- `tools.py` — 12 shared tools (9 mock/ES + 3 Velociraptor wrappers)
+- `vr_client.py` — Velociraptor gRPC wrapper + mock data + host→client_id resolver
+- `vr_client_map.yaml` — Map hostname → Velociraptor client_id (điền sau khi cài VR)
+- `es_io.py` — Read red-alerts, write ai-investigations + state mgmt
+- `daemon.py` — Polling daemon với `--since`, `--no-state`, `--query-string`
+- `inject_test_alert.py` — Helper inject mock alert
+- `agents/` — 8 agent implementations (mỗi cái ~80 dòng)
+- `prompts/` — 8 system prompts markdown
 
-Đánh giá:
-- Time-to-decision (vs analyst người)
-- Token cost/alert
-- Hallucination rate (agent có bịa rule không tồn tại?)
-- Accuracy vs ground truth
+**8 agents chi tiết**:
+
+| Agent | Tools | Output schema | Vai trò |
+|---|---|---|---|
+| **Supervisor** | (none) | `WorkflowPlan` | Router decide skip_fp/quick/full |
+| **Triage** | query_es_history, get_process_tree, lookup_mitre | `TriageOutput` | Severity + FP filter (~60-80% alerts) |
+| **Forensic** ⭐ | vr_process_tree_deep, vr_file_artifacts, vr_network_connections | `ForensicOutput` | Host-level evidence từ Velociraptor — ground hết downstream |
+| **Hunt** | + get_network_connections, search_threat_intel | `HuntOutput` | Timeline + IOCs + threat intel |
+| **RED Analyst** ⭐ | get_sigma_rule_text, get_evasion_tokens | `RedAnalystOutput` | Explain WHY this is evasion (interpretability) |
+| **MITRE** | lookup_mitre | `MitreOutput` | TTP chain mapping |
+| **Response** ⭐ | get_sigma_rule_text, suggest_containment, send_telegram | `ResponseOutput` | Sigma patch (grounded bởi forensic) + containment + notify |
+| **Report** | (none) | `ReportOutput` | Vietnamese markdown report kèm forensic timeline |
+
+**Performance** (per investigation, DeepSeek V3, 2026-05-17 — REAL Velociraptor verified):
+- 7-agent (no Forensic): ~67-77s, ~30-50k tokens, ~$0.015
+- **8-agent mock VR: ~98s, ~67k tokens, ~$0.020** (+27s, +$0.005)
+- **8-agent REAL VR: ~210s, ~67k tokens, ~$0.018** (Forensic Agent ~150s vì 3 query × 25-30s)
+- Forensic Agent mock: ~22s; real: ~150s
+- Parallel block (Hunt+RED+MITRE) vẫn tiết kiệm ~13-16s
+
+**Forensic Agent rationale** (Phase C v2):
+- Vấn đề pipeline cũ: triage + analysis chỉ dựa trên LOG → "LLM bịa Sigma patch" là rủi ro chính
+- Forensic gọi Velociraptor query trực tiếp host nạn nhân → bằng chứng cứng (process tree, file hash, registry persistence, network active)
+- Downstream agents (Response, Report) nhận `ForensicOutput` qua optional kwarg `forensic=` → backward compatible
+- Mock mode (default): trả mock data có shape giống VQL thật → agent code không đổi giữa dev/prod
+- Real mode: `export VR_USE_REAL=1 VR_API_CONFIG=...` + `pip install pyvelociraptor grpcio pyyaml` + điền `vr_client_map.yaml`
+- **Verified 2026-05-17**: pipeline 8-agent chạy với REAL Velociraptor query Windows VM (DESKTOP-2UQB61H, C.1b622eacffe8b75d), scan 166 real processes, agent honest verdict `inconclusive` khi không tìm thấy alert PID → **kháng hallucination measurable**
+
+**Velociraptor lab setup** (đã verify hoạt động):
+- Server binary: `/usr/local/bin/velociraptor` (chạy systemd `velociraptor_server.service`)
+- Server config (root): `/etc/velociraptor/server.config.yaml`
+- User-owned configs: `~/velociraptor/{server,client,api}.config.yaml`
+- Datastore: `/var/lib/velociraptor` (owned by `velociraptor` user, 0750)
+- Server IP: `10.10.20.20`, frontend `:8000`, GUI `:8889`, API gRPC `:8001`
+- GUI admin: user `admin` / pass `tzxr` (lab only, đổi cho prod)
+- API user (cho agent): `agent` (role administrator) — phải tạo qua `user add` + restart server
+- Cần restart `velociraptor_server` sau khi `user add` để pick up user mới
+- API config required field `name` = API user (vd `agent`), NOT TLS hostname (TLS hardcoded `VelociraptorServer`)
+
+**VQL pattern dùng trong vr_client.py**:
+- `collect_client(artifacts=['X'], timeout=60)` → flow_id
+- `watch_monitoring(artifact='System.Flow.Completion') WHERE FlowId = flow.flow_id LIMIT 1` → đợi flow xong
+- `source(client_id, flow_id, artifact='X')` → đọc kết quả
+- VQL của Velociraptor KHÔNG hỗ trợ subquery `IN { SELECT ... }` → filter trong Python
+- Artifacts dùng: `Windows.System.Pslist`, `Windows.Registry.NTUser`, `Windows.Network.NetstatEnriched`
+
+**Time synchronization** (quan trọng cho thesis evaluation):
+- Pipeline correlate event giữa Windows VM, ELK, Velociraptor server, lab agent
+- Lệch giờ > 30s gây: Forensic kết luận sai live/dead, `since_minutes` méo window, timeline đảo thứ tự
+- Bằng chứng **cấu trúc** (process tree, hash, path, IP, registry) KHÔNG bị ảnh hưởng
+- Bằng chứng **thời gian** (timeline tuyệt đối, decision live/dead) BỊ ảnh hưởng
+- Khuyến nghị: `chrony` trên Ubuntu + `w32tm /resync` trên Windows VM về cùng NTP source
+- Velociraptor server tự gán `_ts` (server-received timestamp) — dùng để cross-host correlation
+
+**Sigma patch generation — quan trọng cần ghi rõ**:
+- Hiện tại: LLM generation, **grounded bởi ForensicOutput** từ 2026-05-17 (giảm hallucination)
+- Limitation: vô hạn evasion variants → patch là tactical band-aid, KHÔNG silver bullet
+- Real defense: RED ML model generalize + feedback loop retrain
+- Trong luận văn KHÔNG claim "auto-Sigma patch solves evasion" — chỉ claim tactical mitigation + feedback loop strategic
+- Forensic evidence giờ là **input ground truth** cho LLM thay vì để LLM tự đoán
+- Future work (Layer 3 validator): YAML parse + Sigma schema + functional test với evasion command
+
+**LLM choice**:
+- Production: DeepSeek-V3 (cheap, decent tool use, OpenAI-compat API)
+- API key trong `.env` (KHÔNG commit)
+- Subscription Claude Pro / ChatGPT Plus KHÔNG cho API access → phải có key riêng
+- Future: benchmark Claude / GPT trong evaluation chapter
+
+**Đánh giá luận văn** (cần làm):
+- Time-to-decision (~70s) vs analyst người (5-15 phút) → 4-12× faster
+- Token cost/alert (~$0.015) vs analyst hour ($25-50)
+- Accuracy vs ground truth — CẦN build labeled dataset 100-200 alerts
+- Hallucination rate — cần count cases LLM bịa rule/IOC
+- FP filter coverage — ~60-80% expected
+
+**Limitations cần thừa nhận trong luận văn**:
+- LLM hallucinate có thể sinh Sigma patch invalid YAML
+- Sigma patch không thay thế được generalization của ML model
+- Latency 70s không real-time (acceptable cho SOC triage)
+- Phụ thuộc DeepSeek API uptime + rate limits
 
 #### Phase D — Adversarial Robustness
 - LLM-based evasion: dùng Claude/GPT sinh command tránh rule
@@ -316,14 +417,56 @@ Multi-Agent (advanced): Triage → Investigation → Response → Report.
 | 8 | Viết luận văn nháp | Draft |
 | 9 | Polish + slide + demo video | Final |
 
-### Đóng góp khoa học (claims cho luận văn)
+### Đóng góp khoa học (claims cho luận văn — refraine 2026-05-14)
 
-1. Mở rộng AMIDES với **multi-event-type** (4 loại) thay vì chỉ process creation
-2. **Cosine Similarity** trong không gian TF-IDF chung cho attribution → nhanh, ổn định; SVM/Hybrid-RRF giữ làm baseline so sánh
-3. **AI Agent SOC Triage** tự động hóa workflow analyst — novelty chính
-4. **Adversarial robustness analysis** với LLM-generated evasions
-5. **End-to-end system** từ event → detection → attribution → response → report
-6. **Bằng chứng Ensemble robust hơn SVM ở raw boundary** (5.7% recall improvement, ý nghĩa thống kê cần verify)
+⚠️ **Tránh claim**: "Auto-Sigma patch giải quyết evasion vĩnh viễn" (cat-and-mouse vô hạn — bạn đúng).
+✅ **Claim đúng**: Multi-layer adversarial-aware detection với AI orchestration.
+
+1. **ML model generalize over evasion variants tốt hơn Sigma exact-match**
+   - Ensemble F1=1.0 vs SVM 0.97 (raw threshold=0)
+   - 1 model bắt cả họ variants, không cần enumerate
+   - Bằng chứng: process_creation 17 evasion mà SVM miss được CNB catch
+
+2. **Cosine Similarity attribution accuracy cao**
+   - Top-1 68.8% so với SVM 23.5%, Hybrid 48.7%
+   - Đơn giản, ổn định, scalable
+
+3. **Multi-Agent SOC orchestration tự động hóa workflow analyst**
+   - 8 specialized agents (incl. Forensic), ~98s/alert vs 5-15 phút analyst
+   - Cost $0.020/alert vs $25-50 analyst hour
+
+3b. **Evidence-grounded Sigma patch (Forensic Agent)** ⭐ NEW 2026-05-17
+   - Velociraptor query host nạn nhân → bằng chứng cứng (process tree, file hash, registry, network)
+   - LLM Response Agent ground patch + containment trên evidence cứng thay vì log-level guess
+   - Giảm hallucination Sigma patch — measurable: % patches reference real file paths Velociraptor saw
+   - Trade-off mock: +27s latency, +$0.005/alert
+   - Trade-off real VR: +112s latency (mỗi VR query ~25-30s × 3)
+   - **Hallucination resistance measurable**: với alert PID=0 (Idle Process), Forensic Agent scan 166 real processes, trả verdict `inconclusive` thay vì bịa evidence → claim defensible trong luận văn
+
+4. **Explainable ML detection (RED Analyst Agent)** ⭐ NOVELTY
+   - LLM dịch ML score (black-box) → human reasoning với evidence
+   - Bridge gap giữa ML output và SOC analyst
+   - Không có trong Elastic AI Assistant / Splunk / Sentinel
+
+5. **Cross-source signal correlation (Hunt Agent)**
+   - Fuse SIEM exact-match alerts + RED evasion findings + Threat intel
+   - 1 incident view thay vì N separated alerts
+
+6. **Vietnamese-language SOC automation**
+   - Report tiếng Việt cho VN SOC teams
+   - VNCERT/NĐ 13/2023 compliance ready
+
+7. **Tactical Sigma patch generation + Feedback loop**
+   - LLM sinh patch SHORT-TERM cho variant cụ thể (band-aid)
+   - Evasion samples → retrain RED → long-term defense
+   - Honest framing: patch không thay thế ML model
+
+**Bằng chứng cần measure cho luận văn**:
+- Time-to-decision: agent vs analyst người
+- Accuracy: agent severity vs ground truth (cần build labeled 100-200 alerts)
+- Hallucination rate: % cases LLM bịa rule/IOC
+- FP filter coverage: % FP eliminated trước SOC
+- Sigma patch quality: % patches valid YAML, % catches re-run evasion
 
 ### Vietnamese context (điểm cộng KLTN)
 

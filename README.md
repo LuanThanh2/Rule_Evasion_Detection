@@ -8,7 +8,7 @@ RED là hệ thống end-to-end phát hiện hành vi né tránh luật Sigma, q
 |---|---|---|
 | **Stage 1 — Misuse Detection** | Ensemble Classifier (SVM + LR + CNB) phân biệt benign vs malicious | Score ∈ [0,1] |
 | **Stage 2 — Rule Attribution** | Cosine Similarity trong TF-IDF chung — quy kết rule Sigma bị né | Top-K rules |
-| **Phase C — AI Agent SOC Triage** ⭐ | 7 specialized AI agents tự động investigate, sinh Sigma patch, đề xuất action | Vietnamese report + Sigma patch + containment plan |
+| **Phase C — AI Agent SOC Triage** ⭐ | 8 specialized AI agents (incl. Forensic) tự động investigate với host-level evidence từ Velociraptor, sinh Sigma patch, đề xuất action | Vietnamese report + evidence-grounded Sigma patch + containment plan |
 
 **Đóng góp mới so với AMIDES gốc (Uetz et al., USENIX Security 2024):**
 - **Stage 1**: Ensemble Classifier thay cho SVM đơn lẻ — recall 100% vs 94.3%
@@ -20,14 +20,15 @@ RED là hệ thống end-to-end phát hiện hành vi né tránh luật Sigma, q
 ## Mục lục
 
 1. [Cài đặt](#cài-đặt)
-2. [Thuật toán sử dụng](#thuật-toán-sử-dụng)
-3. [Pipeline tổng quan](#pipeline-tổng-quan)
-4. [Cách chạy](#cách-chạy)
-5. [ELK Integration — Phát hiện trên hệ thống thật](#elk-integration--phát-hiện-trên-hệ-thống-thật)
-6. [AI Agent — Multi-Agent SOC Triage](#ai-agent--multi-agent-soc-triage)
-7. [Chuẩn bị dữ liệu](#chuẩn-bị-dữ-liệu)
-8. [Cấu trúc thư mục](#cấu-trúc-thư-mục)
-9. [Config file](#config-file)
+2. [Trợ giúp lệnh (`-h` / `--help`)](#trợ-giúp-lệnh--h----help)
+3. [Thuật toán sử dụng](#thuật-toán-sử-dụng)
+4. [Pipeline tổng quan](#pipeline-tổng-quan)
+5. [Cách chạy](#cách-chạy)
+6. [ELK Integration — Phát hiện trên hệ thống thật](#elk-integration--phát-hiện-trên-hệ-thống-thật)
+7. [AI Agent — Multi-Agent SOC Triage](#ai-agent--multi-agent-soc-triage)
+8. [Chuẩn bị dữ liệu](#chuẩn-bị-dữ-liệu)
+9. [Cấu trúc thư mục](#cấu-trúc-thư-mục)
+10. [Config file](#config-file)
 
 ---
 
@@ -68,6 +69,80 @@ Tối thiểu cần điền trong `.env`:
 - (Optional) `TELEGRAM_BOT_TOKEN` + `TELEGRAM_CHAT_ID` để Response Agent push notification
 
 > **Lưu ý:** Mọi lệnh `python3 scripts/...` và `python3 -m agent...` bên dưới đều giả định đã `source ~/venvs/rule_evasion_env/bin/activate` trước đó.
+
+---
+
+## Trợ giúp lệnh (`-h` / `--help`)
+
+**Mọi script trong `scripts/` và `agent/` đều hỗ trợ `-h` hoặc `--help`** — in ra usage,
+danh sách tham số, default value và ví dụ chạy. Khi quên cú pháp, chạy `--help` trước.
+
+```bash
+source ~/venvs/rule_evasion_env/bin/activate
+
+# Pattern chung
+python3 scripts/<tên_script>.py --help
+python3 -m agent.<module> --help
+```
+
+### Ví dụ
+
+```bash
+python3 scripts/run_stage1.py --help
+```
+
+```text
+usage: run_stage1.py [-h] --config CONFIG [--ensemble] [--no-ensemble]
+                     [--result-name RESULT_NAME]
+
+Run Stage 1 pipeline (train + validate + evaluate)
+
+options:
+  -h, --help            show this help message and exit
+  --config CONFIG       Path to YAML config (config/process_creation.yaml, ...)
+  --ensemble            Use EnsembleClassifier SVM+LR+CNB (default)
+  --no-ensemble         Use single SVM (baseline so sánh)
+  --result-name RESULT_NAME
+                        Override output name
+
+Usage:
+  python scripts/run_stage1.py --config config/process_creation.yaml
+  python scripts/run_stage1.py --config config/powershell.yaml --no-ensemble
+```
+
+### Bảng tra nhanh — script nào dùng cho việc gì
+
+| Mục đích | Lệnh xem help |
+|---|---|
+| **Stage 1 — gộp 3 bước** | `python3 scripts/run_stage1.py --help` |
+| Stage 1 — train riêng | `python3 scripts/train.py --help` |
+| Stage 1 — validate riêng | `python3 scripts/validate.py --help` |
+| Stage 1 — evaluate riêng | `python3 scripts/evaluate.py --help` |
+| Stage 1 — diagnose model | `python3 scripts/diagnose_stage1.py --help` |
+| **Stage 2 — train attribution** | `python3 scripts/train_attribution.py --help` |
+| Stage 2 — eval (cosine/svm/hybrid) | `python3 scripts/eval_attribution.py --help` |
+| Toàn pipeline Stage 1+2 | `python3 scripts/run_pipeline.py --help` |
+| Sinh evasion variants | `python3 scripts/generate_evasions.py --help` |
+| Export evasion → PowerShell | `python3 scripts/export_evasion_scripts.py --help` |
+| Sinh đồ thị PR / attribution | `python3 scripts/plot.py --help` |
+| **ELK — export events ES → JSONL** | `python3 scripts/elk_export.py --help` |
+| ELK — batch detection (offline) | `python3 scripts/detect_batch.py --help` |
+| ELK — live daemon (real-time) | `python3 scripts/detect_live.py --help` |
+| ELK — push alerts JSONL → ES | `python3 scripts/push_alerts.py --help` |
+| Convert Sigma YAML → Elastic NDJSON | `python3 scripts/convert_sigma_to_elastic.py --help` |
+| **Data prep — LMD → benign** | `python3 scripts/lmd_to_benign.py --help` |
+| Data prep — MPSD → benign PowerShell | `python3 scripts/mpsd_to_benign.py --help` |
+| Data prep — SecRepo → benign URL | `python3 scripts/secrepo_to_benign.py --help` |
+| Data prep — Hayabusa → match events | `python3 scripts/hayabusa_to_matches.py --help` |
+| Data prep — OTRF → match events | `python3 scripts/otrf_to_matches.py --help` |
+| Data prep — split 80/20 benign | `python3 scripts/split_benign.py --help` |
+| **AI Agent — daemon poll ES** | `python3 -m agent.daemon --help` |
+| AI Agent — chạy 1 investigation | `python3 -m agent.run --help` |
+| AI Agent — inject mock alert | `python3 -m agent.inject_test_alert --help` |
+| AI Agent — single-agent baseline | `python3 -m agent.prototype --help` |
+
+> **Mẹo:** Không nhớ tên script? Liệt kê tất cả bằng `ls scripts/*.py` hoặc `ls agent/*.py`.
+> Mọi script dùng `argparse` nên cú pháp help luôn nhất quán.
 
 ---
 
@@ -724,9 +799,9 @@ Security → Alerts
 
 ## AI Agent — Multi-Agent SOC Triage
 
-Lớp cuối của pipeline: **7 specialized AI agents** tự động investigate mọi alert từ `red-alerts`, sinh báo cáo tiếng Việt, đề xuất Sigma patch và containment actions. Kết quả lưu vào index `ai-investigations` để Kibana visualize.
+Lớp cuối của pipeline: **8 specialized AI agents** tự động investigate mọi alert từ `red-alerts`, gọi Velociraptor lấy bằng chứng cứng từ host, sinh báo cáo tiếng Việt, đề xuất Sigma patch và containment actions. Kết quả lưu vào index `ai-investigations` để Kibana visualize.
 
-### Kiến trúc
+### Kiến trúc (cập nhật 2026-05-17 — thêm Forensic Agent)
 
 ```
 red-alerts (ES) ──poll mỗi 60s──►  agent/daemon.py
@@ -737,8 +812,15 @@ red-alerts (ES) ──poll mỗi 60s──►  agent/daemon.py
                             └────────────┬─────────────┘
                                          ▼
                             ┌──────────────────────────┐
-                            │ 🔍 Triage Agent           │  Severity + FP filter
+                            │ 🔍 Triage Agent           │  Severity + FP filter (log-level)
                             └────────────┬─────────────┘
+                                         ▼
+                            ┌──────────────────────────┐
+                            │ 🔬 Forensic Agent ⭐ NEW │  Host-level evidence
+                            │   Velociraptor query:      │  • Process tree thật
+                            │    pslist / file / netstat │  • File / Registry
+                            │                            │  • Network connections
+                            └────────────┬─────────────┘  → evidence_grade + verdict
                                          ▼
                 ┌────────────────────────┴────────────────────────┐
                 ▼ (asyncio.gather — chạy SONG SONG)                ▼
@@ -750,14 +832,16 @@ red-alerts (ES) ──poll mỗi 60s──►  agent/daemon.py
                             ▼                    ▼
                 ┌──────────────────────────────────────┐
                 │ 🛡️  Response Agent ⭐                 │
-                │  • Auto-generate Sigma patch YAML     │
+                │  • Sigma patch YAML (GROUNDED by      │
+                │     Forensic evidence — giảm bịa)     │
                 │  • Containment actions (w/ approval)  │
                 │  • Telegram notification              │
                 └────────────────┬─────────────────────┘
                                  ▼
                 ┌──────────────────────────────────────┐
                 │ 📝 Report Agent                       │
-                │  Vietnamese SOC report (markdown)     │
+                │  Vietnamese SOC report kèm forensic   │
+                │  timeline (markdown)                  │
                 └────────────────┬─────────────────────┘
                                  ▼
                        ai-investigations (ES)
@@ -765,19 +849,335 @@ red-alerts (ES) ──poll mỗi 60s──►  agent/daemon.py
                           Kibana Dashboard
 ```
 
-### Đặc tả 7 agents
+### Đặc tả 8 agents
 
 | Agent | Tools | Output schema | Vai trò |
 |---|---|---|---|
 | **Supervisor** | (none) | `WorkflowPlan` | Router — decide skip_fp / quick / full_investigation |
-| **Triage** | `query_es_history`, `get_process_tree`, `lookup_mitre` | `TriageOutput` | Severity rating + FP filter |
+| **Triage** | `query_es_history`, `get_process_tree`, `lookup_mitre` | `TriageOutput` | Severity rating + FP filter (log-level) |
+| **Forensic** ⭐ NEW | `vr_process_tree_deep`, `vr_file_artifacts`, `vr_network_connections` | `ForensicOutput` | Host-level evidence từ Velociraptor — ground truth verifier, kháng hallucination |
 | **Hunt** | + `get_network_connections`, `search_threat_intel` | `HuntOutput` | Timeline, IOCs, network indicators |
 | **RED Analyst** ⭐ | `get_sigma_rule_text`, `get_evasion_tokens` | `RedAnalystOutput` | Giải thích kỹ thuật né (shorthand_flag, encoding, ...) |
 | **MITRE** | `lookup_mitre` | `MitreOutput` | Map technique + TTP kill-chain |
-| **Response** ⭐ | `get_sigma_rule_text`, `suggest_containment`, `send_telegram` | `ResponseOutput` | **Sigma patch YAML** + containment + notify |
-| **Report** | (none) | `ReportOutput` | Vietnamese markdown report |
+| **Response** ⭐ | `get_sigma_rule_text`, `suggest_containment`, `send_telegram` | `ResponseOutput` | **Sigma patch YAML** (grounded by forensic) + containment + notify |
+| **Report** | (none) | `ReportOutput` | Vietnamese markdown report kèm forensic timeline |
 
-⭐ **RED Analyst + Response** là 2 agent NOVELTY chính — không tool ML nào khác (Elastic AI Assistant, Splunk ESCU, Microsoft Sentinel) có khả năng tự sinh Sigma patch từ evasion sample.
+⭐ **Forensic + RED Analyst + Response** là 3 agent NOVELTY chính.
+- **Forensic** giải quyết bài toán hallucination: thay vì để LLM đoán từ log, query trực tiếp host qua Velociraptor để có bằng chứng cứng. Khi không có evidence (process đã chết, host offline) → kết luận honest `inconclusive` thay vì bịa.
+- **Sigma patch** là **tactical mitigation** (band-aid cho variant cụ thể vừa thấy), **KHÔNG phải silver bullet** — vì có vô hạn variants nên defense thực sự vẫn là RED ML model (generalize) + feedback loop retrain. Xem [Sigma patch limitation](#sigma-patch-limitation--không-phải-silver-bullet) bên dưới.
+
+### Chi tiết từng Agent
+
+Mỗi agent đều là **ReAct loop** (LLM + tools + iteration) — nhận input, dùng tools để gather context, output structured JSON. Vai trò, cách hoạt động, và lý do tồn tại của từng agent:
+
+#### 1. 🎯 Supervisor Agent — Router quyết định workflow
+
+**Vai trò**: Là agent ĐẦU TIÊN nhận mọi alert. Quyết định alert này có đáng investigate không, và investigate ở mức độ nào.
+
+**Inputs**: RED alert raw (host, command_line, top_rules, stage1_score, ...)
+
+**Tools**: (Không có) — Supervisor không gọi external tools, chỉ phân tích dựa trên alert content. Lý do: cần ra quyết định nhanh < 2 giây để route alert.
+
+**Output (`WorkflowPlan`)**:
+- `workflow_type`: `skip_fp` | `quick_triage` | `full_investigation`
+- `priority`: 1-5
+- `agents_to_run`: subset các agents
+- `reasoning`: vì sao chọn workflow này
+
+**Cách hoạt động**:
+1. Đọc `red.stage1_score`, `red.top_rules`, `process.parent.name`
+2. Heuristic-style reasoning bằng LLM:
+   - Score < 0.3 + benign parent → `skip_fp`
+   - Score 0.3–0.6 → `quick_triage` (Triage + Report only)
+   - Score > 0.6 hoặc parent đáng ngờ (outlook, browser) → `full_investigation` (toàn bộ 7 agents)
+3. Output JSON wrapped `<final>` tags
+
+**Tại sao cần**: Tiết kiệm token cost — không phải alert nào cũng cần chạy hết 7 agents. Score thấp filter sớm.
+
+---
+
+#### 2. 🔍 Triage Agent — Severity rating + False Positive filter
+
+**Vai trò**: Quyết định severity (CRITICAL/HIGH/MEDIUM/LOW) hoặc đánh dấu FALSE_POSITIVE.
+
+**Inputs**: Alert raw
+
+**Tools (3)**:
+- `query_es_history(host, hours)` — alerts trước đó cùng host
+- `get_process_tree(host, command_line)` — parent/child processes
+- `lookup_mitre(rule_name)` — severity baseline từ MITRE
+
+**Output (`TriageOutput`)**:
+- `severity`, `is_false_positive`, `confidence`
+- `quick_findings[]`: 3-5 bullet points về evidence
+- `mitre_technique`
+- `needs_deeper_investigation`: bool
+
+**Cách hoạt động**:
+1. Gather context bằng tools (parallel)
+2. LLM reason về kill-chain: parent là outlook? → phishing. Có lsass_access trước? → credential dump. Decode base64 ra IEX? → download cradle.
+3. Áp dụng severity rubric:
+   - CRITICAL: confirmed kill-chain
+   - HIGH: confirmed evasion + known-bad behavior
+   - MEDIUM: suspicious chưa rõ
+   - LOW: edge case
+   - FALSE_POSITIVE: matches known-FP pattern (admin script với encoded command)
+
+**Tại sao cần**: Filter 60-80% FP TRƯỚC khi spend tokens cho Hunt/Response. Reduce analyst fatigue.
+
+---
+
+#### 3. 🔬 Forensic Agent ⭐ NEW — Bằng chứng cứng từ host (NOVELTY)
+
+**Vai trò**: Truy vấn TRỰC TIẾP máy nạn nhân qua Velociraptor để lấy bằng chứng cứng — process tree thật, file mới tạo, kết nối mạng active. Khác Triage (đoán từ log) và Hunt (correlate log).
+
+**Inputs**: Alert + Triage output
+
+**Tools (3)** — wrap quanh Velociraptor gRPC API:
+- `vr_process_tree_deep(client_id, pid)` — cây tiến trình thật + chữ ký số
+- `vr_file_artifacts(client_id, since_minutes)` — file mới tạo + registry persistence
+- `vr_network_connections(client_id, since_minutes)` — kết nối mạng external active
+
+**Output (`ForensicOutput`)**:
+- `evidence_grade`: `high` | `medium` | `low` | `missing`
+- `process_tree_summary_vi`: tóm tắt cấu trúc
+- `suspicious_artifacts[]`: list bằng chứng (kind, description, severity_contribution)
+- `persistence_found`: bool
+- `c2_confirmed`: bool
+- `iocs_observed[]`: IP / file path / SHA256 / registry key
+- `timeline_vi[]`: chuỗi sự kiện theo thời gian từ host
+- `forensic_verdict_vi`: `confirmed_malicious` | `likely_benign` | `inconclusive`
+- `confidence`: 0–1
+
+**Cách hoạt động**:
+1. Resolve `host.name` → Velociraptor `client_id` qua `vr_client_map.yaml`
+2. Gọi 3 VR tool song song (asyncio) — mỗi tool ~25-30s vì `collect_client → wait → source`
+3. LLM tổng hợp evidence, phân loại theo rubric:
+   - ≥ 2 evidence `high` → `confirmed_malicious`
+   - Toàn signed Microsoft + không có file lạ → `likely_benign`
+   - Bằng chứng mâu thuẫn hoặc query fail → `inconclusive`
+4. Downstream agents (Response, Report) nhận `ForensicOutput` qua optional kwarg `forensic=`
+
+**Tại sao cần** — đây là điểm NOVELTY chính của v2 pipeline:
+- Pipeline cũ (7-agent): LLM Response có thể **bịa Sigma patch** dựa trên log alert giả
+- Pipeline mới (8-agent): Response ground patch trên evidence cứng (file path thật, IP thật từ host)
+- **Test minh chứng**: với mock alert có PID=0 (Idle Process không tồn tại), Forensic Agent KHÔNG bịa — scan 166 process thật, không thấy match → trả `evidence_grade: missing`, `verdict: inconclusive`. Đây là **kháng hallucination measurable**.
+
+**Modes**:
+- **Mock mode** (default): trả mock data shape giống VQL thật → test agent loop khi chưa cài Velociraptor
+- **Real mode**: `export VR_USE_REAL=1` + `VR_API_CONFIG=~/velociraptor/api.config.yaml` → query Velociraptor thật
+
+**Limitation cần biết**:
+- Latency: +27s (mock) → +112s (real) vì 3 VR query × 25-30s mỗi cái
+- Cần Windows VM có Velociraptor agent connected
+- Process đã chết / host reboot → không lấy được bằng chứng (đúng kỳ vọng, không phải bug)
+- Clock skew giữa Windows VM và server có thể ảnh hưởng timeline tuyệt đối (xem [Time Synchronization](#time-synchronization) bên dưới)
+
+---
+
+#### 4. 🕵️ Hunt Agent — Correlate signals + Build timeline
+
+**Vai trò**: Investigate sâu — tìm related events, IOCs, network indicators, dựng timeline.
+
+**Inputs**: Alert + Triage output
+
+**Tools (5)**:
+- `query_es_history`, `get_process_tree` (shared với Triage)
+- `get_network_connections(host, timeframe_minutes)` — C2 channels
+- `search_threat_intel(indicator)` — IP/hash reputation (VirusTotal/AbuseIPDB)
+- `lookup_mitre`
+
+**Output (`HuntOutput`)**:
+- `related_events_count`
+- `timeline_vi[]`: chuỗi sự kiện theo thời gian, tiếng Việt
+- `iocs_found[]`: IP, hash, domain, URL
+- `network_indicators[]`: connection details
+- `hunt_summary_vi`: tóm tắt
+- `suspicious_score`: 0–1
+
+**Cách hoạt động**:
+1. Query ES với time window ±15 phút
+2. Build process tree để hiểu chain (e.g. outlook → powershell → curl)
+3. Extract IOCs từ command lines + network logs
+4. Cho mỗi IOC quan trọng, lookup threat intel
+5. Sort events theo timestamp → timeline
+
+**Tại sao cần**: Analyst phải spend 5-15 phút query ES, build timeline. Hunt Agent làm trong ~10s.
+
+---
+
+#### 5. 🧠 RED Analyst Agent ⭐ — Giải thích kỹ thuật evasion (NOVELTY)
+
+**Vai trò**: Đây là agent UNIQUE — translate ML model output (black-box score) thành **technical explanation** tại sao đây là evasion.
+
+**Inputs**: Alert raw (đặc biệt là `red.top_rules` + `process.command_line`)
+
+**Tools (2)**:
+- `get_sigma_rule_text(rule_name)` — đọc YAML rule bị né
+- `get_evasion_tokens(command_line, rule_name)` — phân tích tokens
+
+**Output (`RedAnalystOutput`)**:
+- `evasion_technique`: `shorthand_flag` | `case_manipulation` | `encoding` | `obfuscation` | `concatenation` | `unknown`
+- `evasion_reasoning_vi`: giải thích chi tiết
+- `discriminative_tokens[]`: tokens nào giúp RED model bắt
+- `sigma_rule_comparison_vi`: so sánh rule pattern vs command thực
+- `confidence`: 0–1
+
+**Cách hoạt động**:
+1. Lấy YAML rule gốc (`get_sigma_rule_text`)
+2. So sánh rule pattern (e.g. `CommandLine|contains: '-EncodedCommand'`) với command line thực (`powershell -e SQBu...`)
+3. Phân loại kỹ thuật né (`get_evasion_tokens`)
+4. LLM giải thích: *"Attacker dùng `-e` thay vì `-EncodedCommand`. PowerShell parser tự expand vì `-e` là prefix duy nhất. Sigma rule exact-match bị né."*
+
+**Tại sao cần**:
+- ML score 0.87 không có nghĩa với analyst
+- RED Analyst dịch sang **human reasoning** với evidence
+- Đây là **interpretability layer** giữa black-box ML và SOC analyst
+- Elastic AI Assistant không làm được — nó chỉ chat với data có sẵn, không hiểu nội tại RED model
+
+---
+
+#### 6. 🗺️ MITRE Agent — Map sang ATT&CK framework
+
+**Vai trò**: Mapping technique + dựng TTP kill-chain hoàn chỉnh.
+
+**Inputs**: Alert
+
+**Tools (1)**:
+- `lookup_mitre(rule_name)` — local lookup table mapping rule → technique
+
+**Output (`MitreOutput`)**:
+- `primary_tactic`: TA0001 Initial Access, TA0002 Execution, ...
+- `primary_technique`: T1059.001, T1003.001, ...
+- `sub_techniques[]`: techniques liên quan
+- `ttp_chain_vi[]`: kill-chain từng bước tiếng Việt
+- `severity_baseline`: low/medium/high/critical theo technique
+
+**Cách hoạt động**:
+1. Map top rule sang technique
+2. Phân tích process tree + command line → infer thêm techniques
+   - curl gọi IP → thêm T1105 Ingress Tool Transfer
+   - lsass_access → thêm T1003.001
+3. Sort techniques theo cyber kill-chain order
+
+**Tại sao cần**: Standardize threat reporting cho SOC team, cross-team communication. MITRE là vocabulary chung.
+
+---
+
+#### 7. 🛡️ Response Agent ⭐ — Sigma patch + Containment + Notify (NOVELTY)
+
+**Vai trò**: Output các actions thực tế: Sigma patch tactical, containment actions, notification.
+
+**Inputs**: Alert + Triage + Hunt + RED Analyst + MITRE outputs
+
+**Tools (3)**:
+- `get_sigma_rule_text` — đọc rule gốc để patch
+- `suggest_containment(host, severity, has_credential_access)` — action templates
+- `send_telegram(message_summary, severity)` — push notification (mock nếu chưa config bot)
+
+**Output (`ResponseOutput`)**:
+- `sigma_patch_yaml`: YAML patched rule
+- `sigma_patch_explanation_vi`: tại sao patch này work
+- `containment_actions[]`: list `ResponseAction` (isolate, kill, block_ip, ...)
+  - Mỗi action có `needs_approval`, `priority`, `rationale_vi`
+- `notification_sent`: bool
+- `requires_human_approval`: bool
+- `summary_vi`: tóm tắt cho SOC
+
+**Cách hoạt động**:
+1. Đọc Sigma rule gốc
+2. Dựa vào `evasion_technique` (từ RED Analyst), sinh patch YAML phù hợp:
+   - `shorthand_flag` → thêm các shorthand variants (`-e `, `-ec `, `-en `, ...)
+   - `case_manipulation` → thêm `|cased` modifier hoặc explicit case variants
+   - `encoding` → thêm decode pre-processing, detect entropy
+3. Lấy containment action templates, customize với host/IP/user cụ thể
+4. Send Telegram với summary
+
+**Sigma patch limitation — KHÔNG phải silver bullet**:
+
+> ⚠️ **Quan trọng**: Sigma patch chỉ là **tactical mitigation** cho variant CỤ THỂ vừa thấy. Có vô hạn evasion variants — patch hôm nay obsolete ngày mai khi attacker dùng variant mới.
+>
+> Defense **thực sự** là:
+> 1. **RED ML model** — generalize qua shared token patterns, bắt cả họ variants
+> 2. **Feedback loop**: evasion samples → retrain RED weekly → model adapt
+> 3. **Sigma patch**: chỉ giảm noise SIEM trong vòng vài ngày
+>
+> Đừng claim "AI Agent giải quyết evasion vĩnh viễn" — đó là cat-and-mouse vô hạn.
+
+**Human-in-the-loop**: Mọi action destructive (`isolate_host`, `kill_process`, `disable_user`) có `needs_approval=true`. Daemon hiện tại CHƯA tự execute — chỉ log đề xuất. SOC analyst review trên Kibana → approve → manually execute.
+
+---
+
+#### 8. 📝 Report Agent — Vietnamese SOC report
+
+**Vai trò**: Tổng hợp 5 outputs trên thành báo cáo markdown tiếng Việt chuẩn SOC.
+
+**Inputs**: Alert + ALL outputs từ Triage/Hunt/RED Analyst/MITRE/Response
+
+**Tools**: (Không có) — chỉ format dữ liệu đã có
+
+**Output (`ReportOutput`)**:
+- `title_vi`: 1 dòng tóm tắt
+- `summary_vi`: 2-3 câu
+- `full_markdown_vi`: full report với sections (Mô tả, Kill chain, Bằng chứng, Sigma patch, Containment, Đánh giá, Recommended actions)
+- `recommended_actions_vi[]`: 5-10 action items
+
+**Cách hoạt động**:
+1. Nhận tất cả outputs trên
+2. LLM compose markdown theo template SOC chuẩn
+3. Embed Sigma patch YAML trong code block để analyst copy-paste
+4. List actions từ Response Agent
+
+**Tại sao cần**: Analyst đọc 1 báo cáo gọn thay vì 5 JSON outputs. Vietnamese cho team VN. Format markdown để paste vào Kibana Cases / Telegram.
+
+---
+
+### Workflow tổng quan
+
+```
+Supervisor (~2s, no tools, decide workflow)
+   │
+   ▼
+Triage (~7s, 3 tools, severity + FP filter từ log)
+   │
+   ├──► IF is_false_positive → skip rest, lưu investigation với FP marker
+   │
+   ▼
+Forensic (~22s mock / ~150s real, 3 VR tools — bằng chứng cứng từ host)
+   │
+   ├──► IF severity=LOW → skip để tiết kiệm
+   ├──► IF verdict=likely_benign → close case
+   │
+   ▼
+parallel(Hunt + RED Analyst + MITRE)  ← asyncio.gather (~10s max trong 3)
+   │     • Hunt: timeline + IOCs
+   │     • RED Analyst: explain evasion
+   │     • MITRE: TTP chain
+   ▼
+Response (~15-20s, 3 tools, Sigma patch GROUNDED bởi forensic + containment + notify)
+   │
+   ▼
+Report (~15-25s, no tools, Vietnamese markdown + forensic timeline)
+   │
+   ▼
+ai-investigations index (Kibana visualize)
+```
+
+**Cost breakdown** (per investigation):
+
+| Agent | Tokens | Cost | Time (mock) | Time (real VR) |
+|---|---|---|---|---|
+| Supervisor | ~900 | $0.0003 | 1.7s | 1.8s |
+| Triage | ~4,300 | $0.0014 | 7s | 6s |
+| **Forensic** ⭐ | **~9,000-20,000** | **$0.003-0.005** | **22s** | **150s** |
+| Hunt | ~7,700-10,700 | $0.0026 | 10s (parallel) | 11s (parallel) |
+| RED Analyst | ~3,900 | $0.0013 | 7s (parallel) | 6s (parallel) |
+| MITRE | ~4,400 | $0.0015 | 5s (parallel) | 4s (parallel) |
+| Response | ~18,000 | $0.0061 | 15-20s | 17s |
+| Report | ~7,700-8,500 | $0.0026 | 15-25s | 23s |
+| **Total** | **~67,000** | **~$0.018-0.020** | **~98s** | **~210s** |
+
+> Real mode chậm hơn 2× vì 3 query Velociraptor (`collect_client → wait → source`) mỗi cái ~25-30s. Đây là trade-off để có bằng chứng cứng. Tham khảo [Forensic Agent](#3--forensic-agent--neww--bằng-chứng-cứng-từ-host-novelty).
 
 ### Cài đặt nhanh
 
@@ -791,21 +1191,115 @@ nano .env    # → điền DEEPSEEK_API_KEY và ES credentials
 
 # Verify config load đúng
 python3 -c "import os; from dotenv import load_dotenv; load_dotenv('.env'); print('OK' if os.environ.get('DEEPSEEK_API_KEY') else 'CHƯA SET API KEY')"
+
+# (Optional cho real Velociraptor mode — xem section Forensic Setup bên dưới)
+pip install pyvelociraptor grpcio pyyaml
 ```
+
+### Forensic Agent Setup (Velociraptor — optional)
+
+Forensic Agent có **2 chế độ**:
+
+#### Mock mode (default — không cần Velociraptor)
+Tự động khi `VR_USE_REAL` không set. Trả về mock data shape giống VQL thật → test agent loop nhanh.
+
+```bash
+unset VR_USE_REAL   # đảm bảo mock mode
+python3 -m agent.run
+```
+
+#### Real mode (cần Velociraptor server + Windows agent)
+
+**Bước 1 — Cài Velociraptor server** (tham khảo `~/velociraptor/VELOCI_INSTALL_NOTES.md` nếu đã có, hoặc download từ [velocidex.com](https://docs.velociraptor.app/downloads/)).
+
+**Bước 2 — Cài client lên Windows VM**. Trên VM Windows (PowerShell admin):
+```powershell
+cd C:\Path\To\windows_client
+Set-ExecutionPolicy -Scope Process Bypass -Force
+.\install_velociraptor_client_windows.ps1
+```
+
+**Bước 3 — Generate API config cho agent**:
+```bash
+sudo -u velociraptor /usr/local/bin/velociraptor \
+  --config /etc/velociraptor/server.config.yaml \
+  config api_client --name agent ~/velociraptor/api.config.yaml
+sudo chown $USER ~/velociraptor/api.config.yaml
+
+# Tạo API user + grant role
+sudo -u velociraptor /usr/local/bin/velociraptor \
+  --config /etc/velociraptor/server.config.yaml \
+  user add --role administrator agent agent_api_pass
+sudo systemctl restart velociraptor_server
+```
+
+**Bước 4 — Map hostname → Velociraptor client_id**:
+
+Lấy client_id của VM Windows:
+```bash
+python3 -c "
+import os; os.environ['VR_USE_REAL']='1'; os.environ['VR_API_CONFIG']=os.path.expanduser('~/velociraptor/api.config.yaml')
+from agent.vr_client import _run_vql
+print(_run_vql('SELECT client_id, os_info.fqdn AS hostname FROM clients()', client_id='_'))
+"
+```
+
+Điền vào `agent/vr_client_map.yaml`:
+```yaml
+WIN-01: C.1b622eacffe8b75d            # cho mock alert
+DESKTOP-2UQB61H: C.1b622eacffe8b75d   # tên thật của VM
+```
+
+**Bước 5 — Chạy real mode**:
+```bash
+export VR_USE_REAL=1
+export VR_API_CONFIG=~/velociraptor/api.config.yaml
+export VR_QUERY_TIMEOUT=180
+
+python3 -m agent.run --save /tmp/inv_real.json
+```
+
+Expected: ~210s/alert, ~$0.018 tokens. Forensic Agent sẽ query thật vào Windows VM, scan process list, file events, network connections.
+
+#### Time Synchronization
+
+Pipeline correlate event giữa **Windows VM**, **ELK server**, **Velociraptor server**, **lab agent**. Lệch giờ giữa các máy gây 4 vấn đề:
+
+1. Forensic Agent kết luận sai về process còn live/dead
+2. Query `since_minutes=30` bị méo window
+3. Timeline trong báo cáo không đúng thứ tự
+4. Cross-host correlation cho lateral movement không tin cậy
+
+**Khuyến nghị (10 phút)**: cài NTP trên tất cả máy:
+
+```bash
+# Ubuntu (lab + ELK + Velociraptor server)
+sudo apt install -y chrony
+sudo systemctl enable --now chrony
+chronyc tracking   # check drift
+```
+
+```powershell
+# Windows VM
+w32tm /config /manualpeerlist:"pool.ntp.org" /syncfromflags:manual /update
+w32tm /resync
+```
+
+**Lưu ý quan trọng**: bằng chứng **cấu trúc** (process tree, file path, hash, IP, registry key) **KHÔNG** bị ảnh hưởng bởi clock skew. Chỉ **timeline tuyệt đối** và quyết định **process live/dead** bị ảnh hưởng. Pipeline vẫn dùng được khi lệch giờ — chỉ giảm độ chính xác timeline.
 
 ### Cách chạy
 
 #### Bước 1 — Test 1 alert mock (offline, không cần ES)
 
 ```bash
-# Chạy 7-agent pipeline trên mock alert có sẵn, in báo cáo
+# Chạy 8-agent pipeline (mock VR mode) trên mock alert có sẵn, in báo cáo
 python3 -m agent.run
 
 # Lưu kết quả ra JSON để inspect
 python3 -m agent.run --save /tmp/investigation.json
 ```
 
-Expected: ~67 giây, ~$0.015 tokens. Output gồm severity, kill-chain timeline, Sigma patch YAML, 5–8 containment actions, báo cáo markdown tiếng Việt.
+Expected: ~98 giây, ~$0.020 tokens. Output gồm severity, **forensic evidence + verdict**, kill-chain timeline, Sigma patch YAML (grounded by forensic), 5–8 containment actions, báo cáo markdown tiếng Việt.
 
 #### Bước 2 — Test ES integration (cần ES reachable)
 
@@ -845,6 +1339,9 @@ Daemon argument đầy đủ:
 | `--reset-state` | False | Xóa state file, process lại từ đầu |
 | `--score-threshold` | 0.0 | Skip alerts có RED score < threshold |
 | `--batch-limit` | 20 | Số alerts max lấy về mỗi iteration |
+| `--since` | (None) | Override state, chỉ process alerts có `@timestamp > ISO_value` |
+| `--no-state` | False | Không save `.agent_daemon_state.json` — dùng cho demo one-shot |
+| `--query-string` | (None) | ES `query_string` filter bổ sung trên `red-alerts` |
 | `--skip-health-check` | False | Bỏ qua ES connection check |
 
 ### Output: index `ai-investigations`
@@ -880,12 +1377,12 @@ Mỗi investigation = 1 document với structure:
 
 | Metric | Giá trị |
 |---|---|
-| Time per alert | ~67–77 giây (DeepSeek-V3, sequential + 1 parallel block) |
-| Tokens per alert | ~30k–50k (với prompt caching) |
-| Cost per alert | ~$0.015 USD (~350 VND) |
+| Time per alert | ~98s (mock VR) / ~210s (real Velociraptor) |
+| Tokens per alert | ~67k (với prompt caching) |
+| Cost per alert | ~$0.018–0.020 USD (~450 VND) |
 | Daemon overhead | < 5% (polling + ES write) |
 
-Scale ~50 alerts/giờ → ~$0.75/giờ, ~$18/ngày. Filter `--score-threshold 0.7` giảm ~5–10× thực tế.
+Scale ~30 alerts/giờ → ~$0.60/giờ, ~$14/ngày. Filter `--score-threshold 0.7` giảm ~5–10× thực tế. Real VR mode 2× chậm hơn mock vì 3 query Velociraptor mỗi cái 25-30s — trade-off để có evidence cứng.
 
 ### File structure (module `agent/`)
 
@@ -893,10 +1390,12 @@ Scale ~50 alerts/giờ → ~$0.75/giờ, ~$18/ngày. Filter `--score-threshold 0
 agent/
 ├── __init__.py             # auto-load .env
 ├── llm.py                  # Async DeepSeek/OpenAI client
-├── schemas.py              # Pydantic models (Investigation, *Output)
-├── tools.py                # 9 shared tools (ES, MITRE, Sigma, Telegram, ...)
+├── schemas.py              # Pydantic models (Investigation, ForensicOutput, *Output)
+├── tools.py                # 12 shared tools (9 ES/MITRE/Sigma + 3 Velociraptor)
+├── vr_client.py            # NEW — Velociraptor gRPC wrapper + mock + hostname resolver
+├── vr_client_map.yaml      # NEW — Map hostname → Velociraptor client_id
 ├── _loop.py                # Generic ReAct loop (tool exec + final parsing)
-├── orchestrator.py         # 7-agent workflow runner
+├── orchestrator.py         # 8-agent workflow runner
 ├── es_io.py                # ES read/write + state management
 ├── daemon.py               # Long-running polling daemon
 ├── inject_test_alert.py    # Helper: inject mock alert vào red-alerts
@@ -905,14 +1404,16 @@ agent/
 ├── agents/
 │   ├── supervisor.py
 │   ├── triage.py
+│   ├── forensic.py         # NEW — Forensic Agent (Velociraptor)
 │   ├── hunt.py
 │   ├── red_analyst.py
 │   ├── mitre.py
-│   ├── response.py
-│   └── report.py
+│   ├── response.py         # nhận thêm forensic= để ground Sigma patch
+│   └── report.py           # nhận forensic= để đưa vào timeline
 └── prompts/
     ├── supervisor.md
     ├── triage.md
+    ├── forensic.md         # NEW — Forensic Agent prompt
     ├── hunt.md
     ├── red_analyst.md
     ├── mitre.md
@@ -1085,10 +1586,12 @@ rule_evasion_detection/
 │   └── push_alerts.py            # Bulk index alerts JSONL → Elasticsearch
 ├── agent/                        # Phase C: Multi-Agent SOC Triage ⭐
 │   ├── llm.py                    # Async DeepSeek/OpenAI client
-│   ├── schemas.py                # Pydantic typed outputs
-│   ├── tools.py                  # 9 shared tools (ES, MITRE, Sigma, Telegram)
+│   ├── schemas.py                # Pydantic typed outputs (incl. ForensicOutput)
+│   ├── tools.py                  # 12 shared tools (9 ES + 3 Velociraptor)
+│   ├── vr_client.py              # ⭐ NEW — Velociraptor gRPC wrapper + hostname resolver
+│   ├── vr_client_map.yaml        # ⭐ NEW — Map hostname → Velociraptor client_id
 │   ├── _loop.py                  # Generic ReAct loop
-│   ├── orchestrator.py           # 7-agent workflow runner
+│   ├── orchestrator.py           # 8-agent workflow runner
 │   ├── es_io.py                  # ES poll red-alerts + write ai-investigations
 │   ├── daemon.py                 # Long-running polling daemon
 │   ├── inject_test_alert.py      # Helper inject mock alert
@@ -1096,13 +1599,14 @@ rule_evasion_detection/
 │   ├── prototype.py              # Single-agent baseline (so sánh)
 │   ├── agents/
 │   │   ├── supervisor.py         # Router decide workflow
-│   │   ├── triage.py             # Severity + FP filter (has tools)
+│   │   ├── triage.py             # Severity + FP filter (log-level)
+│   │   ├── forensic.py           # ⭐ NEW — Host evidence từ Velociraptor
 │   │   ├── hunt.py               # Timeline + IOC (parallel)
 │   │   ├── red_analyst.py        # ⭐ Evasion explanation (parallel)
 │   │   ├── mitre.py              # TTP mapping (parallel)
-│   │   ├── response.py           # ⭐ Sigma patch + containment
-│   │   └── report.py             # Vietnamese markdown report
-│   └── prompts/                  # System prompts (markdown)
+│   │   ├── response.py           # ⭐ Sigma patch (grounded by forensic) + containment
+│   │   └── report.py             # Vietnamese markdown report + forensic timeline
+│   └── prompts/                  # 8 system prompts (markdown)
 ├── config/
 │   ├── process_creation.yaml
 │   ├── registry_event.yaml

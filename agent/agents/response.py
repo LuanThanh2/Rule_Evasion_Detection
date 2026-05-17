@@ -11,7 +11,7 @@ from agent.llm import LLMClient
 from agent._loop import react_loop, load_prompt
 from agent.schemas import (
     TriageOutput, HuntOutput, RedAnalystOutput, MitreOutput,
-    ResponseOutput, ResponseAction,
+    ForensicOutput, ResponseOutput, ResponseAction,
 )
 
 logger = logging.getLogger("agent.response")
@@ -26,6 +26,7 @@ async def run_response(
     hunt: Optional[HuntOutput] = None,
     red_analyst: Optional[RedAnalystOutput] = None,
     mitre: Optional[MitreOutput] = None,
+    forensic: Optional[ForensicOutput] = None,
     verbose: bool = True,
 ) -> tuple[ResponseOutput, dict]:
     system_prompt = load_prompt("response")
@@ -36,6 +37,11 @@ async def run_response(
         "\n**TRIAGE**:",
         f"```json\n{triage.model_dump_json(indent=2)}\n```",
     ]
+    if forensic:
+        sections += [
+            "\n**FORENSIC EVIDENCE (BẰNG CHỨNG CỨNG từ Velociraptor — ưu tiên dùng để ground Sigma patch, KHÔNG BỊA)**:",
+            f"```json\n{forensic.model_dump_json(indent=2)}\n```",
+        ]
     if red_analyst:
         sections += [
             "\n**RED ANALYST (dùng evasion_technique để tạo patch phù hợp)**:",

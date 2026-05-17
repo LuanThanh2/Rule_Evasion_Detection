@@ -67,6 +67,30 @@ class MitreOutput(BaseModel):
     severity_baseline: str  # "low" | "medium" | "high" | "critical"
 
 
+class ForensicEvidence(BaseModel):
+    """1 mảnh bằng chứng từ host (process / file / registry / network)."""
+    kind: Literal["process", "file", "registry", "network"]
+    description_vi: str
+    raw: dict = Field(default_factory=dict)
+    severity_contribution: Literal["high", "medium", "low", "exonerating"] = "medium"
+
+
+class ForensicOutput(BaseModel):
+    """Output của Forensic Agent — bằng chứng host-level từ Velociraptor.
+
+    ⭐ Khác Triage: Triage đoán từ log; Forensic xác minh từ chính máy bị cảnh báo.
+    """
+    evidence_grade: Literal["high", "medium", "low", "missing"]
+    process_tree_summary_vi: str
+    suspicious_artifacts: list[ForensicEvidence] = Field(default_factory=list)
+    persistence_found: bool = False
+    c2_confirmed: bool = False
+    iocs_observed: list[str] = Field(default_factory=list)
+    timeline_vi: list[str] = Field(default_factory=list)
+    forensic_verdict_vi: str  # "confirmed_malicious" | "likely_benign" | "inconclusive"
+    confidence: float = Field(ge=0, le=1)
+
+
 ResponseActionType = Literal[
     "isolate_host", "kill_process", "block_ip", "block_domain",
     "disable_user", "reset_credentials", "create_case", "send_alert",
@@ -125,6 +149,7 @@ class Investigation(BaseModel):
     trigger_alert: dict
     workflow_plan: Optional[WorkflowPlan] = None
     triage: Optional[TriageOutput] = None
+    forensic: Optional[ForensicOutput] = None
     hunt: Optional[HuntOutput] = None
     red_analyst: Optional[RedAnalystOutput] = None
     mitre: Optional[MitreOutput] = None
