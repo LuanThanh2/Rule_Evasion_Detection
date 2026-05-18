@@ -198,16 +198,35 @@ FROM source(client_id=ClientId, flow_id=flow.flow_id,
             artifact='Windows.System.Pslist')
 """
 
-_VQL_FILE_EVENTS = """
+_VQL_STARTUP_ITEMS = """
 LET flow <= collect_client(client_id=ClientId,
-                            artifacts=['Windows.Registry.NTUser'],
+                            artifacts=['Windows.Sys.StartupItems'],
                             timeout=60)
 LET _wait <= SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
              WHERE FlowId = flow.flow_id LIMIT 1
-SELECT Key, ValueName, ValueData, ValueType, Mtime AS Modified
+SELECT *
 FROM source(client_id=ClientId, flow_id=flow.flow_id,
-            artifact='Windows.Registry.NTUser')
-WHERE Key =~ '(?i)(run|runonce|services)' LIMIT 100
+            artifact='Windows.Sys.StartupItems')
+LIMIT 200
+"""
+
+_VQL_NEW_FILES = """
+LET flow <= collect_client(client_id=ClientId,
+                            artifacts=['Windows.Search.FileFinder'],
+                            spec=dict(`Windows.Search.FileFinder`=dict(
+                                SearchFilesGlobTable='Glob\nC:\\\\Users\\\\Public\\\\*.exe\nC:\\\\Users\\\\Public\\\\*.dll\nC:\\\\ProgramData\\\\**\\\\*.exe\nC:\\\\Windows\\\\Temp\\\\*.exe',
+                                Calculate_Hash='Y'
+                            )),
+                            timeout=90)
+LET _wait <= SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
+             WHERE FlowId = flow.flow_id LIMIT 1
+SELECT OSPath AS FullPath, Size,
+       MTime AS Modified,
+       BTime AS Created,
+       Hash.SHA256 AS SHA256
+FROM source(client_id=ClientId, flow_id=flow.flow_id,
+            artifact='Windows.Search.FileFinder')
+LIMIT 100
 """
 
 _VQL_NETSTAT = """
@@ -315,18 +334,54 @@ def get_process_tree_deep(client_id: str, pid: int) -> dict:
 
 
 def get_file_artifacts(client_id: str, since_minutes: int = 30) -> dict:
-    """Lấy file events + registry persistence từ host thật."""
+    """Lấy file mới tạo + registry persistence từ host thật.
+
+    Gọi 2 VQL artifact:
+    - Windows.Search.FileFinder: file .exe/.dll trong C:\\Users\\Public, ProgramData, Temp
+    - Windows.Sys.StartupItems: Run keys + Startup folder items
+    """
     if not VR_USE_REAL:
         return _MOCK_FILE_ARTIFACTS
 
     client_id = _resolve_client_id(client_id)
+    files: list[dict] = []
+    persistence: list[dict] = []
+    errors: list[str] = []
+
     try:
-        rows = _run_vql(_VQL_FILE_EVENTS, client_id, env={"SinceMinutes": since_minutes})
-        return {"files_created_by_process": rows, "registry_persistence": [],
-                "_evidence_grade": "high" if rows else "low"}
+        files = _run_vql(_VQL_NEW_FILES, client_id)
     except Exception as e:
-        logger.warning("Velociraptor query failed (file events): %s — fallback mock", e)
-        return {**_MOCK_FILE_ARTIFACTS, "_real_query_failed": str(e)}
+        logger.warning("Velociraptor file query failed: %s", e)
+        errors.append(f"file_query: {e}")
+
+    try:
+        persistence_raw = _run_vql(_VQL_STARTUP_ITEMS, client_id)
+        # Lọc Run keys có dấu hiệu suspicious (path Users\Public, Temp, ProgramData)
+        # Velociraptor StartupItems field: Details = path/command, OSPath = registry key location
+        SUSPICIOUS_PATH_SUBSTRINGS = (
+            "users\\public", "appdata\\local\\temp", "appdata\\roaming",
+            "programdata", "windows\\temp", "\\downloads\\",
+        )
+        persistence = [
+            p for p in persistence_raw
+            if p.get("Details") and
+               any(s in str(p.get("Details", "")).lower()
+                   for s in SUSPICIOUS_PATH_SUBSTRINGS)
+        ]
+    except Exception as e:
+        logger.warning("Velociraptor startup query failed: %s", e)
+        errors.append(f"startup_query: {e}")
+
+    grade = "high" if (files or persistence) else "low"
+    if errors and not files and not persistence:
+        grade = "missing"
+
+    return {
+        "files_created_by_process": files,
+        "registry_persistence": persistence,
+        "_evidence_grade": grade,
+        **({"_query_errors": errors} if errors else {}),
+    }
 
 
 def get_network_connections_deep(client_id: str, since_minutes: int = 30) -> dict:

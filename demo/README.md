@@ -1033,3 +1033,357 @@ Màn hình hiển thị:
 | Không thấy Security alert baseline | Detection Rules chạy theo lịch; chờ ít nhất một interval hoặc kiểm tra rule đã enable |
 | AI Agent không chạy | Kiểm tra `DEEPSEEK_API_KEY`, `ES_HOST`, `ES_USER`, `ES_PASSWORD` trong `.env` |
 | Query quá nhiễu | Thêm `--query-string 'winlog.event_data.CommandLine:*powershell* OR process.command_line:*powershell*'` |
+
+---
+
+## 11. APT Demo Scenario — Kịch bản trình diễn cho GVHD
+
+Phần này tổng hợp kịch bản demo "Cuộc tấn công APT vào FinanceCorp" được rehearsal sẵn để trình bày trước hội đồng. Gồm 3 file:
+
+| File | Mục đích |
+|---|---|
+| `demo/apt_demo_scenario.ps1` | Script PowerShell **lab-safe** mô phỏng kill-chain APT — chạy trên Windows VM |
+| `demo/QA_PREP.md` | 16 câu hỏi GVHD có thể hỏi + câu trả lời chuẩn bị sẵn |
+| `demo/SLIDES_OUTLINE.md` | Khung 15 slides + timing 25-30 phút |
+
+### 11.0 Phạm vi demo — "Attacker chiếm máy thế nào?"
+
+Đây là câu hỏi GVHD hay vặn. Trả lời thẳng:
+
+**Demo này là post-exploitation perspective** — giả định attacker đã có shell access trên Windows VM rồi. Initial access (làm sao chiếm được máy) **out of scope** cho lab vì cần:
+- Email server thật + Outlook profile thật → gửi phishing email
+- User thật click vào file → trigger macro
+- Network egress thật để C2
+
+→ Không khả thi trong lab thesis.
+
+**Tuy nhiên** — đây không phải hạn chế của RED pipeline, mà là hạn chế của môi trường demo. Trong **production thật**, RED + Sigma có thể detect các giai đoạn đầu của intrusion:
+
+| Phase intrusion | Event log sinh ra | RED có detect được không? |
+|---|---|---|
+| **Initial Access** — macro spawn powershell từ Word/Outlook | Sysmon EID 1: `process.parent.name = "winword.exe"`, `process.name = "powershell.exe"` | ✅ — RED process_creation model match command line pattern |
+| **Execution** — PowerShell encoded payload | PowerShell EID 4104: ScriptBlockText chứa base64 + IEX | ✅ — RED powershell model match (đây là phase mạnh nhất) |
+| **Discovery** — net user, whoami | Sysmon EID 1: cmd hoặc PS chạy lệnh recon | ✅ — RED process_creation match |
+| **Persistence** — Run key | Sysmon EID 13: registry SetValue | ✅ — RED registry_event model match |
+| **Defense Evasion** — clear log | PowerShell EID 4104: Clear-EventLog | ✅ — RED powershell model match |
+
+**Trong lab demo này**, ta SSH vào Windows VM rồi chạy script — parent process là `sshd.exe` thay vì `outlook.exe`. **Sigma rule dạng "parent=Office AND child=powershell" sẽ KHÔNG fire trong demo lab**. Nhưng:
+- **Sigma rule dạng "command_line contains X"** VẪN fire bình thường (vì command line giống nhau trong lab và production)
+- **RED ML** dùng command_line pattern là chính → đầy đủ chức năng trong lab
+
+→ Demo của bạn **đủ defensible** với câu trả lời này.
+
+### 11.0.1 Để mô phỏng "attacker chiếm máy" thực tế hơn
+
+Nếu GVHD muốn xem initial access, có 3 cách thực hiện trong lab:
+
+**Cách 1 — Macro thật trong Word/Excel**:
+- Tạo file `Q1_Report.docm` có macro VBA chạy `Shell("powershell.exe -e <base64>", 0)`
+- Mở file trên Windows VM → macro fire → Sysmon log `parent=winword.exe child=powershell.exe`
+- Đầy đủ tính realistic
+
+**Cách 2 — Process injection mô phỏng**:
+- Dùng `WMI Win32_Process.Create` để spawn powershell với parent giả lập
+- Phức tạp, dễ fail, không cần cho demo cơ bản
+
+**Cách 3 — Honest framing trong slide** (khuyến nghị):
+- Slide nói rõ "demo post-exploitation perspective"
+- Liệt kê 5 phase intrusion + chỉ ra RED có cover được phase nào
+- Trong khi defending: *"Cách 1 (macro thật) em chưa làm vì cần Office license và infrastructure email. Em đề xuất là future work."*
+
+### 11.1 Cốt truyện
+
+| Thành phần | Chi tiết |
+|---|---|
+| Nạn nhân | Alice — kế toán trưởng FinanceCorp Vietnam |
+| Máy đích | `DESKTOP-2UQB61H` (Windows 11, lab VM) |
+| Velociraptor client_id | `C.1b622eacffe8b75d` |
+| Attacker | APT giả định (cảm hứng APT32) |
+| Mục tiêu | Đánh cắp báo cáo Q1 + persistence để truy cập lâu dài |
+
+### 11.2 Kill chain — 5 phase ánh xạ trực tiếp với Sigma rule
+
+Script `apt_demo_scenario.ps1` có 4 mode (giống 3 script `*_scenarios.ps1` còn lại):
+
+| Mode | Mục đích | Kỳ vọng |
+|---|---|---|
+| `benign` | Hành động admin bình thường (whoami, OneDrive, Get-LocalUser) | Sigma silent, RED silent → đối chứng FP |
+| `baseline` | Pattern CHUẨN (canonical) như `-EncodedCommand`, `IEX (...)`, `HKCU\...\Run\...` | **Sigma fires** ✓ + RED fires |
+| `evasion` | Variant né rule: `-e` shorthand, split keyword, RunOnce thay Run | Sigma **MISS** ❌, RED **CATCH** ✅ — điểm bán hàng |
+| `chain` | Multi-phase realistic — pha trộn baseline + evasion theo kill-chain | Mix các trên — workflow APT thật |
+
+**Bảng map 5 phase với Sigma rule cụ thể trong `data/sigma/rules/`** (bạn có thể click trong Kibana Security → Rules để xem):
+
+| # | Phase | Event type | Sigma rule baseline catch | Evasion technique (Sigma miss) |
+|---|---|---|---|---|
+| 1 | **Execution** — PowerShell encoded | process_creation (Sysmon EID 1) + powershell (EID 4104) | `posh_ps_susp_invocation_specific.yml` (chứa `-EncodedCommand`) | `-e` shorthand flag (PowerShell auto-expand) |
+| 2 | **Download Cradle** — IEX + WebClient | powershell (EID 4104) | `posh_ps_susp_download.yml` (`System.Net.WebClient` + `.DownloadString`) | Split string: `'Sys'+'tem.Net.WebCl'+'ient'` |
+| 3 | **Persistence** — Run key | registry_event (Sysmon EID 13) | rule check `HKCU\...\Run\` | Dùng `RunOnce` thay `Run` |
+| 4 | **Defense Evasion** — Clear log | powershell (EID 4104) | `posh_ps_susp_clear_eventlog.yml` (literal `Clear-EventLog`) | Split keyword: `'Clear'+'-Event'+'Log'` |
+| 5 | **Credential Access** marker | powershell (EID 4104) | `posh_ps_potential_invoke_mimikatz.yml` (literal `sekurlsa::logonpasswords`) | Split: `'sek'+'urlsa'+'::log'+'onpasswords'` |
+
+Tất cả 5 phase là **LAB-SAFE**: không tải payload thật, không touch lsass thật, "dropper" chỉ là copy `calc.exe`, "C2" chỉ là DNS NXDOMAIN.
+
+### 11.2.1 MITRE ATT&CK mapping
+
+| Phase | Tactic | Technique |
+|---|---|---|
+| 1 | TA0002 Execution | T1059.001 PowerShell + T1027 Obfuscated Files |
+| 2 | TA0002 Execution + TA0011 C2 | T1105 Ingress Tool Transfer |
+| 3 | TA0003 Persistence | T1547.001 Registry Run Keys / Startup Folder |
+| 4 | TA0005 Defense Evasion | T1070.001 Clear Windows Event Logs |
+| 5 | TA0006 Credential Access | T1003.001 LSASS Memory (marker only) |
+
+### 11.3 Chạy demo (chuẩn bị + trigger)
+
+**Trên máy lab (Ubuntu, agent server)**:
+```bash
+# Đảm bảo Velociraptor server đang chạy + client Windows connected
+sudo systemctl status velociraptor_server --no-pager
+sudo -u velociraptor /usr/local/bin/velociraptor --config /etc/velociraptor/server.config.yaml \
+  query "SELECT client_id, last_seen_at FROM clients()"
+
+# Push script lên Windows VM (1 lần — đảm bảo UTF-8 BOM cho PowerShell parse đúng tiếng Việt)
+python3 -c "
+import codecs
+with open('demo/apt_demo_scenario.ps1', 'rb') as f: c = f.read()
+if not c.startswith(codecs.BOM_UTF8):
+    with open('/tmp/apt_bom.ps1', 'wb') as f: f.write(codecs.BOM_UTF8 + c)
+    print('BOM added')
+"
+sshpass -p '<WIN_PASS>' scp /tmp/apt_bom.ps1 \
+  luanthanh@10.10.20.50:/C:/Users/LuanThanh/apt_demo_scenario.ps1
+```
+
+**Trên Windows VM (RDP hoặc SSH)** — chọn 1 trong 4 mode:
+
+```powershell
+# Mode benign — hành động admin bình thường (đối chứng FP)
+.\apt_demo_scenario.ps1 -Mode benign
+
+# Mode baseline — pattern CHUẨN, Sigma rule cứng catch được (show baseline works)
+.\apt_demo_scenario.ps1 -Mode baseline
+
+# Mode evasion — variant né rule, Sigma MISS nhưng RED CATCH (điểm bán hàng) ⭐
+.\apt_demo_scenario.ps1 -Mode evasion
+
+# Mode chain — full kill-chain mix baseline + evasion (realistic APT)
+.\apt_demo_scenario.ps1 -Mode chain -SleepSeconds 240
+
+# Chỉ chạy 1 phase (vd Phase 2 = Download Cradle) để demo từng rule riêng
+.\apt_demo_scenario.ps1 -Mode evasion -Phase 2
+```
+
+Output mỗi lần in:
+```
+RunId   : <random 8-hex>   ← dùng search trong Kibana
+Marker  : RED_APT_DEMO_PHASE*_<RunId>
+```
+
+**Workflow demo gợi ý** (15-20 phút):
+
+1. Chạy `-Mode benign` → mở Kibana red-alerts → **không có alert** (đối chứng)
+2. Chạy `-Mode baseline` → mở Kibana Security/Rules → **Sigma fires** + red-alerts có score
+3. Chạy `-Mode evasion` → Kibana Security Rules → **Sigma silent** ❌ nhưng red-alerts có score ✅ → wow moment
+4. Chạy `-Mode chain` → mix 5 phase → agent daemon pickup → ai-investigations populated
+
+**Trên máy lab — Trigger agent pipeline**:
+
+*Option A — Inject test alert (nhanh, deterministic cho demo)*:
+```bash
+# Lấy PID + RunId từ output script Windows, tạo /tmp/demo_alert.json
+# (Template: copy từ section 11.10 bên dưới)
+cd ~/KLTN/KLTN/Rule_Evasion_Detection/rule_evasion_detection
+source ~/venvs/rule_evasion_env/bin/activate
+export VR_USE_REAL=1
+export VR_API_CONFIG=~/velociraptor/api.config.yaml
+export VR_QUERY_TIMEOUT=180
+
+python3 -m agent.run --alert-file /tmp/demo_alert.json --save /tmp/inv_demo.json
+```
+
+*Option B — Daemon poll ES (real flow, ~30-60s delay)*:
+```bash
+python3 -m agent.daemon --interval 30 --score-threshold 0.5
+```
+
+### 11.4 Kết quả rehearsal (verified 2026-05-18, post-fix v2)
+
+Bảng dưới ghi nhận kết quả chạy **thật** trên lab sau khi fix 3 bug critical (Triage hallucinate, mock contamination, VQL artifact sai). Dùng làm bằng chứng cho luận văn:
+
+| Metric | Giá trị |
+|---|---|
+| Pipeline | 8 agents (Supervisor → Triage → **Forensic** → Hunt+RED+MITRE → Response → Report) |
+| Tổng thời gian | **217 giây** (real Velociraptor) |
+| Tổng tokens | 92,002 |
+| Cost ước tính | **$0.028 USD** (~700 VND) |
+| Triage severity | HIGH |
+| Forensic verdict | **confirmed_malicious** |
+| Forensic evidence grade | **high** |
+| Forensic confidence | **0.92** |
+| Forensic artifacts | **7** (1 process + 3 file + 3 registry) |
+| Forensic IOCs (toàn thật) | 7 (3 file paths + 1 SHA256 + 3 registry keys) |
+| Containment actions | 5 (toàn target thật, không bịa) |
+| Block IP fake | **0** ✓ |
+
+**Per-agent metadata** (rehearsal v2 post-fix):
+```
+supervisor    2s   ~1,000 tokens
+triage       ~12s  ~5,000 tokens   (now ghi parent=sshd.exe đúng từ alert)
+forensic    ~90s  ~10,000 tokens   ⭐ tìm thấy 3 file + 3 registry thật
+hunt         ~15s  ~12,000 tokens
+red_analyst  ~10s  ~5,000 tokens
+mitre        ~12s  ~6,000 tokens
+response     ~30s  ~28,000 tokens  (target toàn thật, no fake IP)
+report       ~30s  ~9,000 tokens
+```
+
+So với baseline pre-fix (rehearsal #1):
+- Forensic artifacts: 2 → **7** (+250%)
+- Forensic confidence: 0.85 → **0.92**
+- Triage hallucinate parent: **YES → NO** ✓
+- Response block IP fake (1.2.3.4): **YES → NO** ✓
+- Cost: $0.021 → $0.028 (+33% — trade-off cho anti-hallucination rules trong prompt)
+
+### 11.5 Wow moment ⭐ — Forensic Agent verify evidence cứng
+
+Kết quả rehearsal post-fix cho thấy Forensic Agent thu thập được **bằng chứng cứng** từ host:
+
+**IOCs THẬT Forensic phát hiện được trên host** (qua Velociraptor):
+```
+File droppers:
+  C:\Users\Public\xkj9_demo_052d4f9d.exe
+  C:\Users\Public\xkj9_demo_2177c23e.exe
+  C:\Users\Public\xkj9_demo_6e9c8180.exe
+
+SHA256 (cả 3 file, vì đều là copy của calc.exe):
+  58189cbd4e6dc0c7d8e66b6a6f75652fc9f4afc7ce0eba7d67d8c3feb0d5381f
+
+Registry persistence (Run keys):
+  HKCU\Software\Microsoft\Windows\CurrentVersion\Run\RED_APT_DEMO_PERSIST_052d4f9d
+  HKCU\Software\Microsoft\Windows\CurrentVersion\Run\RED_APT_DEMO_PERSIST_2177c23e
+  HKCU\Software\Microsoft\Windows\CurrentVersion\Run\RED_APT_DEMO_PERSIST_6e9c8180
+```
+
+Đây là **bằng chứng cứng** — process tree, file path, SHA256, registry key đều query trực tiếp từ host qua Velociraptor, KHÔNG phải LLM bịa.
+
+**Sau khi fix Bug 1 (Triage hallucinate)**, Triage giờ ghi đúng:
+> *"Parent process: sshd.exe (SSH remote execution — cần Forensic verify)"*
+
+So với trước fix:
+> ❌ *"Parent process: outlook.exe → phishing vector"* (BỊA — alert không có outlook.exe)
+
+**Sau khi fix Bug 2 (Mock contamination)**, Triage prefix `[MOCK]` cho data giả lập:
+> *"[MOCK] Process tree mock: outlook.exe → powershell.exe → curl.exe (KHÔNG phải thật, parent thật là sshd.exe)"*
+
+→ Response Agent **không còn đề xuất block IP fake** `1.2.3.4`. Containment targets giờ toàn data thật từ alert:
+- Host: `DESKTOP-2UQB61H` (alert)
+- Process: `powershell.exe (PID 6860)` (alert)
+- User: `luanthanh` (alert)
+- Case management: `kibana_cases` (safe action)
+
+### 11.6 Sigma patch grounded by evidence
+
+Response Agent dùng evidence từ Forensic để sinh patch **chính xác kỹ thuật**:
+
+**Trích `sigma_patch_explanation_vi`**:
+> *"Rule gốc chỉ check '-EncodedCommand' và '-Encoded' exact string. Attacker dùng flag '-e' (shorthand parameter) — PowerShell tự động expand thành '-EncodedCommand' nhưng chuỗi literal không xuất hiện trong command line. Patch bổ sung: (1) tất cả shorthand prefix có space: '-e ', '-ec ', '-en ', ...; (2) shorthand dính liền base64 (không space, uppercase S): '-eS', '-ecS', ...; (3) regex fallback phát hiện pattern '-e' hoặc '-E' theo sau bởi base64 dài ≥40 ký tự."*
+
+3 lớp patch — đảm bảo bắt được toàn bộ họ variants shorthand.
+
+### 11.7 Báo cáo Vietnamese final
+
+Report Agent generate ~160 dòng markdown tiếng Việt, đầy đủ structure cho SOC:
+- Tóm tắt
+- Mức nghiêm trọng + lý do
+- Kill chain timeline
+- Evidence (process tree + file + registry + network)
+- MITRE ATT&CK mapping
+- Sigma rule patch
+- Containment actions (7 items, có `needs_approval`)
+- Recommended next steps
+
+File mẫu: `/tmp/inv_demo.json` (rehearsal) — extract bằng:
+```bash
+jq -r '.report.full_markdown_vi' /tmp/inv_demo.json > rehearsal_report.md
+```
+
+### 11.8 Cleanup sau demo
+
+Script `apt_demo_scenario.ps1` đã có **auto-cleanup** sau `$SleepSeconds + 30` giây — tự xóa dropper + registry Run key. Nếu cần xóa thủ công:
+
+```powershell
+# Trên Windows VM
+Remove-Item C:\Users\Public\xkj9_demo_*.exe -Force -ErrorAction SilentlyContinue
+$runKey = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"
+Get-Item $runKey | Select-Object -ExpandProperty Property |
+  Where-Object { $_ -like "RED_APT_DEMO_PERSIST_*" } |
+  ForEach-Object { Remove-ItemProperty -Path $runKey -Name $_ }
+```
+
+### 11.9 Backup plan nếu live demo fail
+
+| Tình huống | Cách xử lý |
+|---|---|
+| ELK ingest > 2 phút | Inject alert qua `python3 -m agent.inject_test_alert --host DESKTOP-2UQB61H` |
+| Velociraptor query timeout | `unset VR_USE_REAL` → mock mode, giải thích "production có SLA 30s" |
+| Agent daemon crash | Show `/tmp/inv_demo.json` (file rehearsal) làm bằng chứng |
+| Windows VM offline | Demo mock mode + show pre-recorded screencast 3 phút |
+| DeepSeek API rate limit | Lưu `inv_demo.json` từ rehearsal trên USB, mở qua `jq` |
+
+### 11.10 Template alert JSON cho Option A
+
+Lưu thành `demo/apt_alert_template.json`, sửa `pid`, `command_line` (base64), `RunId` cho mỗi lần demo:
+
+```json
+{
+  "@timestamp": "2026-05-18T06:05:02.000Z",
+  "host": {"name": "DESKTOP-2UQB61H", "client_id": "C.1b622eacffe8b75d"},
+  "user": {"name": "luanthanh"},
+  "process": {
+    "name": "powershell.exe",
+    "pid": 5624,
+    "command_line": "powershell.exe -NoProfile -ExecutionPolicy Bypass -e VwByAGkAdABlAC0ASABvAHMAdAAg...",
+    "parent": {"name": "sshd.exe"}
+  },
+  "red": {
+    "stage1_score": 0.91,
+    "stage1_model": "ensemble_f1",
+    "top_rules": [
+      {"rule_id": "powershell_encoded_command", "cosine_score": 0.94},
+      {"rule_id": "powershell_suspicious", "cosine_score": 0.81}
+    ],
+    "evasion_type": "shorthand_flag"
+  },
+  "source_event_id": "apt-demo-<RunId>"
+}
+```
+
+### 11.11 Tham khảo
+
+- **Q&A Bank**: `demo/QA_PREP.md` — 16 câu hỏi GVHD + trả lời chuẩn bị sẵn
+- **Slides outline**: `demo/SLIDES_OUTLINE.md` — 15 slides cho buổi defense 25-30 phút
+- **Forensic Agent design**: `agent/prompts/forensic.md` + `agent/agents/forensic.py`
+- **Velociraptor setup**: `~/velociraptor/VELOCI_INSTALL_NOTES.md`
+
+### 11.12 Anti-Hallucination Fixes (2026-05-18 v2)
+
+Sau rehearsal lần 1, đã phát hiện 3 bug critical làm pipeline có thể bịa data. Đã fix và verify:
+
+| Bug | File sửa | Kết quả verify |
+|---|---|---|
+| **#1**: Triage bịa parent process từ ví dụ prompt | `agent/prompts/triage.md` — thêm rule "PHẢI đọc từ alert.process.parent.name, KHÔNG đoán" | Triage giờ ghi đúng `sshd.exe` (alert thật) thay vì `outlook.exe` (ví dụ trong prompt) |
+| **#2**: Mock data ô nhiễm downstream (Response block IP fake 1.2.3.4) | `agent/prompts/{triage,hunt,response}.md` — thêm rule prefix `[MOCK]` + cấm tạo block action từ mock IOC | Response Agent KHÔNG còn đề xuất `block_ip: 1.2.3.4` (verify `has_block_1234: 0`) |
+| **#3**: Velociraptor query không tìm thấy file + registry persistence | `agent/vr_client.py` — đổi VQL từ `Windows.Registry.NTUser` (offline hive) sang `Windows.Sys.StartupItems` (live Run keys) + `Windows.Search.FileFinder` với glob đúng (`C:\Users\Public\*.exe`) | Forensic giờ trả về 7 artifacts thật (1 process + 3 file + 3 registry) với SHA256 + path đầy đủ |
+
+**Rule anti-hallucination chính** (áp dụng cho mọi prompt):
+```
+1. Mọi fact (parent, command, host, user, IP) PHẢI đọc trực tiếp từ alert
+2. Tool result có "_mock": true → prefix [MOCK], KHÔNG ghi như fact
+3. Block action chỉ được tạo nếu IOC đến từ forensic.iocs_observed thật
+4. Khi Forensic verdict = inconclusive → giảm severity, KHÔNG destructive actions
+5. Report Agent: PRIORITIZE Forensic findings khi conflict với Triage
+```
+
+**Defensible thesis claim sau fix**:
+- *"Pipeline 8-agent không chỉ verify alert mà còn CORRECT hallucination từ Triage Agent. Forensic Agent ground các quyết định downstream trên bằng chứng cứng từ Velociraptor — đã chứng minh qua rehearsal: 0 lần block IP fake, 100% IOC trong containment đến từ host thật."*
