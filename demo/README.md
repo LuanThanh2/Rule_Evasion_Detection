@@ -1150,15 +1150,15 @@ Script `apt_demo_scenario.ps1` có 4 mode giống 3 script `*_scenarios.ps1` cò
 **Bảng gắn 7 pha với rule Sigma cụ thể trong `data/sigma/rules/`** (có thể
 click trong Kibana Security -> Rules để xem):
 
-| # | Pha | Loại log | Rule Sigma bắt mẫu chuẩn | Né rule (evasion) | Taxonomy 1.4 |
+| # | Pha | Loại log | Rule Sigma bắt mẫu chuẩn (filename → Kibana title) | Né rule (evasion) | Taxonomy 1.4 |
 |---|---|---|---|---|---|
-| 1 | **Chạy lệnh** — PowerShell mã hóa | process_creation EID 1 + PS 4104 | `posh_ps_susp_invocation_specific.yml` (chuỗi `-EncodedCommand`) | Tier 1: `-e` rút gọn / Tier 2: format string `'{0}{1}{2}' -f 'In','voke-Exp','ression'` / Tier 2: char-code `[char]73+[char]69+[char]88` -> `IEX` | **1.4.2** Payload Obfuscation |
-| 2 | **Tải lệnh từ xa** — IEX + WebClient | PS 4104 | `posh_ps_susp_download.yml` (`System.Net.WebClient` + `.DownloadString`) | Tier 1: split `'Sys'+'tem.Net.WebCl'+'ient'` / Tier 2: comment inject `Sys<#x#>tem.Net.WebCl<#y#>ient` / Tier 2: env var chain `$env:DEMO_T1+$env:DEMO_T2` | **1.4.2** Payload Obfuscation |
-| 3 | **Tự chạy lại** — Persistence | registry_event EID 13 + WMI events | rule kiểm tra `HKCU\...\Run\` | Tier 1: `RunOnce` thay `Run` / **Tier 3: WMI Event Subscription** (T1546.003 — APT29/FIN8 dùng) | **1.4.6** LotL (WMI fileless) |
-| 4 | **Né phòng thủ** — xóa log + AMSI | PS 4104 | `posh_ps_susp_clear_eventlog.yml` + `posh_ps_amsi_bypass` | Tier 1: split `'Clear'+'-Event'+'Log'` / **Tier 3: AMSI bypass marker** (T1562.001, `amsiInitFailed` keyword) | **1.4.2 + 1.4.6** |
-| 5 | **Credential Access marker** | PS 4104 | `posh_ps_potential_invoke_mimikatz.yml` (chuỗi `sekurlsa::logonpasswords`) | Tier 1: concat split / Tier 2: char-code `[char]115,101,107,...` / Tier 2: format `'{0}{1}::{2}{3}'` | **1.4.2** Payload Obfuscation |
+| 1 | **Chạy lệnh** — PowerShell mã hóa | process_creation EID 1 + PS 4104 | `posh_ps_susp_invocation_specific.yml` → `Suspicious PowerShell Invocations - Specific` (chuỗi `-EncodedCommand`) | Tier 1: `-e` rút gọn / Tier 2: format string `'{0}{1}{2}' -f 'In','voke-Exp','ression'` / Tier 2: char-code `[char]73+[char]69+[char]88` -> `IEX` | **1.4.2** Payload Obfuscation |
+| 2 | **Tải lệnh từ xa** — IEX + WebClient | PS 4104 | `posh_ps_susp_download.yml` → `Suspicious PowerShell Download - Powershell Script` (`System.Net.WebClient` + `.DownloadString`) | Tier 1: split `'Sys'+'tem.Net.WebCl'+'ient'` / Tier 2: comment inject `Sys<#x#>tem.Net.WebCl<#y#>ient` / Tier 2: env var chain `$env:DEMO_T1+$env:DEMO_T2` | **1.4.2** Payload Obfuscation |
+| 3 | **Tự chạy lại** — Persistence | registry_event EID 13 + WMI events | `registry_set_asep_reg_keys_modification_currentversion.yml` → `CurrentVersion Autorun Keys Modification`; WMI: `posh_ps_wmi_persistence.yml` → `Powershell WMI Persistence` | Tier 1: `RunOnce` thay `Run` / **Tier 3: WMI Event Subscription** (T1546.003 — APT29/FIN8 dùng) | **1.4.6** LotL (WMI fileless) |
+| 4 | **Né phòng thủ** — xóa log + AMSI | PS 4104 | `posh_ps_susp_clear_eventlog.yml` → `Suspicious Eventlog Clear`; AMSI: `posh_ps_amsi_bypass_pattern_nov22.yml` | Tier 1: split `'Clear'+'-Event'+'Log'` / **Tier 3: AMSI bypass marker** (T1562.001, `amsiInitFailed` keyword) | **1.4.2 + 1.4.6** |
+| 5 | **Credential Access marker** | PS 4104 | `posh_ps_potential_invoke_mimikatz.yml` → `Potential Invoke-Mimikatz PowerShell Script` (chuỗi `sekurlsa::logonpasswords`) | Tier 1: concat split / Tier 2: char-code `[char]115,101,107,...` / Tier 2: format `'{0}{1}::{2}{3}'` | **1.4.2** Payload Obfuscation |
 | 6 | **LOLBins + DNS Tunnel + Fileless** *(NEW)* | process_creation EID 1 + PS 4104 + DNS | `proc_creation_win_mshta_*`, `regsvr32 squiblydoo`, `dns_susp_long_subdomain`, `posh_ps_reflection_assembly_load` | Tier 3 *Variant A-C*: mshta/regsvr32/rundll32 LOLBins (T1218.005/010/011) / *Variant D*: DNS tunnel subdomain base64 encode (T1071.004) / *Variant E*: `[Reflection.Assembly]::Load` fileless marker (T1620) | **1.4.6** LotL + **1.4.3** Encryption/Tunneling + **1.4.6** Fileless |
-| 7 | **Sandbox Detection** *(NEW)* | PS 4104 | `posh_ps_susp_sandbox_detect` (probe RAM + procs + analyst tools + mouse + uptime) | Tier 3: 5 probe checks trong cùng ScriptBlock — pattern điển hình malware "check before detonate" | **1.4.5** Sandbox & Analysis Evasion |
+| 7 | **Sandbox Detection** *(NEW)* | PS 4104 | `posh_ps_susp_keywords.yml` → `Potential Suspicious PowerShell Keywords` (probe RAM + procs + analyst tools + mouse + uptime) | Tier 3: 5 probe checks trong cùng ScriptBlock — pattern điển hình malware "check before detonate" | **1.4.5** Sandbox & Analysis Evasion |
 
 **Cover taxonomy 1.4 của luận văn**:
 
@@ -1210,6 +1210,149 @@ sshpass -p '<WIN_PASS>' scp /tmp/apt_bom.ps1 \
   luanthanh@10.10.20.50:/C:/Users/LuanThanh/apt_demo_scenario.ps1
 ```
 
+**Bật RED `detect_live.py` trước khi chạy APT demo**:
+
+`detect_live.py` không tự đọc `.env`, nên source `.env` rồi truyền credential qua
+`--es-host`. Nên mở 3 terminal/tmux panes riêng để RED bắt đủ 3 loại log chính
+của `apt_demo_scenario.ps1`:
+
+Không dùng `--query-string` chứa marker demo như `RED_APT_DEMO`. Query dưới đây
+chỉ scope đúng máy nạn nhân + nhóm log liên quan từng model để tránh log nhiễu
+của lab; detection vẫn do RED model tự chấm điểm. `ES_AUTH_HOST` là URL
+Elasticsearch kèm user/pass, không phải chỉ là IP.
+
+```bash
+cd ~/KLTN/KLTN/Rule_Evasion_Detection/rule_evasion_detection
+source .env
+ES_AUTH_HOST="http://${ES_USER}:${ES_PASSWORD}@10.10.20.100:9200"
+DEMO_HOST_QUERY='host.name:"desktop-2uqb61h" OR winlog.computer_name:"DESKTOP-2UQB61H"'
+DEMO_PROCESS_QUERY="($DEMO_HOST_QUERY) AND (winlog.event_data.Image:*powershell* OR process.name:*powershell* OR winlog.event_data.CommandLine:*powershell* OR process.command_line:*powershell* OR winlog.event_data.Image:*mshta* OR winlog.event_data.Image:*regsvr32* OR winlog.event_data.Image:*rundll32*)"
+DEMO_REGISTRY_QUERY="($DEMO_HOST_QUERY) AND (winlog.event_data.TargetObject:*CurrentVersion*Run* OR message:*CurrentVersion*Run*)"
+DEMO_PS_QUERY="$DEMO_HOST_QUERY"
+```
+
+Terminal 1 — Sysmon process creation EID 1 (`-EncodedCommand`, LOLBins):
+
+```bash
+python3 scripts/detect_live.py \
+  --config config/process_creation.yaml \
+  --es-host "$ES_AUTH_HOST" \
+  --es-index "logs-winlog*" \
+  --out-index red-alerts-demo \
+  --event-id 1 \
+  --threshold 0.5 \
+  --method cosine \
+  --timestamp-field event.ingested \
+  --interval 30 \
+  --lookback 10m \
+  --reset-state \
+  --batch-size 500 \
+  --query-string "$DEMO_PROCESS_QUERY"
+```
+
+Terminal 2 — Sysmon registry SetValue EID 13 (Phase 3 Run/RunOnce):
+
+```bash
+python3 scripts/detect_live.py \
+  --config config/registry_event.yaml \
+  --es-host "$ES_AUTH_HOST" \
+  --es-index "logs-winlog*" \
+  --out-index red-alerts-registry-demo \
+  --event-id 13 \
+  --threshold 0.5 \
+  --method cosine \
+  --timestamp-field event.ingested \
+  --interval 30 \
+  --lookback 10m \
+  --reset-state \
+  --batch-size 500 \
+  --query-string "$DEMO_REGISTRY_QUERY"
+```
+
+Terminal 3 — PowerShell ScriptBlock EID 4104 (DownloadString, Mimikatz marker,
+sandbox probe, AMSI/fileless marker):
+
+```bash
+python3 scripts/detect_live.py \
+  --config config/powershell.yaml \
+  --es-host "$ES_AUTH_HOST" \
+  --es-index "logs-winlog*" \
+  --out-index red-alerts-powershell-demo \
+  --event-id 4104 \
+  --threshold 0.5 \
+  --method cosine \
+  --timestamp-field event.ingested \
+  --interval 30 \
+  --lookback 10m \
+  --reset-state \
+  --batch-size 500 \
+  --query-string "$DEMO_PS_QUERY"
+```
+
+Kiểm tra RED đã ghi alert:
+
+```bash
+curl -s -u "$ES_USER:$ES_PASSWORD" \
+  "$ES_HOST/red-alerts-demo,red-alerts-registry-demo,red-alerts-powershell-demo/_search?size=10&sort=@timestamp:desc&ignore_unavailable=true" \
+  | jq -r '.hits.hits[] | [._index, ._source["@timestamp"], ._source["red.detection_score"], ._source["red.top_rule"], (._source["red.command_line"] // "")] | @tsv'
+```
+
+Nếu lỡ chạy Windows script trước khi bật `detect_live.py`, chạy backfill một lần
+trong cửa sổ 20 phút gần nhất:
+
+```bash
+# Backfill process_creation
+python3 scripts/detect_live.py \
+  --config config/process_creation.yaml \
+  --es-host "$ES_AUTH_HOST" \
+  --es-index "logs-winlog*" \
+  --out-index red-alerts-demo \
+  --event-id 1 \
+  --threshold 0.5 \
+  --method cosine \
+  --timestamp-field event.ingested \
+  --since "20m" \
+  --until "now" \
+  --max-iter 1 \
+  --no-state \
+  --batch-size 500 \
+  --query-string "$DEMO_PROCESS_QUERY"
+
+# Backfill registry_event
+python3 scripts/detect_live.py \
+  --config config/registry_event.yaml \
+  --es-host "$ES_AUTH_HOST" \
+  --es-index "logs-winlog*" \
+  --out-index red-alerts-registry-demo \
+  --event-id 13 \
+  --threshold 0.5 \
+  --method cosine \
+  --timestamp-field event.ingested \
+  --since "20m" \
+  --until "now" \
+  --max-iter 1 \
+  --no-state \
+  --batch-size 500 \
+  --query-string "$DEMO_REGISTRY_QUERY"
+
+# Backfill PowerShell 4104
+python3 scripts/detect_live.py \
+  --config config/powershell.yaml \
+  --es-host "$ES_AUTH_HOST" \
+  --es-index "logs-winlog*" \
+  --out-index red-alerts-powershell-demo \
+  --event-id 4104 \
+  --threshold 0.5 \
+  --method cosine \
+  --timestamp-field event.ingested \
+  --since "20m" \
+  --until "now" \
+  --max-iter 1 \
+  --no-state \
+  --batch-size 500 \
+  --query-string "$DEMO_PS_QUERY"
+```
+
 **Trên Windows VM (RDP hoặc SSH)** — chọn 1 trong 4 mode:
 
 ```powershell
@@ -1237,9 +1380,9 @@ Marker  : RED_APT_DEMO_PHASE*_<RunId>
 
 **Luồng demo gợi ý** (15-20 phút):
 
-1. Chạy `-Mode benign` -> mở Kibana `red-alerts` -> **không có cảnh báo** (đối chứng)
-2. Chạy `-Mode baseline` -> mở Kibana Security/Rules -> **Sigma báo** + `red-alerts` có điểm
-3. Chạy `-Mode evasion` -> Kibana Security Rules -> **Sigma có thể im lặng** nhưng `red-alerts` vẫn có điểm -> điểm nhấn demo
+1. Chạy `-Mode benign` -> mở Kibana `red-alerts-*demo` -> **không có cảnh báo** (đối chứng)
+2. Chạy `-Mode baseline` -> mở Kibana Security/Rules -> **Sigma báo** + `red-alerts-*demo` có điểm
+3. Chạy `-Mode evasion` -> Kibana Security Rules -> **Sigma có thể im lặng** nhưng `red-alerts-*demo` vẫn có điểm -> điểm nhấn demo
 4. Chạy `-Mode chain` -> trộn 5 pha -> agent daemon nhặt cảnh báo -> `ai-investigations` có báo cáo
 
 **Trên máy lab — Kích hoạt luồng AI Agent**:
@@ -1833,17 +1976,21 @@ EID 21: 1 (WMI FilterToConsumerBinding)
 > nâng cao thuộc nhóm 1.4.6 LotL/Fileless. Phase 3 WMI Consumer liên tục fire mỗi
 > 60s đến khi cleanup → RED detect được pattern recurring."*
 
-### 12.11 ⚠️ LÀM RÕ — 2 layer rule attribution, 2 naming khác nhau
+### 12.11 ⚠️ LÀM RÕ — 2 layer rule attribution, dùng chung metadata Sigma
 
-Có **2 bảng rule trong các section trên** và chúng KHÁC NHAU (cố tình). Khi xem
-cần phân biệt:
+Có **2 bảng rule trong các section trên** và chúng đo 2 layer khác nhau. Tên nên
+được nối bằng metadata Sigma (`filename`, `title`, `id`) thay vì sửa
+`convert_sigma_to_elastic.py`:
 
 | Bảng ở | Đo cái gì | Dùng naming | Nguồn |
 |---|---|---|---|
-| Section 11.2 | **Sigma rule cứng** sẽ fire trong Kibana Security/Rules | FILENAME (vd `posh_ps_susp_download.yml`) | `data/sigma/rules/` — 1,624 rule đã import vào Elastic SIEM |
-| Section 12.9 | **RED ML Stage 2 attribute** thực sự sau khi alert được score | INTERNAL `name:` field (vd `potential_regsvr32_commandline_flag_anomaly`) | `models/*/train_rslt_attr_ensemble.zip` |
+| Section 11.2 | **Sigma rule cứng** sẽ fire trong Kibana Security/Rules | FILENAME + `title:` (vd `posh_ps_susp_download.yml` → `Suspicious PowerShell Download - Powershell Script`) | `data/sigma/rules/` — 1,624 rule đã import vào Elastic SIEM |
+| Section 12.9 | **RED ML Stage 2 attribute** thực sự sau khi alert được score | INTERNAL key = normalize(`title:`), kèm metadata `top_rule_sigma_filename`, `top_rule_sigma_title`, `top_rule_sigma_id` | `models/*/train_rslt_attr_ensemble.zip` + `red.rule_metadata.SigmaRuleIndex` |
 
-**Cả 2 đều ĐÚNG** trong context riêng. Nhưng vì naming khác → dễ confuse.
+**Cách đọc chuẩn**: `top_rule` là key nội bộ cho model; `top_rule_sigma_filename`
+và `top_rule_sigma_title` mới là tên dùng để đối chiếu với Section 11.2/Kibana.
+Vì vậy không cần đổi converter sang filename; converter giữ đúng Sigma spec
+(`name` trong Kibana lấy từ `title:`).
 
 #### 12.11.1 Quy mô từng layer
 
@@ -1851,7 +1998,8 @@ cần phân biệt:
 |---|---|---|
 | Sigma rule cứng (Kibana) | 1,624 đã import | Fire khi baseline mode match literal |
 | **RED process_creation** | **83 rule** đã train | Stage 2 attribute đa dạng |
-| **RED powershell** | **6 rule** đã train ⚠️ | Stage 2 chỉ map về 1 trong 6, limitation |
+| **RED powershell SVM** | **25 rule** đã train | Sau fix `search_fields`; đây là per-rule SVM |
+| **RED powershell Cosine catalog** | **204 rule** | Catalog-only fallback từ YAML; có cả `posh_ps_susp_download.yml` |
 | **RED registry_event** | **38 rule** đã train | Stage 2 attribute đủ rộng |
 
 **Lệnh verify** (chạy trên lab):
@@ -1867,27 +2015,33 @@ for name, path in [
 ]:
     r = load_result(path)
     rules = sorted(r['rule_models'].keys())
-    print(f'{name}: {len(rules)} rules')
+    cosine = r.get('cosine_attributor')
+    cosine_rules = len(cosine.rule_filter_matrices) if cosine else 0
+    print(f'{name}: {len(rules)} SVM rules; {cosine_rules} cosine rules')
     for ru in rules[:5]: print(f'  - {ru}')
     if len(rules) > 5: print(f'  ... và {len(rules)-5} rule khác')
     print()
 "
 ```
 
-#### 12.11.2 Lý do RED powershell chỉ có 6 rule
+#### 12.11.2 Lý do vẫn có Phase 2/5 khác rule
 
-Theo `CLAUDE.md` mục Hiện trạng: *"powershell: 25 subdirs load 0"*. Nghĩa là khi
-train Stage 2, attribution_dir chỉ tìm được data cho **6 rule** trong tổng 25 sub-
-directory rule powershell. Các sub-directory khác load 0 match event → Stage 2
-không có sample để train → bị bỏ qua.
+Trước fix, RED powershell chỉ có **6 rule** nên nhiều alert bị ép vào rule gần
+nhất. Sau fix `search_fields`, trạng thái hiện tại là:
 
-→ **Phải làm sạch dataset attribution cho powershell** trước khi RED powershell
-có thể attribute đa dạng. Đây là **future work** đã ghi roadmap.
+- `rule_models` per-rule SVM: **25 rule**
+- `cosine_attributor` catalog: **204 rule / 1,220 filter values**
+- `posh_ps_susp_download.yml` (`403c2cc0...`) đã có trong Cosine catalog nhưng
+  vẫn là **Cosine-only**, chưa có SVM riêng
 
-#### 12.11.3 Verify thực tế — RED powershell attribute Phase 1-7
+Vì vậy nếu Phase 2/5 vẫn ra rule khác, đó là vấn đề **attribution/ranking** của
+RED trên demo ScriptBlock verbose, không phải lỗi import Kibana và không sửa bằng
+`convert_sigma_to_elastic.py`.
 
-Sau khi trigger demo RunId `69366ecb` (sleep 60s, 5 phút trước), run RED
-powershell trên 4104 events:
+#### 12.11.3 Verify cũ — RED powershell attribute Phase 1-7
+
+Trước khi fix ở mục 12.12, trigger demo RunId `69366ecb` (sleep 60s, 5 phút
+trước), run RED powershell trên 4104 events:
 
 ```bash
 ES_PASS=$(grep ES_PASSWORD .env | cut -d= -f2)
@@ -1900,7 +2054,7 @@ python3 scripts/detect_batch.py \
   --threshold 0.0 --method cosine --out /tmp/ps_alerts.jsonl
 ```
 
-**Kết quả thực tế** (mapping demo phase → RED powershell top_rule):
+**Kết quả lúc đó** (mapping demo phase → RED powershell top_rule):
 
 | Demo phase | RED powershell `top_rule` |
 |---|---|
@@ -1911,12 +2065,12 @@ python3 scripts/detect_batch.py \
 | Phase 6 Reflection.Assembly | `potential_in_memory_execution_using_reflection_assembly` ✅ |
 | Phase 7 sandbox probe | `potential_in_memory_execution_using_reflection_assembly` |
 
-**Đọc bảng**: Vì RED powershell chỉ biết 6 rule, mọi alert đều bị "ép" vào 1
-trong 6 rule. Phase 6 (Reflection) → attribute ĐÚNG. Các phase khác → attribute
-gần đúng (Phase 2 DownloadString thực ra nên là `usage_of_web_request` nhưng bị
-map sang `reflection_assembly` vì cosine similarity gần hơn).
+**Đọc bảng**: Đây là kết quả trước khi mở rộng catalog/SVM ở mục 12.12. Nó cho
+thấy vấn đề gốc là attribution bị kéo bởi token chung trong ScriptBlock demo, chứ
+không phải do tên Sigma trong Kibana khác filename.
 
-→ **Đây không phải RED sai**, mà **dataset attribution train chưa đủ phong phú**.
+→ Sau fix, khi cần đối chiếu tên, đọc thêm các field metadata trong alert:
+`top_rule_sigma_filename`, `top_rule_sigma_title`, `top_rule_sigma_id`.
 
 #### 12.11.3b Cấu trúc 1 Sigma rule có 3 "tên"
 
@@ -1936,33 +2090,33 @@ detection:
 
 - **Sigma Kibana** import vào Detection Rules → hiển thị `title:` (human-readable)
 - **RED ML** key = normalize(`title:`) → snake_case (`suspicious_powershell_download...`)
-- **Section 11.2** trong README dùng FILENAME để dễ tra cứu file
-- **Section 12.9** dùng RED internal name = normalize(title)
+- **Section 11.2** nên ghi FILENAME + TITLE để dễ tra cứu file và match Kibana
+- **Section 12.9** nên dùng `top_rule` + metadata `top_rule_sigma_*` để join về cùng rule
 
 #### 12.11.3c Phân biệt 2 trường hợp bảng mapping
 
-**Trường hợp A — 2 tên CÙNG 1 rule (4 phase)**:
+**Trường hợp A — 2 tên CÙNG 1 rule**:
 
 | Phase | FILENAME | RED internal | Quan hệ |
 |---|---|---|---|
-| 1 | `posh_ps_susp_invocation_specific.yml` | `suspicious_powershell_invocations_-_specific` | Cùng file, 2 tên ✅ |
+| 1 | `posh_ps_susp_invocation_specific.yml` | `suspicious_powershell_invocations_specific` | Cùng file, 2 tên ✅ |
 | 4 | `posh_ps_susp_clear_eventlog.yml` | `suspicious_eventlog_clear` | Cùng file ✅ |
 | 6 regsvr32 | `proc_creation_win_regsvr32_flags_anomaly.yml` | `potential_regsvr32_commandline_flag_anomaly` | Cùng file ✅ |
-| 7 sandbox | `posh_ps_susp_sandbox_detect` | `potential_suspicious_powershell_keywords` | Cùng file ✅ |
+| 7 sandbox | `posh_ps_susp_keywords.yml` | `potential_suspicious_powershell_keywords` | Cùng keyword-family rule ✅ |
 
 → **Detect CÙNG event**, hiển thị tên khác.
 
-**Trường hợp B — 2 RULE KHÁC NHAU cùng kill-chain (2 phase)**:
+**Trường hợp B — 2 RULE KHÁC NHAU cùng kill-chain**:
 
 | Phase | FILENAME (Section 11.2) | RED internal (Section 12.9) | Quan hệ |
 |---|---|---|---|
 | 2 | `posh_ps_susp_download.yml` (UUID `403c2cc0...`) | `usage_of_web_request_commands_and_cmdlets_scriptblock` (UUID `1139d2e2...`) | 2 file, 2 UUID khác ❌ |
 | 5 | `posh_ps_potential_invoke_mimikatz.yml` | `powershell_get_process_lsass_in_scriptblock` | 2 file khác ❌ |
 
-**Lý do**: RED Stage 2 powershell sau fix có 25 rule trained. Rule Sigma chính xác
-(`posh_ps_susp_download`) **không nằm trong 25 rule đó**. Khi alert đến, Cosine
-similarity chọn rule **gần nhất trong 25 rule có train** → ra
-`usage_of_web_request_commands` (cùng kill-chain "download cradle", pattern khác).
+**Lý do**: RED Stage 2 powershell sau fix có **25 SVM rule** và **204 Cosine rule**.
+Rule Sigma chính xác (`posh_ps_susp_download`) đã nằm trong Cosine catalog, nhưng
+không nằm trong 25 SVM rule. Khi alert demo có nhiều token chung/boilerplate,
+ranking có thể chọn rule gần nhất cùng kill-chain thay vì exact YAML file.
 
 → **Cùng kill-chain phase** (download cradle), nhưng **pattern detect khác**:
 - Rule A check `WebClient` + `.DownloadString` ← Phase 2 baseline fire
@@ -1972,9 +2126,9 @@ similarity chọn rule **gần nhất trong 25 rule có train** → ra
 
 | Câu hỏi GVHD | Trả lời defensible |
 |---|---|
-| *"Em demo 7 phase, sao RED powershell chỉ attribute về 6 rule?"* | "RED Stage 2 powershell hiện chỉ train được 6 rule do dataset attribution cho 19 sub-dir khác load 0 match event. Em đã document trong CLAUDE.md và roadmap." |
+| *"Em demo 7 phase, sao RED powershell có lúc attribute khác tên Sigma?"* | "Tên Sigma có 3 metadata: filename, title, UUID. RED dùng key normalize từ title và alert đã enrich lại filename/title/UUID để join. Một số phase khác rule thật vì attribution chọn rule gần nhất cùng kill-chain." |
 | *"RED process_creation có 83 rule, attribute đa dạng hơn?"* | "Đúng — đây là model train tốt nhất, attribute LOLBins Squiblydoo và WMI persistence chính xác. Section 12.9 là bằng chứng thật." |
-| *"Khi nào RED powershell train đủ rule?"* | "Future work. Cần re-collect Hayabusa match events cho 19 rule sub-dir còn lại, hoặc dùng Stage 2 fallback (Cosine on shared TF-IDF) thay vì per-rule SVM." |
+| *"PowerShell đã fix gì?"* | "Đã mở rộng `search_fields`: SVM tăng 6 → 25 rule; Cosine catalog hiện có 204 rule / 1,220 filter values. Exact `posh_ps_susp_download.yml` có trong Cosine-only." |
 
 ### 12.12 ⭐ FIX APPLIED 2026-05-19 — Mở rộng `search_fields` → 6 rule → 25 rule
 
@@ -2019,8 +2173,8 @@ python3 scripts/train_attribution.py --config config/powershell.yaml \
 | | Trước fix | **Sau fix** |
 |---|---|---|
 | `rule_models` (per-rule SVM) | **6** | **25** ⬆ 4x |
-| `cosine_attributor` rules | **6** | **25** ⬆ 4x |
-| Cosine total filter values | ~30 | **167** ⬆ 5.5x |
+| `cosine_attributor` rules | **6** | **204** ⬆ 34x |
+| Cosine total filter values | ~30 | **1,220** ⬆ 40x |
 
 **Rule mới có sau fix** (xuất hiện trong Phase 1, 2, 4, 5):
 
@@ -2049,8 +2203,8 @@ giải thích cho GVHD, không phản ánh accuracy thực của RED model trong
 **Defensible claim mới sau fix**:
 > *"Em đã phát hiện và fix limitation của Stage 2 powershell trong session
 > rehearsal. Mở rộng `search_fields` từ 1 field lên 5 field (cover 3 sub-folder
-> Sigma rule powershell) → số rule attribution tăng từ 6 lên 25 (4x). Cosine
-> attributor giờ có 167 filter values vs ~30 trước. Demo script verbose gây noise
+> Sigma rule powershell) → số SVM attribution tăng từ 6 lên 25 (4x). Cosine
+> catalog giờ có 204 rule / 1,220 filter values vs ~30 trước. Demo script verbose gây noise
 > trong Cosine similarity, nhưng trên evasion samples thật, attribution accuracy
 > đo trên đánh giá luận văn (top-1 ~68.8% cho process_creation) sẽ áp dụng tương
 > tự cho powershell sau fix."*

@@ -51,6 +51,7 @@ outputs/
 
 # Claude Code
 .claude/settings.local.json
+.claude
 
 #demo/README.md
 #demo/QA_PREP.md

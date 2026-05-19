@@ -66,6 +66,13 @@ param(
 )
 
 $ErrorActionPreference = "Continue"
+
+# Force console UTF-8 để tiếng Việt không bị mojibake khi chạy qua SSH/RDP
+try {
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+    chcp 65001 | Out-Null
+} catch {}
 $DemoTag = "RED_APT_DEMO"
 $RunId = ([guid]::NewGuid().ToString().Substring(0, 8))
 $DropperPath = "C:\Users\Public\xkj9_demo_$RunId.exe"
@@ -542,10 +549,35 @@ Write-Host "  RunId   : $RunId"
 Write-Host "  Marker  : ${DemoTag}_PHASE*_$RunId"
 Write-Host ""
 Write-Host "  Search trong Kibana:"
-Write-Host "    1. logs-winlog* -> RunId '$RunId' (Sysmon + PS + Registry events)"
-Write-Host "    2. Security/Alerts -> Sigma rule baseline catch"
-Write-Host "    3. red-alerts* -> RED ML catch (BOTH baseline + evasion)"
-Write-Host "    4. ai-investigations -> agent triage report VN"
+Write-Host "    1. logs-winlog* -> tìm theo RunId '$RunId'"
+Write-Host "       (Sysmon EID 1/11/13/22 + PS 4104 + WMI 19/20/21)"
+
+# Kỳ vọng Sigma & RED tùy Mode — không hard-code 1 câu cho mọi mode
+switch ($Mode) {
+    "benign" {
+        Write-Host "    2. Security/Alerts -> KHÔNG có alert mới (đối chứng FP)"
+        Write-Host "    3. red-alerts*     -> KHÔNG có RED alert (đối chứng FP)"
+    }
+    "baseline" {
+        Write-Host "    2. Security/Alerts -> Sigma cứng FIRE rule chuẩn"
+        Write-Host "       VD: 'SIGMA - CurrentVersion Autorun Keys Modification'"
+        Write-Host "    3. red-alerts*     -> RED ML score ≈ 1.0 (cùng rule với Sigma)"
+    }
+    "evasion" {
+        Write-Host "    2. Security/Alerts -> Sigma SILENT trên biến thể né rule ❌"
+        Write-Host "       (-e shorthand / split string / RunOnce — literal không khớp)"
+        Write-Host "    3. red-alerts*     -> RED ML vẫn CATCH ✅ (điểm bán hàng)"
+    }
+    "chain" {
+        Write-Host "    2. Security/Alerts -> Sigma FIRE phần baseline, MISS phần evasion"
+        Write-Host "    3. red-alerts*     -> RED ML catch CẢ baseline + evasion ✅"
+    }
+}
+Write-Host "    4. ai-investigations -> AI Agent (8-agent) triage report tiếng Việt"
+Write-Host ""
+Write-Host "  Verify khớp rule giữa Sigma Kibana & RED:"
+Write-Host "    field 'top_rule_sigma_id' (UUID) trong red-alerts ↔ rule UUID trong"
+Write-Host "    Security/Rules. Cùng UUID = cùng rule (chỉ format hiển thị khác)."
 
 if (-not $DryRun) {
     # Auto-cleanup sau $SleepSeconds + 60s (đủ thời gian cho Forensic Agent query)
