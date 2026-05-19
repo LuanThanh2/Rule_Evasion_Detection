@@ -51,3 +51,7 @@ outputs/
 
 # Claude Code
 .claude/settings.local.json
+
+#demo/README.md
+#demo/QA_PREP.md
+#demo/SLIDES_OUTLINE.md

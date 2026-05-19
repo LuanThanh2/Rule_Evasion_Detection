@@ -7,9 +7,16 @@ data:
   events_dir: ~/data/sigma/events_hayabusa/windows/powershell
   evasions_dir: ~/data/sigma/evasions/windows/powershell
   rules_dir: ~/data/sigma/rules/windows/powershell
-  # Sigma native field names — dùng để parse Sigma YAML detection blocks
+  # Sigma native field names — mở rộng để cover 3 sub-category powershell rules:
+  #   powershell_script:  ScriptBlockText (162 rules)
+  #   powershell_module:  ContextInfo, Payload (33 rules)
+  #   powershell_classic: Data, HostApplication (13 rules — EID 400/600 Engine Start)
   search_fields:
     - ScriptBlockText
+    - ContextInfo
+    - Payload
+    - Data
+    - HostApplication
   # Mapping Sigma field name → list JSON paths để đọc event/log dict
   event_field_map:
     ScriptBlockText:
@@ -18,6 +25,18 @@ data:
       - Details.ScriptBlock
       - Details.Cmdline
       - ExtraFieldInfo.ScriptBlockText
+    ContextInfo:
+      - winlog.event_data.ContextInfo
+      - Details.ContextInfo
+    Payload:
+      - winlog.event_data.Payload
+      - Details.Payload
+    Data:
+      - winlog.event_data.Data
+      - Details.Data
+    HostApplication:
+      - winlog.event_data.HostApplication
+      - Details.HostApplication
   malicious_extra: ~/data/benign/powershell/malicious_extra.txt
   max_benign_samples: 30000        # cap Stage 1 benign — MPSD .ps1 có thể rất lớn
   max_attribution_benign: 15000    # cap Stage 2 per-rule benign

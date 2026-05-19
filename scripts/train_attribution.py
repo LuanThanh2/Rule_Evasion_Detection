@@ -280,13 +280,62 @@ def main():
 
     logger.info("Trained %d rule models", trained_count)
 
-    # Build cosine attributor on a SHARED vector space (all rules' filter values)
+    # ── Cosine attributor — EXPANDED 2026-05-19 ──
+    # Cosine không cần match events, chỉ cần filter values từ YAML detection block.
+    # Vì vậy bổ sung TẤT CẢ rule trong rules_dir (1,624 catalog) vào Cosine fit,
+    # KHÔNG giới hạn ở rule có Hayabusa match events (~146 rule).
+    #
+    # Nguyên tắc merge:
+    #   - Rule đã có trong rule_filters_normalized (event-based, có match events)
+    #     → giữ nguyên filter values + match events
+    #   - Rule chỉ có YAML (chưa Hayabusa scan) → thêm vào với filter values từ YAML
+    cosine_filters_normalized = dict(rule_filters_normalized)
+    if args.cosine and args.rules_dir:
+        from red.rule_metadata import normalize_title
+        catalog_added = 0
+        catalog_skipped = 0
+        rules_dir_path = os.path.expanduser(args.rules_dir)
+        if os.path.isdir(rules_dir_path):
+            logger.info("Loading catalog rule set from %s for Cosine expansion...", rules_dir_path)
+            # Force pure-catalog mode: events_dir=None để load theo YAML files
+            catalog_rule_set = load_rule_set(events_dir=None, rules_dir=rules_dir_path,
+                                              evasions_dir=None)
+            for rule_name, rule_data in catalog_rule_set.items():
+                # Normalize key sang Hayabusa convention (snake_case) để khớp với
+                # SigmaRuleIndex lookup. rule_name từ catalog = raw title (vd
+                # "Suspicious PowerShell Download") → normalize trước.
+                normalized_key = normalize_title(rule_name) if rule_name else rule_name
+                if not normalized_key:
+                    catalog_skipped += 1
+                    continue
+                if normalized_key in cosine_filters_normalized:
+                    continue  # đã có trong event-based set
+                # Extract filter values từ YAML
+                vals = []
+                for detection in rule_data.sigma_values:
+                    if isinstance(detection, dict):
+                        vals.extend(extract_sigma_detection_values(detection, args.search_fields))
+                for filt in rule_data.filters:
+                    vals.extend(extract_filter_values(filt, event_paths))
+                if not vals:
+                    catalog_skipped += 1
+                    continue
+                normalized = normalize_samples(vals)
+                if normalized:
+                    cosine_filters_normalized[normalized_key] = normalized
+                    catalog_added += 1
+                else:
+                    catalog_skipped += 1
+            logger.info("Catalog expansion: added %d rules (skipped %d empty), total %d for Cosine",
+                        catalog_added, catalog_skipped, len(cosine_filters_normalized))
+
     cosine_attributor = None
-    if args.cosine and rule_filters_normalized:
-        logger.info("Building cosine attributor on shared vector space...")
+    if args.cosine and cosine_filters_normalized:
+        logger.info("Building cosine attributor on shared vector space (%d rules)...",
+                    len(cosine_filters_normalized))
         cosine_vectorizer = create_vectorizer(args.vectorization, ngram_range=ngram_range)
         cosine_attributor = CosineRuleAttributor.fit(
-            rule_filters_normalized, cosine_vectorizer,
+            cosine_filters_normalized, cosine_vectorizer,
         )
 
     # Save
@@ -298,8 +347,10 @@ def main():
     info = {
         "result_name": args.result_name,
         "num_rules": trained_count,
+        "num_cosine_rules": len(cosine_filters_normalized) if cosine_attributor else 0,
         "svc_params": svc_params,
         "rules": list(rule_models.keys()),
+        "cosine_rules": sorted(cosine_filters_normalized.keys()) if cosine_attributor else [],
         "cosine_enabled": cosine_attributor is not None,
     }
     save_result(result, f"train_rslt_{args.result_name}", args.out_dir, info=info)

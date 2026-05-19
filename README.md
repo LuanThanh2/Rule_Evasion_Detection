@@ -13,7 +13,10 @@ RED là hệ thống end-to-end phát hiện hành vi né tránh luật Sigma, q
 **Đóng góp mới so với AMIDES gốc (Uetz et al., USENIX Security 2024):**
 - **Stage 1**: Ensemble Classifier thay cho SVM đơn lẻ — recall 100% vs 94.3%
 - **Stage 2**: Cosine Similarity trong không gian TF-IDF chung — top-1 accuracy 68.8% vs SVM 23.5%
+- **Stage 2 (v2 — 2026-05-19)**: Cosine **catalog expansion** từ 146 lên **1,367 rule** — fit thuần trên Sigma YAML filter values, KHÔNG cần Hayabusa match events
 - **Phase C**: Multi-Agent SOC Triage với **auto-generation Sigma rule patch** ⭐ — feature không có trong Elastic AI Assistant / Splunk / Sentinel
+- **Phase C (v2 — 2026-05-17)**: Thêm **Forensic Agent** query Velociraptor lấy bằng chứng cứng từ host → kháng hallucination (verified: 0 fake IP trong containment actions)
+- **Sigma metadata enrichment**: Mỗi alert có `top_rule_sigma_filename` + `sigma_id` + `sigma_title` → SOC analyst trace ngược về file Sigma trực tiếp
 
 ---
 
@@ -140,6 +143,10 @@ Usage:
 | AI Agent — chạy 1 investigation | `python3 -m agent.run --help` |
 | AI Agent — inject mock alert | `python3 -m agent.inject_test_alert --help` |
 | AI Agent — single-agent baseline | `python3 -m agent.prototype --help` |
+| **🆕 Demo APT scenario** (Windows) | `demo/apt_demo_scenario.ps1 -Mode chain` |
+| 🆕 Tra rule RED ↔ Sigma | xem `demo/RED_RULE_MAP.md` (1,367 rule) |
+| 🆕 Q&A bank cho defense | xem `demo/QA_PREP.md` |
+| 🆕 Slide outline | xem `demo/SLIDES_OUTLINE.md` |
 
 > **Mẹo:** Không nhớ tên script? Liệt kê tất cả bằng `ls scripts/*.py` hoặc `ls agent/*.py`.
 > Mọi script dùng `argparse` nên cú pháp help luôn nhất quán.
@@ -269,7 +276,7 @@ Sau khi có ensemble score, dùng **MCC (Matthews Correlation Coefficient)** đ�
 
 Khi Stage 1 phát hiện event là SUSPICIOUS, Stage 2 xác định **luật Sigma nào** bị evasion.
 
-#### Cosine Similarity
+#### Cosine Similarity (production)
 Stage 2 production dùng **Cosine Similarity**: đo độ giống nhau trực tiếp giữa vector TF-IDF của event suspicious và các filter values của từng rule trong **không gian vector chung**:
 
 ```
@@ -285,10 +292,41 @@ Stage 2 production dùng **Cosine Similarity**: đo độ giống nhau trực ti
 
 **Ưu điểm:** Không cần train, xử lý tốt rule ít data, tất cả rules cùng scale.
 
+#### 🆕 Catalog expansion (2026-05-19) — 146 → 1,367 rule
+
+**Vấn đề trước**: per-rule SVM và Cosine cả 2 đều iterate `events_hayabusa/<event_type>/` — chỉ rule có **match events từ Hayabusa scan** mới được train. Toàn pipeline chỉ phủ 146 rule (83 proc + 25 ps + 38 reg) trên tổng 1,624 Sigma rule có sẵn trong `data/sigma/rules/`.
+
+**Fix**: tách 2 loop trong `scripts/train_attribution.py`:
+- **Loop A (SVM)**: cần training samples → giữ nguyên iterate Hayabusa subdir
+- **Loop B (Cosine)**: chỉ cần filter values từ YAML detection block → load **TẤT CẢ rule trong rules_dir** + normalize key về snake_case → fit Cosine trên union
+
+**Kết quả**:
+
+| Model | per-rule SVM | Cosine attributor (catalog) |
+|---|---|---|
+| `process_creation` | 202 | **920** |
+| `powershell` | 25 | **204** |
+| `registry_event` | 38 | **243** |
+| **TỔNG Cosine** | — | **1,367 rule** (~9.4x vs trước) |
+
+→ Khi alert đến, RED ưu tiên per-rule SVM (chất lượng cao hơn), fallback Cosine attribute đến bất kỳ rule nào trong 1,367 catalog. Verified E2E: alert evasion `HKCU\RunOnce` attribute tới rule `currentversion_nt_autorun_keys_modification` — rule MỚI từ catalog, không có trong 38 SVM.
+
+#### Sigma metadata enrichment trong alert (2026-05-19)
+
+Mỗi alert sinh bởi `detect_batch.py` / `detect_live.py` giờ có thêm 3 field:
+- `top_rule_sigma_filename` — vd `proc_creation_win_regsvr32_flags_anomaly.yml`
+- `top_rule_sigma_id` — UUID universal unique
+- `top_rule_sigma_title` — human-readable, hiển thị trong Kibana Security/Rules
+
+Module `red/rule_metadata.py` (class `SigmaRuleIndex`) load 1,624 Sigma YAML 1 lần
+khi script start, lookup theo internal name → metadata. Verified 100% (1367/1367).
+
+Xem `demo/RED_RULE_MAP.md` để tra cứu đầy đủ 1,367 rule.
+
 #### Baseline/So sánh: Per-rule SVM và Hybrid/RRF
 Để phục vụ thí nghiệm so sánh, project vẫn giữ per-rule SVM và Hybrid/RRF:
 
-- **Per-rule SVM:** mỗi rule có 1 SVM binary riêng, train trên benign vs. filter values của rule đó.
+- **Per-rule SVM:** mỗi rule có 1 SVM binary riêng, train trên benign vs. filter values của rule đó. Cần Hayabusa match events → giới hạn 265 rule trên 3 model.
 - **Hybrid/RRF:** kết hợp ranking từ SVM và Cosine bằng Reciprocal Rank Fusion.
 
 Hai chế độ này không phải cấu hình production hiện tại. Production dùng:
@@ -356,8 +394,9 @@ Rule_C: 1/(60+3) + 1/(60+3) = 0.0159 + 0.0159 = 0.0317
 │             STAGE 2 — RULE ATTRIBUTION                      │
 │                                                             │
 │  train_attribution.py                                       │
-│    Per-rule SVM (mỗi rule 1 model riêng)                    │
-│    + CosineRuleAttributor (shared vectorizer)               │
+│    Per-rule SVM: 265 rule (cần Hayabusa match events)       │
+│    CosineRuleAttributor: 1,367 rule (catalog expansion ⭐)  │
+│       ↑ load filter values từ YAML, không cần training data │
 │    → lưu train_rslt_attr_*.zip                              │
 │                                                             │
 │  eval_attribution.py --method cosine  (production)          │
@@ -368,19 +407,21 @@ Rule_C: 1/(60+3) + 1/(60+3) = 0.0159 + 0.0159 = 0.0317
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
 │         ELK INTEGRATION (detect_live.py)                    │
-│  Sysmon event ──► Elasticsearch ──► RED detect ──►          │
-│                                     red-alerts index        │
+│  Sysmon/PowerShell event ──► Elasticsearch ──► RED detect   │
+│    ──► SigmaRuleIndex enrichment (filename + UUID + title)  │
+│    ──► red-alerts index                                     │
 └─────────────────────────────────────────────────────────────┘
                           │
                           ▼
 ┌─────────────────────────────────────────────────────────────┐
-│       PHASE C — AI AGENT SOC TRIAGE ⭐                       │
+│       PHASE C — AI AGENT SOC TRIAGE ⭐ (8 agents)            │
 │                                                             │
 │  agent/daemon.py (poll mỗi 60s)                             │
 │                                                             │
 │  Supervisor → Triage                                        │
+│              ├─ 🔬 Forensic Agent (Velociraptor query host) │
 │              ├─ parallel(Hunt, RED Analyst, MITRE)          │
-│              └─ Response (Sigma patch + containment)        │
+│              └─ Response (Sigma patch grounded by forensic) │
 │                  → Report (Vietnamese markdown)             │
 │                                                             │
 │  → lưu ai-investigations index                              │
@@ -650,8 +691,11 @@ Alerts được ghi vào index `red-alerts-demo` với các field:
 | Field | Mô tả |
 |---|---|
 | `red.detection_score` | Score Stage 1 (cao = suspicious) |
-| `red.top_rule` | Rule Sigma bị evasion nhiều khả năng nhất |
-| `red.top_rules[]` | Top-5 rules kèm cosine similarity score |
+| `red.top_rule` | Rule Sigma bị evasion nhiều khả năng nhất (internal name snake_case) |
+| `red.top_rule_sigma_filename` | **🆕** Filename Sigma rule YAML (vd `proc_creation_win_regsvr32_flags_anomaly.yml`) — click để mở file gốc |
+| `red.top_rule_sigma_id` | **🆕** UUID Sigma rule — universal unique, dùng để tra Sigma community |
+| `red.top_rule_sigma_title` | **🆕** Human-readable title (hiển thị trong Kibana Security/Rules) |
+| `red.top_rules[]` | Top-5 rules kèm cosine similarity score + metadata Sigma cho mỗi rule |
 | `red.command_line` | CommandLine của event |
 | `host.name` | Tên máy Windows |
 
@@ -1560,6 +1604,7 @@ rule_evasion_detection/
 │   ├── evaluate.py               # BinaryEvaluation, MCC scaler
 │   ├── attribution.py            # RuleAttributionEvaluation, CosineRuleAttributor, RRF baseline
 │   ├── data.py                   # Data loading (txt/jsonl/json/csv, Sigma rules)
+│   ├── rule_metadata.py          # 🆕 SigmaRuleIndex — load Sigma YAML → filename/id/title lookup
 │   ├── persist.py                # save/load pickle+ZIP
 │   └── visualize.py              # PR curves, attribution plots
 ├── scripts/
@@ -1607,6 +1652,16 @@ rule_evasion_detection/
 │   │   ├── response.py           # ⭐ Sigma patch (grounded by forensic) + containment
 │   │   └── report.py             # Vietnamese markdown report + forensic timeline
 │   └── prompts/                  # 8 system prompts (markdown)
+├── demo/                         # 🆕 Demo scripts + tài liệu defense
+│   ├── apt_demo_scenario.ps1     # Kịch bản APT 7 phase (Tier 1+2+3 evasion)
+│   ├── powershell_scenarios.ps1  # Demo PowerShell ScriptBlock
+│   ├── process_creation_scenarios.ps1
+│   ├── registry_scenarios.ps1
+│   ├── monitor.sh                # Live monitor red-alerts/ai-investigations
+│   ├── RED_RULE_MAP.md           # Bảng tra 1,367 RED rule ↔ Sigma metadata
+│   ├── QA_PREP.md                # 16 câu hỏi GVHD + câu trả lời defensible
+│   ├── SLIDES_OUTLINE.md         # Khung 15 slide cho defense
+│   └── README.md                 # Runbook + verification commands
 ├── config/
 │   ├── process_creation.yaml
 │   ├── registry_event.yaml

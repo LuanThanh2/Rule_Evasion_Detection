@@ -33,6 +33,7 @@ from red.normalize import Normalizer
 from red.persist import load_result
 from red.data import resolve_event_paths
 from red.attribution import reciprocal_rank_fusion
+from red.rule_metadata import SigmaRuleIndex
 
 logger = logging.getLogger("detect_live")
 
@@ -280,6 +281,20 @@ def main():
     logger.info("Stage 2 ready — %d rule models, cosine=%s",
                 len(rule_models), "yes" if cosine_attributor else "no")
 
+    # Build SigmaRuleIndex để inject metadata vào alert
+    rules_dir = data_cfg.get("rules_dir")
+    rule_index = None
+    if rules_dir:
+        all_rule_dirs = [rules_dir]
+        rules_base = os.path.dirname(os.path.expanduser(rules_dir))
+        for sibling in ("powershell", "process_creation", "registry"):
+            sib_path = os.path.join(rules_base, sibling)
+            if os.path.isdir(sib_path) and sib_path != os.path.expanduser(rules_dir):
+                all_rule_dirs.append(sib_path)
+        rule_index = SigmaRuleIndex.from_rules_dirs(all_rule_dirs)
+        logger.info("SigmaRuleIndex: %d Sigma rules indexed for metadata enrichment",
+                    len(rule_index))
+
     normalizer = Normalizer()
 
     if args.reset_state and os.path.exists(args.state_file):
@@ -345,14 +360,24 @@ def main():
                         args.method, args.top_k,
                     )
 
+                    top_rule_name = top_rules[0][0] if top_rules else None
+                    # Build top_rules với Sigma metadata nếu có rule_index
+                    top_rules_enriched = []
+                    for r, s in top_rules:
+                        entry = {"rule": r, "score": round(s, 4)}
+                        if rule_index is not None:
+                            meta = rule_index.lookup_dict(r)
+                            entry["sigma_filename"] = meta.get("filename")
+                            entry["sigma_id"] = meta.get("sigma_id")
+                            entry["sigma_title"] = meta.get("title")
+                        top_rules_enriched.append(entry)
+
                     alert = {
                         "@timestamp": event.get("@timestamp"),
                         "red.detection_score": round(score, 4),
                         "red.attribution_method": args.method,
-                        "red.top_rule": top_rules[0][0] if top_rules else None,
-                        "red.top_rules": [
-                            {"rule": r, "score": round(s, 4)} for r, s in top_rules
-                        ],
+                        "red.top_rule": top_rule_name,
+                        "red.top_rules": top_rules_enriched,
                         "red.command_line": text,
                         "host.name": event.get("host", {}).get("name", "unknown"),
                         "winlog.event_id": event.get("winlog", {}).get("event_id"),
@@ -360,6 +385,11 @@ def main():
                         "process": event.get("process", {}),
                         "user": event.get("user", {}),
                     }
+                    if top_rule_name and rule_index is not None:
+                        meta = rule_index.lookup_dict(top_rule_name)
+                        alert["red.top_rule_sigma_filename"] = meta.get("filename")
+                        alert["red.top_rule_sigma_id"] = meta.get("sigma_id")
+                        alert["red.top_rule_sigma_title"] = meta.get("title")
 
                     es_index(args.es_host, args.out_index, alert)
                     n_alerts += 1

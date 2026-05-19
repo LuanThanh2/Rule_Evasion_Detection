@@ -26,6 +26,7 @@ from red.normalize import Normalizer
 from red.persist import load_result
 from red.data import resolve_event_paths
 from red.attribution import reciprocal_rank_fusion
+from red.rule_metadata import SigmaRuleIndex
 
 logger = logging.getLogger("detect_batch")
 
@@ -65,16 +66,35 @@ def score_event(normalized: str, estimator, vectorizer, scaler, shift: float) ->
 
 
 def _append_alert(alerts: list, event: dict, text: str, score: float,
-                  method: str, top_rules: list) -> None:
+                  method: str, top_rules: list, rule_index=None) -> None:
+    top_rule_name = top_rules[0][0] if top_rules else None
+
+    # Build top_rules với metadata Sigma (filename + UUID) nếu có rule_index
+    top_rules_enriched = []
+    for r, s in top_rules:
+        entry = {"rule": r, "score": round(s, 4)}
+        if rule_index is not None:
+            meta = rule_index.lookup_dict(r)
+            entry["sigma_filename"] = meta.get("filename")
+            entry["sigma_id"] = meta.get("sigma_id")
+            entry["sigma_title"] = meta.get("title")
+        top_rules_enriched.append(entry)
+
     alert = {
         "@timestamp": event.get("@timestamp"),
         "host": event.get("host", {}).get("name", "unknown"),
         "command_line": text,
         "detection_score": round(score, 4),
         "attribution_method": method,
-        "top_rules": [{"rule": r, "score": round(s, 4)} for r, s in top_rules],
-        "top_rule": top_rules[0][0] if top_rules else None,
+        "top_rules": top_rules_enriched,
+        "top_rule": top_rule_name,
     }
+    # Inject top-level Sigma metadata cho rule cao điểm nhất (dễ filter trong Kibana)
+    if top_rule_name and rule_index is not None:
+        meta = rule_index.lookup_dict(top_rule_name)
+        alert["top_rule_sigma_filename"] = meta.get("filename")
+        alert["top_rule_sigma_id"] = meta.get("sigma_id")
+        alert["top_rule_sigma_title"] = meta.get("title")
     alerts.append(alert)
 
 
@@ -141,6 +161,21 @@ def main():
     logger.info("Stage 2 loaded: %d rules, cosine=%s", len(rule_models),
                 "yes" if cosine_attributor else "no")
 
+    # Build SigmaRuleIndex để inject metadata (filename + UUID + title) vào alert
+    rules_dir = data_cfg.get("rules_dir")
+    rule_index = None
+    if rules_dir:
+        # Load rules_dir của event type này + 2 dir khác để lookup được rule cross-type
+        all_rule_dirs = [rules_dir]
+        # Bonus: load thêm các thư mục anh em (process_creation, registry, powershell)
+        rules_base = os.path.dirname(os.path.expanduser(rules_dir))
+        for sibling in ("powershell", "process_creation", "registry"):
+            sib_path = os.path.join(rules_base, sibling)
+            if os.path.isdir(sib_path) and sib_path != os.path.expanduser(rules_dir):
+                all_rule_dirs.append(sib_path)
+        rule_index = SigmaRuleIndex.from_rules_dirs(all_rule_dirs)
+        logger.info("SigmaRuleIndex: %d rules indexed for metadata enrichment", len(rule_index))
+
     normalizer = Normalizer()
 
     with open(args.events, encoding="utf-8") as f:
@@ -201,7 +236,7 @@ def main():
             for j, i in enumerate(suspicious_idx):
                 top_rules = all_rankings[j][:args.top_k]
                 _append_alert(alerts, valid_events[i], valid_texts[i],
-                              float(scores[i]), args.method, top_rules)
+                              float(scores[i]), args.method, top_rules, rule_index)
         else:
             # SVM / Hybrid fallback — per-event (slower but rarely used in prod)
             for i in suspicious_idx:
@@ -209,7 +244,7 @@ def main():
                                             cosine_attributor, args.method,
                                             args.top_k)
                 _append_alert(alerts, valid_events[i], valid_texts[i],
-                              float(scores[i]), args.method, top_rules)
+                              float(scores[i]), args.method, top_rules, rule_index)
 
     logger.info("Done — %d alerts / %d events processed (%d skipped, no command line)",
                 len(alerts), len(events), skipped)
