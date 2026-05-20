@@ -516,30 +516,63 @@ def extract_sigma_detection_values(detection: dict, search_fields) -> list:
 def _extract_sigma_detection_values(detection: dict, search_fields: set) -> list:
     """Extract string values from a raw Sigma detection block for matching fields.
 
-    Handles field specs like 'c-uri|contains', 'url|startswith', 'cs-uri-stem', etc.
-    Skips the 'condition' key. Works recursively for nested groups.
+    Fix v2 (2026-05-20) — broader extraction để cover thêm rule:
+      - Field name match case-INSENSITIVE (`parent_image` == `ParentImage`)
+      - `keywords` section (list of plain strings, không có field constraint) → luôn extract
+      - List of strings ở top-level (vd rule chỉ check 1 list không có field) → extract
+      - Plain string value ở top-level → extract
+      - Recursive handle nested groups
+    Skip key 'condition' (logic combinator, không phải value).
     """
     values = []
     if not isinstance(detection, dict):
         return values
+
+    # Normalize cho lookup: case-insensitive + bỏ underscore
+    # → 'parent_image' / 'ParentImage' / 'PARENT_IMAGE' đều match
+    def _norm_field(f: str) -> str:
+        return f.lower().replace("_", "")
+
+    search_fields_norm = {_norm_field(f) for f in search_fields}
+
     for key, content in detection.items():
         if key == "condition":
             continue
+
+        # SPECIAL CASE: 'keywords' section — Sigma convention cho list of strings
+        # không có field constraint, áp dụng cho mọi field. Luôn extract.
+        is_keywords = key.lower() == "keywords"
+
         if isinstance(content, dict):
             # Named group: {field_spec: value, ...}
             for field_spec, field_value in content.items():
                 field_name = field_spec.split("|")[0]
-                if field_name not in search_fields:
+                # Match exact OR case-insensitive (ignore underscore + case)
+                if _norm_field(field_name) not in search_fields_norm:
                     continue
                 if isinstance(field_value, str):
                     values.append(field_value)
                 elif isinstance(field_value, list):
                     values.extend(v for v in field_value if isinstance(v, str))
+                elif isinstance(field_value, dict):
+                    # Nested dict (rare): recurse
+                    values.extend(
+                        _extract_sigma_detection_values(field_value, search_fields)
+                    )
         elif isinstance(content, list):
-            # List of sub-groups or keywords — recurse each dict
+            # List có thể là:
+            #  - sub-groups (dict items) → recurse
+            #  - keywords list (plain strings) → extract nếu key=='keywords' hoặc list toàn string
+            all_strings = all(isinstance(it, str) for it in content) if content else False
             for item in content:
                 if isinstance(item, dict):
                     values.extend(_extract_sigma_detection_values(item, search_fields))
+                elif isinstance(item, str) and (is_keywords or all_strings):
+                    values.append(item)
+        elif isinstance(content, str) and is_keywords:
+            # 'keywords: "single_string"' edge case
+            values.append(content)
+
     return values
 
 

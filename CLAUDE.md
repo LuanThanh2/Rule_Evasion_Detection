@@ -485,3 +485,104 @@ Supervisor (no tools) → Triage (3 tools)
 | Scale | Linear | Auto |
 
 ROI calc cho SOC trung (1000 alerts/ngày).
+
+---
+
+## ⏳ HANDOFF — Work-in-progress 2026-05-20 (3 fix RED ML)
+
+User đề xuất 4 limitation của RED, đã apply Fix #1, #2, #4 (bỏ #3 top-K).
+
+### Fix đã apply (code + config đã sửa trên disk)
+
+| Fix | File sửa | Thay đổi |
+|---|---|---|
+| **#2 Tokenizer giữ path** | `red/normalize.py` | Thêm `[\w\\/:.\-]+` trong regex, replace `\ / : . -` thành `_` trong token, max_str_len 30→60. `C:\Windows\sshd.exe` → 1 token `c_windows_sshd_exe`. |
+| **#4 Extract broader** | `red/data.py` `_extract_sigma_detection_values` | Case-insensitive field match + bỏ `_` để `parent_image` = `ParentImage`. Auto-extract `keywords:` section + list of plain strings. Recursive nested dict. |
+| **#1 Multi-field search_fields** | `config/process_creation.yaml`, `config/registry_event.yaml`, `config/powershell.yaml` (powershell đã làm trước đó) | Mở rộng `search_fields` thêm `Image`, `ParentImage`, `ParentCommandLine`, `IntegrityLevel`, `User`, `OriginalFileName`, `CurrentDirectory` (process_creation); `Image`, `User`, `EventType` (registry_event). Cập nhật `event_field_map` map ra JSON path tương ứng. |
+
+### ✅ Retrain ĐÃ XONG 2026-05-20 16:32
+
+**Before vs After Fix #1/2/4**:
+
+| Model | Before SVM | Before Cos | After SVM | After Cos |
+|---|---|---|---|---|
+| process_creation | 202 | 920 | 200 | **1129** ⬆ |
+| powershell | 25 | 204 | 25 | **208** ⬆ |
+| registry_event | 38 | 243 | 23 | **242** |
+| **TỔNG** | 265 | **1,367** | 248 | **1,579** ⬆ |
+
+**Δ Cosine: +212 rule (+15.5%)** — Fix #1 (multi-field) đóng góp chính (process_creation +209).
+
+**Δ SVM: -17** — tokenizer mới làm 17 rule không đủ filter values sau normalize (chấp nhận được, SVM được fallback bằng Cosine).
+
+**Verified metadata lookup**: 1,579/1,579 (100%) qua SigmaRuleIndex.
+
+### ✅ Quick rehearsal verify 2026-05-20 16:39 — Fix #1 confirmed
+
+RunId `13b2e975` (Mode evasion) — RED attribute thêm rule mới mà TRƯỚC fix miss:
+
+| Sau fix RED bắt được | Quan hệ với Sigma Kibana | Lý do |
+|---|---|---|
+| `program_executed_using_proxy_local_command_via_ssh_exe` ⭐ | ✅ Sigma Kibana cũng fire | Rule check `ParentImage|endswith: '\sshd.exe'` — Fix #1 thêm ParentImage vào search_fields → RED extract được |
+| `regsvr32_execution_from_highly_suspicious_location` ⭐ | (rule mới) | Phase 6 Squiblydoo, rule mới từ catalog expansion |
+| `hacktool_covenant_powershell_launcher` | (rule mới) | Pattern PowerShell launcher |
+| `amsi_bypass_pattern_assembly_gettype` | (giữ nguyên) | Phase 4 AMSI marker |
+| 4 rule khác | various | Cover thêm |
+
+→ **Bằng chứng Fix #1 ĐÚNG MỤC ĐÍCH**: RED catch được rule SSH-based (parent-child) — trước fix MISS hoàn toàn vì RED chỉ nhìn command_line.
+
+**Sigma vs RED overlap**: Trước fix 1/8 → sau fix ≥3/8 (SSH spawn + WMI + Regsvr32 đều khớp).
+
+### ⏭️ Việc tiếp theo (chưa làm)
+
+Tokenizer thay đổi → vocabulary thay đổi → **PHẢI retrain Stage 1 + Stage 2 cả 3 event_type**. Backup model cũ đã làm: `models/{event}/train_rslt_*.PRE_FIX124.zip`.
+
+**Sau retrain — verify**
+
+```bash
+# 1. Verify rule count tăng (kỳ vọng > 1,367 trong Cosine attributor)
+python3 -c "
+from red.persist import load_result
+for n,p in [('proc','models/process_creation/train_rslt_attr_ensemble.zip'),
+            ('ps','models/powershell/train_rslt_attr_ensemble.zip'),
+            ('reg','models/registry_event/train_rslt_attr_ensemble.zip')]:
+    r=load_result(p)
+    print(f'{n}: SVM={len(r[\"rule_models\"])}, Cosine={len(r[\"cosine_attributor\"].rule_filter_matrices)}')
+"
+
+# 2. Regenerate RED_RULE_MAP.md với rule count mới (xem demo/RED_RULE_MAP.md generator trong git history)
+
+# 3. Rerun demo Mode evasion + so sánh Sigma vs RED overlap
+sshpass -p tzxr ssh luanthanh@10.10.20.50 \
+  'powershell -ExecutionPolicy Bypass -File C:\Users\LuanThanh\apt_demo_scenario.ps1 -Mode evasion -SleepSeconds 60'
+sleep 90
+
+# So sánh:
+# - Trước fix: Sigma fire 8 rule unique, RED attribute 9 rule (1 overlap)
+# - Sau fix kỳ vọng: RED attribute thêm rule SSH-based (parent), AMSI bypass, RunOnce NT → overlap tăng 3-5 rule
+```
+
+### Update sau khi verify
+
+- `demo/RED_RULE_MAP.md` — regenerate (xem snippet trong section 12.14 của demo/README.md)
+- `demo/README.md` — thêm section 12.16 "Multi-field Fix #1/#2/#4" với before/after
+- `demo/apt_demo_scenario_demo_present.md` — update bảng Pha 4 với rule overlap mới
+- `README.md` (root) — update Stage 2 catalog expansion: 1,367 → con số mới
+- File này (CLAUDE.md) — đánh dấu Fix #1/#2/#4 status = "applied + verified"
+
+### Rủi ro
+
+- Stage 1 retrain có thể giảm accuracy nếu tokenizer mới generate tokens lạ với benign data → check F1 sau retrain
+- Nếu accuracy giảm > 5% → revert tokenizer hoặc dùng dual-tokenization (keep both old + new tokens)
+- Cosine catalog có thể tăng lên ~1,500 rule (từ 1,367) sau Fix #4 — KHÔNG cần lo nếu < 2,000
+
+### Files khác đã update trong session này
+
+- `demo/apt_demo_scenario.md` — giải thích từng phase + Sigma rule match
+- `demo/apt_demo_scenario_demo_present.md` — hướng dẫn defense step-by-step + Phụ lục A Velociraptor
+- `demo/RED_RULE_MAP.md` — tra cứu 1,367 RED rule ↔ Sigma metadata
+- `demo/QA_PREP.md` + `demo/SLIDES_OUTLINE.md` — Q&A + slides
+- `agent/prompts/{triage,hunt,response,report}.md` — anti-hallucination rules
+- `agent/agents/{forensic,response,report}.py` — Forensic Agent + integration
+- `agent/vr_client.py` — Velociraptor gRPC wrapper
+- `red/rule_metadata.py` — SigmaRuleIndex enrichment

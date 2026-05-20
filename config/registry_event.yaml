@@ -7,11 +7,13 @@ data:
   events_dir: ~/data/sigma/events_hayabusa/windows/registry_event
   evasions_dir: ~/data/sigma/evasions/windows/registry_event
   rules_dir: ~/data/sigma/rules/windows/registry
-  # Sigma native field names — dùng để parse Sigma YAML detection blocks
+  # Fix v2 (2026-05-20): mở rộng search_fields cover thêm field rule check
   search_fields:
     - TargetObject
     - Details
-  # Mapping Sigma field name → list JSON paths để đọc event/log dict
+    - Image
+    - User
+    - EventType
   event_field_map:
     TargetObject:
       - winlog.event_data.TargetObject
@@ -19,6 +21,14 @@ data:
     Details:
       - winlog.event_data.Details
       - Details.Details
+    Image:
+      - process.executable
+      - winlog.event_data.Image
+    User:
+      - user.name
+      - winlog.event_data.User
+    EventType:
+      - winlog.event_data.EventType
   max_benign_samples: 30000        # cap Stage 1 benign — LMD Sysmon EID 12/13/14 có thể rất lớn
   max_attribution_benign: 15000    # cap Stage 2 per-rule benign
 
