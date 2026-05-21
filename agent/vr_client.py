@@ -57,6 +57,13 @@ def _resolve_client_id(name: str) -> str:
         return name
     mapping = _load_client_map()
     resolved = mapping.get(name)
+    if not resolved:
+        name_lower = name.lower()
+        resolved = next(
+            (client_id for host, client_id in mapping.items()
+             if str(host).lower() == name_lower),
+            None,
+        )
     if resolved:
         return resolved
     logger.warning(
@@ -329,8 +336,15 @@ def get_process_tree_deep(client_id: str, pid: int) -> dict:
             "_evidence_grade": "high" if target else ("low" if rows else "missing"),
         }
     except Exception as e:
-        logger.warning("Velociraptor query failed (process tree): %s — fallback mock", e)
-        return {**_MOCK_PROCESS_TREE, "_real_query_failed": str(e)}
+        logger.warning("Velociraptor query failed (process tree): %s", e)
+        return {
+            "target_process": {},
+            "parent_chain": [],
+            "children": [],
+            "total_procs_scanned": 0,
+            "_evidence_grade": "missing",
+            "_real_query_failed": str(e),
+        }
 
 
 def get_file_artifacts(client_id: str, since_minutes: int = 30) -> dict:
@@ -394,5 +408,9 @@ def get_network_connections_deep(client_id: str, since_minutes: int = 30) -> dic
         rows = _run_vql(_VQL_NETSTAT, client_id, env={"SinceMinutes": since_minutes})
         return {"connections": rows, "_evidence_grade": "high" if rows else "low"}
     except Exception as e:
-        logger.warning("Velociraptor query failed (netstat): %s — fallback mock", e)
-        return {**_MOCK_NETWORK, "_real_query_failed": str(e)}
+        logger.warning("Velociraptor query failed (netstat): %s", e)
+        return {
+            "connections": [],
+            "_evidence_grade": "missing",
+            "_real_query_failed": str(e),
+        }

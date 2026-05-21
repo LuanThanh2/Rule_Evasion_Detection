@@ -237,18 +237,25 @@ def normalize_alert_source(src: dict) -> dict:
 
 def poll_new_alerts(
     since_timestamp: Optional[str] = None,
+    until_timestamp: Optional[str] = None,
     limit: int = 50,
     score_threshold: float = 0.0,
     query_string: Optional[str] = None,
 ) -> list[dict]:
     """Lấy alerts mới từ red-alerts.
 
-    - since_timestamp: ISO 8601, lấy alerts có @timestamp > giá trị này
+    - since_timestamp: ISO 8601/date math, lấy alerts có @timestamp > giá trị này
+    - until_timestamp: ISO 8601/date math, lấy alerts có @timestamp <= giá trị này
     - score_threshold: lấy alerts có red.stage1_score hoặc red.detection_score >= ngưỡng
     """
     filters: list[dict] = []
+    timestamp_range = {}
     if since_timestamp:
-        filters.append({"range": {"@timestamp": {"gt": since_timestamp}}})
+        timestamp_range["gt"] = since_timestamp
+    if until_timestamp:
+        timestamp_range["lte"] = until_timestamp
+    if timestamp_range:
+        filters.append({"range": {"@timestamp": timestamp_range}})
     if score_threshold > 0:
         filters.append({
             "bool": {

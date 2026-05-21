@@ -415,139 +415,78 @@ sshpass -p tzxr ssh luanthanh@10.10.20.50 \
 2. Mở Kibana `red-alerts-demo` + `red-alerts-powershell-demo` → RED có alert SSH/process + PowerShell evasion với `top_rule` + `sigma_filename`
 3. Kiểm tra thêm `red-alerts-registry-demo`: bản rerun sau retrain **chưa có alert RunOnce ở threshold 0.5** dù Sysmon EID 13 đã có log RunOnce. Không nói "RunOnce RED registry đã fire" nếu dùng build mới này.
 
-**Verified rerun sau fix/retrain** (RunId `f3fe655b`, `2026-05-20 16:49:45 +07`, Mode evasion full 7 phase, `-SleepSeconds 60`):
+**Kết quả verified mới nhất** (RunId `b626ddff`, 2026-05-20 21:20 +07, sau script-level obfuscation fix):
 
-#### A0. Log ingest ground truth
+> Note Phase 6: hàm `Use-NoisySigma` chưa định nghĩa → 3 LOLBin variant (mshta/regsvr32/rundll32) bị skip; DNS tunnel + fileless marker vẫn chạy. Đây là lỗi pre-existing không liên quan fix Phase 4/5.
 
-Window kiểm tra: `2026-05-20T09:49:40Z` → `09:51:10Z`, host `desktop-2uqb61h`.
+#### A. Log ingest (window `14:20:00Z` → `14:22:30Z`, host `desktop-2uqb61h`)
 
-| Event code | Count | Ý nghĩa |
+| Event code | Count | Nguồn |
 |---|---:|---|
-| Sysmon EID 1 | 102 | Process create, gồm SSH PowerShell + WMI child PowerShell |
-| Sysmon EID 11 | 91 | File create policy-test/temp artifacts |
-| PowerShell 4104 | 16 | ScriptBlockText cho phase 1-7 |
-| Sysmon EID 13 | 1 | `HKCU\...\CurrentVersion\RunOnce\RED_APT_DEMO_PERSIST_f3fe655b` |
-| Sysmon EID 19/20/21 | 1/1/1 | WMI Event Subscription persistence |
-| Sysmon EID 22 | 1 | DNS tunnel marker |
+| PowerShell 4104 | 16 | ScriptBlockText các phase 1-7 |
+| Sysmon EID 13 | 1 | `HKCU\...\RunOnce\RED_APT_DEMO_PERSIST_b626ddff` |
+| Sysmon EID 19/20/21 | 1/1/1 | WMI Event Subscription persistence (Phase 3) |
+| Sysmon EID 22 | 1 | DNS tunnel marker (Phase 6) |
 
-Note live run: `mshta.exe` và `rundll32.exe` bị Windows chặn `Access is denied`; `regsvr32.exe` vẫn chạy và sinh alert.
+#### B. Sigma Kibana — 5 rule fire (`.internal.alerts-security.alerts-*`)
 
-#### A1. Sigma Kibana — 6 rule fire mới (`.internal.alerts-security.alerts-*`)
-
-| Count | Rule name | Sigma UUID | Phase nào trigger |
-|---:|---|---|---|
-| 100x | `SIGMA - Non Interactive PowerShell Process Spawned` | `f4bbd493-b796-416e-bbf2-121235348529` | WMI/PowerShell non-interactive child |
-| 100x | `SIGMA - Potential WMI Lateral Movement WmiPrvSE Spawned PowerShell` | `692f0bec-83ba-4d04-af7e-e884a96059b6` | Phase 3 Tier 3 WMI fires |
-| 16x | `SIGMA - Program Executed Using Proxy/Local Command Via SSH.EXE` | `7d6d30b8-5b91-4b90-a891-46cccaf29598` | Script chạy qua SSH session |
-| 1x | `SIGMA - CurrentVersion Autorun Keys Modification` | `20f0ee37-5942-4e45-b7d5-c5b5db9df5cd` | Phase 3 RunOnce registry event |
-| 1x | `SIGMA - Scripting/CommandLine Process Spawned Regsvr32` | `ab37a6ec-6068-432b-a64e-2c7bf95b1d22` | Phase 6 Squiblydoo |
-| 1x | `SIGMA - Suspicious Execution of Powershell with Base64` | `fb843269-508c-4b76-8b8d-88679db22ce7` | Phase 1 `-e` shorthand |
-
-→ Sigma vẫn **không silent** trên evasion mode. Lần rerun mới fire ít rule unique hơn kết quả cũ vì `mshta`/`rundll32` bị OS chặn, nhưng WMI + SSH + non-interactive + regsvr32 vẫn rất rõ.
-
-#### B0. RED ML attribution sau retrain — 15 rule unique (117 alerts trong demo window)
-
-| Count | RED `top_rule` | RED `sigma_title` | Sigma UUID | Ghi chú |
+| Count | Rule name | Sigma UUID | Phase trigger | Loại phát hiện |
 |---:|---|---|---|---|
-| 83x | `hacktool_covenant_powershell_launcher` | "HackTool - Covenant PowerShell Launcher" | `c260b6db-48ba-4b4a-a76f-2f67644e99d2` | WMI child PowerShell marker được top-1 attribution vào launcher pattern |
-| 9x | `program_executed_using_proxy_local_command_via_ssh_exe` | "Program Executed Using Proxy/Local Command Via SSH.EXE" | `7d6d30b8-5b91-4b90-a891-46cccaf29598` | ✅ Exact UUID overlap với Sigma sau multi-field fix |
-| 8x | `powershell_create_scheduled_task` | "Powershell Create Scheduled Task" | `363eccc0-279a-4ccf-a3ab-24c2e63b11fb` | PowerShell module noise trong 4104 backfill |
-| 5x | `suspicious_runas_like_flag_combination` | "Suspicious RunAs-Like Flag Combination" | `50d66fb0-03f8-4da0-8add-84e77d12a020` | SSH/cmd launch flags |
-| 2x | `tamper_windows_defender_psclassic` | "Tamper Windows Defender - PSClassic" | `ec19ebab-72dc-40e1-9728-4c0b805d722c` | PowerShell module noise trong 4104 backfill |
-| 1x | `non_interactive_powershell_process_spawned` | "Non Interactive PowerShell Process Spawned" | `f4bbd493-b796-416e-bbf2-121235348529` | ✅ Exact UUID overlap với Sigma |
-| 1x | `regsvr32_execution_from_highly_suspicious_location` | "Regsvr32 Execution From Highly Suspicious Location" | `327ff235-94eb-4f06-b9de-aaee571324be` | Same technique as Sigma regsvr32, different Sigma rule UUID |
-| 1x | `amsi_bypass_pattern_assembly_gettype` | "AMSI Bypass Pattern Assembly GetType" | `e0d6c087-2d1c-47fd-8799-3904103c5a98` | Phase 4 AMSI marker, Sigma miss |
-| 1x | `nslookup_powershell_download_cradle` | "Nslookup PowerShell Download Cradle" | `999bff6d-dc15-44c9-9f5c-e1051bfc86e1` | Phase 2/6 DNS-download style attribution |
-| 1x | `potential_in_memory_execution_using_reflection_assembly` | "Potential In-Memory Execution Using Reflection.Assembly" | `ddcd88cb-7f62-4ce5-86f9-1704190feb0a` | Phase 6 fileless marker |
-| 1x | `potential_powershell_obfuscation_using_character_join` | "Potential PowerShell Obfuscation Using Character Join" | `e8314f79-564d-4f79-bc13-fbc0bf2660d8` | Phase 1/5 char-code evasion |
-| 1x | `suspicious_get_local_groups_information` | "Suspicious Get Local Groups Information" | `cef24b90-dddc-4ae1-a09a-8764872f69fc` | Phase 7 sandbox/system probe |
-| 1x | `automated_collection_bookmarks_using_get_childitem_powershell` | "Automated Collection Bookmarks..." | `e0565f5d-d420-4e02-8a68-ac00d864f9cf` | Discovery-style attribution |
-| 1x | `local_file_read_using_curl_exe` | "Local File Read Using Curl.EXE" | `aa6f6ea6-0676-40dd-b510-6e46f02d8867` | False-positive-ish top-1 attribution on script launch string |
-| 1x | `sdiagnhost_calling_suspicious_child_process` | "Sdiagnhost Calling Suspicious Child Process" | `f3d39c45-de1a-4486-a687-ab126124f744` | Low-confidence/noisy top-1 attribution |
+| 200x | `SIGMA - Potential WMI Lateral Movement WmiPrvSE Spawned PowerShell` | `692f0bec-...` | Phase 3 WMI | **Behavior** (parent-child) |
+| 100x | `SIGMA - Non Interactive PowerShell Process Spawned` | `f4bbd493-...` | WMI/SSH child PS | **Behavior** (parent-child) |
+| 12x | `SIGMA - Program Executed Using Proxy/Local Command Via SSH.EXE` | `7d6d30b8-...` | Script qua SSH | **Context** (parent image) |
+| 1x | `SIGMA - CurrentVersion Autorun Keys Modification` | `20f0ee37-...` | Phase 3 RunOnce | **Registry** (key path) |
+| 1x | `SIGMA - Suspicious Execution of Powershell with Base64` | `fb843269-...` | Phase 1 `-e` | **Argument** (cmd-line) |
 
-**Quan trọng sau fix #1/#2/#4**:
-- RED process_creation hiện đã đọc thêm `ParentImage`/`ParentCommandLine`, nên catch được SSH rule: exact UUID `7d6d30b8-...` khớp Sigma.
-- Exact UUID overlap mới: `program_executed_using_proxy_local_command_via_ssh_exe` và `non_interactive_powershell_process_spawned`.
-- Technique overlap: regsvr32 có cả Sigma và RED, nhưng là 2 Sigma UUID khác nhau.
-- Registry caveat: Sysmon EID 13 RunOnce có log thật, nhưng `red-alerts-registry-demo` không fire ở threshold `0.5`. Manual check cho thấy normalizer trả chuỗi rỗng với full RunOnce path, nên cần patch registry normalization trước khi claim RED registry catch RunOnce.
+**3 rule target đã bị vô hiệu hóa** — Sigma keyword match trên ScriptBlockText đều MISS:
 
-**Lời thoại cập nhật cho WOW moment**:
-> *"Verified lại sau retrain với RunId `f3fe655b`: Sigma fire 6 rule unique, mạnh nhất là WMI, non-interactive PowerShell và SSH. RED ML fire 15 top_rule unique. Điểm mới quan trọng là RED đã bắt được SSH parent-context rule qua UUID `7d6d30b8-...`, chứng minh multi-field fix có tác dụng."*
+| Rule target | Script cũ | Script sau fix | Lý do |
+|---|---|---|---|
+| `posh_ps_amsi_bypass` | ✅ Fire | ❌ Không fire | Literal `amsiInitFailed`/`AmsiUtils` đã encode thành char-code → base64, không còn trong source |
+| `posh_ps_potential_invoke_mimikatz` | ✅ Fire | ❌ Không fire | Literal `sekurlsa`/`logonpasswords` đã encode, không còn trong source |
+| `posh_ps_susp_clear_eventlog` | Không fire (Variant A đã đủ) | ❌ Không fire | Parent source sạch hoàn toàn |
+
+**Bằng chứng cứng**: query `match_phrase` từng keyword trên 16 event 4104 trong window → tất cả trả 0 hit.
+
+#### C. RED ML — batch detection trên 17 event 4104
+
+**Stage 1**: 17/17 events `detection_score = 1.0` — ML vẫn flag suspicious toàn bộ dù script đã obfuscate cứng.
+
+**Stage 2 — top-1 attribution**:
+
+| Count | RED `top_rule` | Phase liên quan |
+|---:|---|---|
+| 8x | `powershell_create_scheduled_task` | Parent SBT (script lớn) |
+| 2x | `tamper_windows_defender_psclassic` | AMSI base64 variant |
+| 1x | `potential_powershell_obfuscation_using_character_join` ⭐ | Phase 4 Variant A char-code |
+| 1x | `suspicious_get_local_groups_information` | Phase 7 sandbox probe |
+| 1x | `nslookup_powershell_download_cradle` | Phase 2/6 DNS style |
+| ... | 4 rule khác | various |
+
+**Trade-off cần nhớ**: sau khi script source sạch hoàn toàn, Stage 2 không còn attribute vào `amsi_bypass_pattern_assembly_gettype` hay Mimikatz rule nữa (token đã bị xoá). Nhưng Stage 1 vẫn detect 100% — đây là điểm mấu chốt: **ML detection không phụ thuộc keyword cụ thể**.
+
+**Lời thoại WOW moment**:
+> *"Verified RunId `b626ddff`: sau khi script obfuscate cứng (char-code + base64 build-time), Sigma keyword detection bị tê liệt hoàn toàn — AMSI bypass và Mimikatz không còn fire. Sigma chỉ còn fire 5 rule qua hành vi: WMI spawn, SSH parent, RunOnce registry, base64 argument — không có rule nào đọc nội dung code."*
 >
-> *"RED vẫn bắt các biến thể mà Sigma miss như AMSI bypass marker, Reflection.Assembly fileless marker, nslookup/download-cradle style, char-code obfuscation và sandbox/system probe. Nhưng registry RunOnce hiện là caveat: log Sysmon có, Sigma có alert, RED registry threshold 0.5 chưa fire — không nên nói quá trong buổi bảo vệ."*
+> *"RED ML Stage 1 vẫn detect 17/17 event với score 1.0. Stage 2 attribute Phase 4 Variant A sang `potential_powershell_obfuscation_using_character_join` — ML 'thấy' kỹ thuật char-code dù không thấy keyword cụ thể. Đây là generalization mà Sigma keyword không có."*
+>
+> *"Verify UUID cross-layer: Sigma `20f0ee37-...` ↔ RED `currentversion_autorun_keys_modification` — cùng một rule, 2 layer detect độc lập."*
 
-**Verified rule match cũ** (RunId `803901d3`, 2026-05-20, Mode evasion full 7 phase, trước rerun/fix mới):
+#### D. Tại sao 5 rule Sigma vẫn fire — behavior vs keyword
 
-#### A. Sigma Kibana — 8 rule fire (`.internal.alerts-security.alerts-*`)
+5 rule còn lại **không đọc ScriptBlockText**, chúng nhìn vào **ai sinh ra ai** và **argument**:
 
-| Count | Rule name | Phase nào trigger |
+| Rule | Sigma match field | Không thể obfuscate vì... |
 |---|---|---|
-| 100x | `SIGMA - Potential WMI Lateral Movement WmiPrvSE Spawned PowerShell` | Phase 3 Tier 3 WMI fires (60s/lần) |
-| 44x | `SIGMA - Program Executed Using Proxy/Local Command Via SSH.EXE` | Script chạy qua SSH session |
-| 31x | `SIGMA - Non Interactive PowerShell Process Spawned` | Phase 1 non-interactive PS |
-| 3x | `SIGMA - CurrentVersion Autorun Keys Modification` | WMI consumer ghi Run-like key |
-| 2x | `SIGMA - Scripting/CommandLine Process Spawned Regsvr32` | Phase 6 Squiblydoo |
-| 1x | `SIGMA - Suspicious Execution of Powershell with Base64` | Phase 1 `-e` shorthand (vẫn fire vì rule có `EncodedCommand` substring match) |
-| 1x | `SIGMA - Execution Of Non-Existing File` | Phase 6 mshta marker file |
-| 1x | `SIGMA - Execution of Suspicious File Type Extension` | Phase 6 LOLBins |
+| WMI Lateral Movement | `winlog.provider_name` + EID 19/20/21 | WMI event log độc lập, không liên quan code PS |
+| Non-interactive PS | `ParentImage` + command-line flags | Process tree cố định |
+| SSH proxy | `ParentImage ends with sshd.exe` | Parent process không đổi được |
+| RunOnce Autorun | Registry key path | Persistence cần ghi đúng key path thật |
+| Base64 PS | `CommandLine contains "-e "` | Argument `-e` ở process-level, không ở ScriptBlockText |
 
-→ **Sigma KHÔNG silent hoàn toàn** trên evasion mode. Sigma fire 8 rule, đặc biệt nặng trên Phase 3 (WMI persistence — Tier 3 advanced) và Phase 6 (LOLBins).
+→ Keyword match trên ScriptBlockText đã bị tê liệt. Defense-in-depth tiếp tục qua parent-context rule.
 
-#### B. RED ML attribution — 9 rule unique (248 alerts demo-related)
-
-| Count | RED `top_rule` | RED `sigma_title` | Phase | Sigma fire? |
-|---|---|---|---|---|
-| 232x | `suspicious_runas_like_flag_combination` | "Suspicious RunAs-Like Flag Combination" | Phase 6 LOLBins (`/s /n /u /i`) | ❌ Không có trong Sigma fired list |
-| 3x | `nslookup_powershell_download_cradle` | "Nslookup PowerShell Download Cradle" | Phase 2 evasion Tier 2 | ❌ Sigma miss |
-| 3x | `powershell_write_eventlog_usage` | "PowerShell Write-EventLog Usage" | Phase 4 Tier 1 split keyword | ❌ Sigma miss |
-| 3x | `automated_collection_bookmarks_using_get_childitem_powershell` | "Automated Collection Bookmarks..." | Phase 6/7 discovery | ❌ Sigma miss |
-| 2x | `security_software_discovery_via_powershell_script` | "Security Software Discovery..." | Phase 7 sandbox probe (analyst tools check) | ❌ Sigma miss |
-| 2x | `control_panel_items` | "Control Panel Items" | LOLBin process | — |
-| **1x** | **`currentversion_autorun_keys_modification`** | "CurrentVersion Autorun Keys Modification" | Phase 3 chain (WMI consumer Run-like) | **✅ Sigma cũng fire** |
-| **1x** | **`currentversion_nt_autorun_keys_modification`** | "CurrentVersion NT Autorun Keys Modification" | Phase 3 evasion (`RunOnce`) | ❌ Sigma miss biến thể NT |
-| 1x | `amsi_bypass_pattern_assembly_gettype` | "AMSI Bypass Pattern Assembly GetType" | Phase 4 Tier 3 AMSI marker | ❌ Sigma miss |
-
-#### C. Insight cho defense
-
-1. **1 rule khớp ĐÚNG cả 2 layer**: `currentversion_autorun_keys_modification` (UUID `20f0ee37-...`) — verify Sigma metadata + UUID identical.
-
-2. **RED catch 8 rule mà Sigma miss**:
-   - **AMSI bypass marker** (Tier 3) ⭐
-   - **PowerShell Write-EventLog** (Tier 1 split `Clear-EventLog`)
-   - **Nslookup download cradle** (Tier 2 obfuscation)
-   - **Sandbox detection probe** (Tier 3)
-   - **RunOnce variant** (Tier 1 — Sigma fire `Run` không phải `RunOnce NT`)
-   - **RunAs-like flag combination** trên LOLBins
-   - + 2 khác
-
-3. **Sigma catch 7 rule khác (không trong RED top attribution)**:
-   - WMI Lateral Movement (Sigma có rule riêng cho WMI Consumer pattern)
-   - Non Interactive PowerShell Process Spawned
-   - SSH Local Command (rule độc của Sigma)
-   - Squiblydoo Regsvr32
-
-→ **2 layer cover khác nhau** — đây là defense-in-depth thực sự. KHÔNG phải "Sigma silent, RED catch". Đúng là: cả 2 layer fire trên evasion mode, nhưng **góc nhìn khác nhau** → giảm chance attacker né được cả 2.
-
-**Nói (CHẬM RÃI, NHẤN MẠNH)**:
-> *"Mode evasion thay đổi nhiều điểm: `-e` shorthand thay `-EncodedCommand`,
-> `'Sys'+'tem.Net.WebCl'+'ient'` split string, `RunOnce` thay `Run`, AMSI bypass
-> marker, WMI Event Subscription. Behavior tổng quát giống baseline."*
->
-> *"Verified với RunId `803901d3`: Sigma Kibana fire **8 rule unique** (chủ yếu WMI
-> + Squiblydoo + LOLBins). RED ML attribute **9 rule unique** — trong đó **8 rule
-> KHÔNG có trong danh sách Sigma fired**, nổi bật: AMSI bypass pattern, PowerShell
-> Write-EventLog, RunOnce NT variant, Sandbox detection probe."*
->
-> *"Đây là **defense-in-depth thực sự**: Sigma cứng catch các technique đã biết
-> với pattern rõ ràng (WMI, Squiblydoo), RED ML catch các evasion variant cụ thể
-> mà Sigma miss (AMSI bypass, RunOnce NT, sandbox probe). Cả 2 layer cùng tồn tại,
-> giảm chance attacker né được cả hai."*
->
-> *"Verify khớp rule chéo qua UUID — alert RED có field `top_rule_sigma_id`. Ví dụ
-> rule `currentversion_autorun_keys_modification` có UUID `20f0ee37-...` — Sigma
-> Kibana fire `SIGMA - CurrentVersion Autorun Keys Modification` cùng UUID."*
-
-#### D. Tại sao RED KHÔNG cover hết những event Sigma bắt được?
+#### E. Tại sao RED KHÔNG cover hết những event Sigma bắt được?
 
 Câu hỏi GVHD điển hình: *"RED là superset của Sigma không?"* — **KHÔNG**, do 4 lý do:
 
@@ -653,14 +592,27 @@ confidence *1.2. Ghi rõ trong reasoning: 'Sigma + RED cùng fire — evidence k
 ### Pha 5 — Chain mode + AI Agent (7 phút) — full pipeline
 
 ```bash
-# Bật agent daemon (Terminal 4)
-unset VR_USE_REAL  # mock VR cho nhanh, OR set =1 cho real (chậm hơn)
+# Bật agent daemon (Terminal 4) — chỉ đọc RED alerts của máy demo, tránh backlog host khác
+source ~/venvs/rule_evasion_env/bin/activate
+source .env
+export ES_RED_INDEX='red-alerts*'
+DEMO_AGENT_QUERY='host.name:"desktop-2uqb61h" OR winlog.computer_name:"DESKTOP-2UQB61H"'
 export VR_USE_REAL=1
-python3 -m agent.daemon --interval 30 --score-threshold 0.5 --no-state &
+export VR_API_CONFIG=~/velociraptor/api.config.yaml
+export VR_QUERY_TIMEOUT=180
+python3 -m agent.daemon \
+  --interval 30 \
+  --max-iter 1 \
+  --score-threshold 0.5 \
+  --since "now-20m" \
+  --until "now" \
+  --batch-limit 1 \
+  --query-string "$DEMO_AGENT_QUERY" \
+  --no-state
 
 # Trigger chain mode
 sshpass -p tzxr ssh luanthanh@10.10.20.50 \
-  'powershell -ExecutionPolicy Bypass -File C:\Users\LuanThanh\apt_demo_scenario.ps1 -Mode chain -SleepSeconds 120'
+  'powershell -ExecutionPolicy Bypass -File C:\Users\LuanThanh\apt_demo_scenario.ps1 -Mode chain -SleepSeconds 3'
 ```
 
 **Verified result** (RunId `b82c152e`, 2026-05-20, Mode chain 7 phase):
@@ -1421,6 +1373,18 @@ firefox https://10.10.20.20:8889
 > tại thời điểm investigation. Sysmon log có thể bị attacker clear (T1070.001),
 > nhưng Velociraptor query state thật ngay lúc đó. Hai cái complement nhau:
 > Sysmon ship log liên tục, Velociraptor query forensic on-demand."*
+
+---
+
+## Phụ lục B — Lịch sử rerun evasion mode
+
+| RunId | Thời điểm | Mô tả | Sigma unique | AMSI/Mimi fire? |
+|---|---|---|---:|---|
+| `803901d3` | 2026-05-20 (sớm) | Trước multi-field fix | 8 | ✅ |
+| `f3fe655b` | 2026-05-20 16:49 | Sau multi-field fix #1/#2/#4, trước obfuscation fix | 6 | ✅ |
+| `b626ddff` | 2026-05-20 21:20 | **Sau obfuscation fix Phase 4+5 (hiện tại)** | 5 | ❌ |
+
+Chi tiết kết quả mới nhất (`b626ddff`) đã được tích hợp vào section Pha 4 ở trên.
 
 ---
 

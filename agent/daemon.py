@@ -50,6 +50,9 @@ _shutdown = False
 
 def _handle_signal(signum, frame):
     global _shutdown
+    if _shutdown:
+        logger.warning("Got signal %d again — force exit now", signum)
+        os._exit(128 + signum)
     logger.info("Got signal %d — shutting down sau iteration hiện tại...", signum)
     _shutdown = True
 
@@ -106,6 +109,7 @@ async def daemon_loop(
     score_threshold: float,
     batch_limit: int,
     since: str | None,
+    until: str | None,
     no_state: bool,
     query_string: str | None,
 ):
@@ -121,6 +125,8 @@ async def daemon_loop(
     logger.info("   last_processed=%s | total_processed=%d",
                 state.get("last_processed_timestamp", "(none — process all)"),
                 state.get("processed_count", 0))
+    if until:
+        logger.info("   until=%s", until)
     logger.info("═" * 70)
 
     while not _shutdown:
@@ -130,6 +136,7 @@ async def daemon_loop(
         try:
             alerts = poll_new_alerts(
                 since_timestamp=state.get("last_processed_timestamp"),
+                until_timestamp=until,
                 limit=batch_limit,
                 score_threshold=score_threshold,
                 query_string=query_string,
@@ -198,6 +205,8 @@ def main():
                         help="Số alerts max lấy về mỗi iteration. Default 20")
     parser.add_argument("--since", type=str, default=None,
                         help="Override state timestamp; process alerts with @timestamp > this ISO value")
+    parser.add_argument("--until", type=str, default=None,
+                        help="Only process alerts with @timestamp <= this ISO/date-math value")
     parser.add_argument("--no-state", action="store_true",
                         help="Do not save .agent_daemon_state.json; useful for demo one-shot runs")
     parser.add_argument("--query-string", type=str, default=None,
@@ -234,6 +243,7 @@ def main():
             score_threshold=args.score_threshold,
             batch_limit=args.batch_limit,
             since=args.since,
+            until=args.until,
             no_state=args.no_state,
             query_string=args.query_string,
         ))

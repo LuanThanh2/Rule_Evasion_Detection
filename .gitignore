@@ -53,6 +53,9 @@ outputs/
 .claude/settings.local.json
 .claude
 
-#demo/README.md
-#demo/QA_PREP.md
-#demo/SLIDES_OUTLINE.md
+demo/README.md
+demo/QA_PREP.md
+demo/SLIDES_OUTLINE.md
+demo/RED_RULE_MAP.md
+demo/apt_demo_scenario_demo_present.md
+demo/apt_demo_scenario.md

@@ -8,7 +8,9 @@
 
     benign   : Hành động admin bình thường tương đương. Sigma + RED đều silent.
     baseline : Pattern CHUẨN (canonical). Sigma rule cứng catch được.
-    evasion  : Variant Tier 1+2+3 để né rule. Sigma MISS, RED ML CATCH.
+    evasion  : Variant Tier 1+2+3 để né từng rule canonical trong cùng một
+               kill-chain. Lưu ý: Sigma vẫn có thể fire ở các rule behavior
+               khác như WMI/LOLBins/SSH — đây là defense-in-depth, không phải lỗi.
     chain    : Multi-phase realistic — pha trộn baseline + evasion theo kill-chain.
 
     Mapping với taxonomy 1.4 (Section 1.4 trong luận văn):
@@ -139,12 +141,11 @@ if (Should-Run 1) {
         }
     }
     elseif ($Mode -eq "evasion") {
-        # 3 variant cùng chạy để show breadth
         $payload = "Write-Host '${DemoTag}_PHASE1_EVASION_$RunId'; Start-Sleep $SleepSeconds"
         $enc = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($payload))
 
         # Variant A — Tier 1: shorthand -e
-        Write-Action "Variant A (Tier 1): powershell.exe -e <base64>" "shorthand flag"
+        Write-Action "Variant A (Tier 1): powershell.exe -e <base64>" "shorthand flag; may still hit broader Sigma base64/non-interactive rules"
         Invoke-If {
             Start-Process powershell.exe -ArgumentList "-NoProfile","-e",$enc `
                 -WindowStyle Hidden -PassThru | Select-Object -ExpandProperty Id |
@@ -277,7 +278,7 @@ if (Should-Run 3) {
     }
     elseif ($Mode -eq "evasion") {
         # Variant A — Tier 1: RunOnce thay Run
-        Write-Action "Variant A (Tier 1): HKCU\RunOnce\\$regName" "Sigma rule chỉ check \\Run\\, miss RunOnce"
+        Write-Action "Variant A (Tier 1): HKCU\RunOnce\\$regName" "Sigma rule canonical Run có thể miss, nhưng rule broader CurrentVersion có thể vẫn fire"
         Invoke-If {
             if (-not (Test-Path $DropperPath)) {
                 Copy-Item C:\Windows\System32\calc.exe $DropperPath -Force
@@ -286,7 +287,7 @@ if (Should-Run 3) {
         }
 
         # Variant B — Tier 3: WMI Event Subscription (đỉnh evasion)
-        Write-Action "Variant B (Tier 3): WMI Event Subscription persistence" "T1546.003 — APT29/FIN8 dùng. Không touch registry Run."
+        Write-Action "Variant B (Tier 3): WMI Event Subscription persistence" "T1546.003 — intentionally triggers behavior-level Sigma/forensic visibility"
         Invoke-If {
             $filterParams = @{
                 Name = $WmiFilterName
@@ -309,103 +310,163 @@ if (Should-Run 3) {
 }
 
 # ============================================================
-# PHASE 4 - Defense Evasion (Clear Log + AMSI bypass marker)
+# PHASE 4 - Defense Evasion (log-cleanup cmdlet + memory marker)
 # ============================================================
-# Sigma target: posh_ps_susp_clear_eventlog.yml + posh_ps_amsi_bypass
-# Tier 1: split 'Clear-EventLog' | Tier 3: AMSI bypass marker
+# Sigma target (đặt tên không-keyword để parent script source sạch):
+#   - log cleanup cmdlet rule  (keyword Sigma match: log-cleanup cmdlet literal)
+#   - memory marker rule       (keyword Sigma match: in-memory bypass literal)
+# Evasion design: KHÔNG để literal Sigma keyword nào lọt vào parent script source.
+#   PS 4104 log nguyên file source -> nếu parent có 'Clear-EventLog' / 'amsiInitFailed' / 'AmsiUtils' /
+#   '[Ref].Assembly' thì dù chạy nhánh evasion, Sigma vẫn fire vì keyword nằm ở các nhánh khác.
+# Kỹ thuật:
+#   Tier 2 (char-code array) — Variant A & baseline
+#   Tier 3 (base64 build-time, decode runtime) — Variant B (memory marker)
+#   Tier 2 (reverse-string) — Variant C
 if (Should-Run 4) {
-    Write-Phase 4 "Defense Evasion - Clear Log + AMSI bypass" "posh_ps_susp_clear_eventlog + posh_ps_amsi_bypass" "Tier 1+3"
+    Write-Phase 4 "Defense Evasion - log cleanup + memory marker" "log-cleanup-rule + memory-marker-rule" "Tier 2+3"
 
     if ($Mode -eq "benign") {
-        Write-Action "Get-EventLog -List (đọc, không xóa)"
+        Write-Action "Get-EventLog -List (read-only, no destructive cmdlet)"
         Invoke-If { Get-EventLog -List | Out-Null }
     }
     elseif ($Mode -in "baseline","chain") {
-        $scriptText = @"
-Write-Host '${DemoTag}_PHASE4_BASELINE_$RunId'
-# Lab-safe — chỉ Get-Command, không thật Clear
-Get-Command Clear-EventLog | Out-Null
-"@
-        Write-Action "Get-Command Clear-EventLog" "BASELINE: literal 'Clear-EventLog' present"
+        # Baseline dùng char-code: parent KHÔNG chứa literal cmdlet,
+        # nhưng CHILD scriptblock (sau decode) CÓ → Sigma fire trên child = đúng ý đồ baseline.
+        $cmdBytes = @(71,101,116,45,67,111,109,109,97,110,100,32,67,108,101,97,114,45,69,118,101,110,116,76,111,103,32,124,32,79,117,116,45,78,117,108,108)
+        $sensitive = -join ($cmdBytes | ForEach-Object { [char]$_ })
+        $scriptText = "Write-Host '${DemoTag}_PHASE4_BASELINE_$RunId'; $sensitive"
+        Write-Action "Baseline: child block chứa literal log-cleanup cmdlet (dựng runtime)" "BASELINE: Sigma fire trên CHILD ScriptBlockText (parent sạch)"
         Invoke-If { try { $sb = [scriptblock]::Create($scriptText); & $sb } catch { } }
     }
     elseif ($Mode -eq "evasion") {
-        # Variant A — Tier 1: split keyword
+        # --------------------------------------------------------
+        # Variant A — Tier 2: char-code array dựng cmdlet
+        # Source chỉ chứa mảng số -> không substring 'Clear', '-Event', 'Log'
+        # --------------------------------------------------------
+        $cmdBytes = @(67,108,101,97,114,45,69,118,101,110,116,76,111,103)
         $scriptA = @"
 Write-Host '${DemoTag}_PHASE4_EVASION_A_$RunId'
-`$cmdName = 'Clear' + '-Event' + 'Log'
-Write-Host 'Tier 1 split-keyword built:' `$cmdName
+`$b = @($($cmdBytes -join ','))
+`$kw = -join (`$b | ForEach-Object { [char]`$_ })
+Write-Host 'Tier 2 reconstructed cmdlet hash:' (`$kw.GetHashCode())
+# LAB-SAFE: in hash, KHÔNG Invoke-Expression
 "@
-        Write-Action "Variant A (Tier 1): 'Clear' + '-Event' + 'Log' concat" "literal split"
+        Write-Action "Variant A (Tier 2): char-code array -> cmdlet" "Source chỉ là số nguyên, Sigma keyword match MISS"
         Invoke-If { try { $sb = [scriptblock]::Create($scriptA); & $sb } catch { } }
 
-        # Variant B — Tier 3: AMSI bypass marker
-        # LAB-SAFE: chỉ marker text trong ScriptBlockText, KHÔNG patch AMSI thật
+        # --------------------------------------------------------
+        # Variant B — Tier 3: memory marker (build-time char-code -> runtime base64 decode)
+        # Parent source KHÔNG chứa bất kỳ literal Sigma keyword nào:
+        #   không có 'amsiInitFailed', 'AmsiUtils', '[Ref].Assembly', 'System.Management.Automation.Amsi'
+        # Build bytes -> payload -> base64 -> nhúng base64 vào CHILD scriptblock.
+        # Child khi log 4104 chỉ thấy base64 blob + lệnh decode generic -> Sigma keyword match MISS.
+        # --------------------------------------------------------
+        $markerBytes = @(
+            91,82,101,102,93,46,65,115,115,101,109,98,108,121,46,71,101,116,84,121,112,101,
+            40,34,83,121,115,116,101,109,46,77,97,110,97,103,101,109,101,110,116,46,65,117,
+            116,111,109,97,116,105,111,110,46,65,109,115,105,85,116,105,108,115,34,41,46,71,
+            101,116,70,105,101,108,100,40,34,97,109,115,105,73,110,105,116,70,97,105,108,101,
+            100,34,44,34,78,111,110,80,117,98,108,105,99,44,83,116,97,116,105,99,34,41
+        )
+        $markerPayload = -join ($markerBytes | ForEach-Object { [char]$_ })
+        $markerB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($markerPayload))
         $scriptB = @"
 Write-Host '${DemoTag}_PHASE4_EVASION_B_$RunId'
-# Tier 3 — AMSI BYPASS MARKER (LAB-SAFE, không thực thi)
-# Real attacker pattern: [Ref].Assembly.GetType('System.Management.Automation.Amsi'+'Utils')...
-# Marker này sẽ trigger rule posh_ps_amsi_bypass
-`$amsiMarker = '[Ref].Assembly.GetType(' + "'System.Management.Automation.Amsi'" + '+Utils").GetField("amsiInitFailed","NonPublic,Static")'
-Write-Host 'AMSI bypass detection marker:' `$amsiMarker
+`$enc = '$markerB64'
+`$dec = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(`$enc))
+Write-Host 'Tier 3 marker length:' `$dec.Length
+# LAB-SAFE: in length, KHÔNG eval/IEX/GetField
 "@
-        Write-Action "Variant B (Tier 3): AMSI bypass marker (MARKER ONLY)" "T1562.001 — Sigma fires keyword amsiInitFailed"
+        Write-Action "Variant B (Tier 3): memory marker base64 (build-time char-code)" "Parent + Child 4104 đều KHÔNG có literal Sigma keyword"
         Invoke-If { try { $sb = [scriptblock]::Create($scriptB); & $sb } catch { } }
+
+        # --------------------------------------------------------
+        # Variant C — Tier 2: reverse-string reconstruct
+        # Source chứa 'goLtnevE-raelC' (đảo ngược) -> keyword match miss,
+        # khác cách build với Variant A để RED phải generalize.
+        # --------------------------------------------------------
+        $scriptC = @"
+Write-Host '${DemoTag}_PHASE4_EVASION_C_$RunId'
+`$rev = 'goLtnevE-raelC'
+`$kw  = -join (`$rev[(`$rev.Length-1)..0])
+Write-Host 'Tier 2 reverse-string cmdlet hash:' (`$kw.GetHashCode())
+"@
+        Write-Action "Variant C (Tier 2): reverse-string -> cmdlet" "Source chứa chuỗi đảo, Sigma MISS"
+        Invoke-If { try { $sb = [scriptblock]::Create($scriptC); & $sb } catch { } }
     }
 }
 
 # ============================================================
-# PHASE 5 - Credential Access marker (Mimikatz keywords)
+# PHASE 5 - Credential Access marker (cred-dump keyword)
 # ============================================================
-# Sigma target: posh_ps_potential_invoke_mimikatz.yml
-# Tier 1: split concat | Tier 2: char-code + format
+# Sigma target (đặt tên không-keyword để parent script source sạch):
+#   - cred-dump-rule  (Sigma match literal 'sekurlsa::logonpasswords' / 'sekurlsa' / 'logonpasswords')
+# Evasion design giống Pha 4: parent KHÔNG chứa literal Sigma keyword,
+#   ngay cả nhánh baseline cũng dựng cred-dump literal qua char-code -> chỉ xuất hiện trong CHILD.
+# Kỹ thuật:
+#   Tier 2 (char-code array) — Variant A & baseline
+#   Tier 3 (base64 build-time, decode runtime) — Variant B
+#   Tier 2 (reverse-string) — Variant C
 if (Should-Run 5) {
-    Write-Phase 5 "Credential Access marker" "posh_ps_potential_invoke_mimikatz.yml" "Tier 1+2"
+    Write-Phase 5 "Credential Access marker" "cred-dump-rule" "Tier 2+3"
 
     if ($Mode -eq "benign") {
-        Write-Action "Get-LocalUser (không có Mimikatz keyword)"
+        Write-Action "Get-LocalUser (read-only, no credential-dump keyword)"
         Invoke-If { Get-LocalUser -ErrorAction SilentlyContinue | Out-Null }
     }
     elseif ($Mode -in "baseline","chain") {
-        $scriptText = @"
-Write-Host '${DemoTag}_PHASE5_BASELINE_$RunId'
-# LAB-SAFE marker only
-`$mimikatzCmd = 'sekurlsa::logonpasswords'
-Write-Host 'Demo marker:' `$mimikatzCmd
-"@
-        Write-Action "Literal 'sekurlsa::logonpasswords'" "BASELINE: Sigma catch"
+        # Baseline: literal cred-dump dựng từ char-code -> parent sạch, CHILD chứa literal -> Sigma fire trên child.
+        $credBytes = @(115,101,107,117,114,108,115,97,58,58,108,111,103,111,110,112,97,115,115,119,111,114,100,115)
+        $sensitive = -join ($credBytes | ForEach-Object { [char]$_ })
+        $scriptText = "Write-Host '${DemoTag}_PHASE5_BASELINE_$RunId'; `$marker = '$sensitive'; Write-Host 'Demo marker length:' `$marker.Length"
+        Write-Action "Baseline: child block chứa literal cred-dump keyword (dựng runtime)" "BASELINE: Sigma fire trên CHILD ScriptBlockText (parent sạch)"
         Invoke-If { try { $sb = [scriptblock]::Create($scriptText); & $sb } catch { } }
     }
     elseif ($Mode -eq "evasion") {
-        # Variant A — Tier 1: concat split
+        # --------------------------------------------------------
+        # Variant A — Tier 2: char-code array dựng cred-dump keyword
+        # Source chỉ là mảng số -> không substring 'sekurlsa', 'logonpasswords', 'onpasswords'
+        # --------------------------------------------------------
+        $credBytes = @(115,101,107,117,114,108,115,97,58,58,108,111,103,111,110,112,97,115,115,119,111,114,100,115)
         $scriptA = @"
 Write-Host '${DemoTag}_PHASE5_EVASION_A_$RunId'
-`$kw = 'sek' + 'urlsa' + '::log' + 'onpasswords'
-Write-Host 'Tier 1 concat:' `$kw
+`$b = @($($credBytes -join ','))
+`$kw = -join (`$b | ForEach-Object { [char]`$_ })
+Write-Host 'Tier 2 reconstructed keyword hash:' (`$kw.GetHashCode())
+# LAB-SAFE: in hash, không Invoke-Expression, không gọi LSASS
 "@
-        Write-Action "Variant A (Tier 1): 'sek'+'urlsa'+'::log'+'onpasswords'" "split literal"
+        Write-Action "Variant A (Tier 2): char-code array -> cred-dump keyword" "Source chỉ là số nguyên, Sigma keyword match MISS"
         Invoke-If { try { $sb = [scriptblock]::Create($scriptA); & $sb } catch { } }
 
-        # Variant B — Tier 2: char code reverse
+        # --------------------------------------------------------
+        # Variant B — Tier 3: build-time char-code -> runtime base64 decode
+        # Parent source KHÔNG chứa literal 'sekurlsa'/'logonpasswords'.
+        # Child source chỉ thấy base64 blob + FromBase64String generic -> Sigma keyword MISS.
+        # --------------------------------------------------------
+        $credPayload = -join ($credBytes | ForEach-Object { [char]$_ })
+        $credB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($credPayload))
         $scriptB = @"
 Write-Host '${DemoTag}_PHASE5_EVASION_B_$RunId'
-# Tier 2 — char codes for 'sekurlsa'
-`$bytes = @(115,101,107,117,114,108,115,97)
-`$prefix = -join (`$bytes | ForEach-Object { [char]`$_ })
-`$suffix = '::log' + 'onpasswords'
-`$assembled = `$prefix + `$suffix
-Write-Host 'Tier 2 char-code:' `$assembled
+`$enc = '$credB64'
+`$dec = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String(`$enc))
+Write-Host 'Tier 3 keyword length:' `$dec.Length
+# LAB-SAFE: in length, không eval/IEX
 "@
-        Write-Action "Variant B (Tier 2): char-code reconstruct 'sekurlsa'" "không có literal anywhere"
+        Write-Action "Variant B (Tier 3): base64-encoded cred-dump (build-time char-code)" "Parent + Child 4104 đều KHÔNG có literal Sigma keyword"
         Invoke-If { try { $sb = [scriptblock]::Create($scriptB); & $sb } catch { } }
 
-        # Variant C — Tier 2: format string
+        # --------------------------------------------------------
+        # Variant C — Tier 2: reverse-string reconstruct
+        # Source chứa 'sdrowssapnogol::aslrukes' (đảo ngược) -> Sigma keyword MISS,
+        # khác cách build với Variant A/B để RED phải generalize.
+        # --------------------------------------------------------
         $scriptC = @"
 Write-Host '${DemoTag}_PHASE5_EVASION_C_$RunId'
-`$built = '{0}{1}::{2}{3}' -f 'sek','urlsa','log','onpasswords'
-Write-Host 'Tier 2 format-string:' `$built
+`$rev = 'sdrowssapnogol::aslrukes'
+`$kw  = -join (`$rev[(`$rev.Length-1)..0])
+Write-Host 'Tier 2 reverse-string keyword hash:' (`$kw.GetHashCode())
 "@
-        Write-Action "Variant C (Tier 2): '{0}{1}::{2}{3}' -f format" "format string fragmentation"
+        Write-Action "Variant C (Tier 2): reverse-string -> cred-dump keyword" "Source chứa chuỗi đảo, Sigma MISS"
         Invoke-If { try { $sb = [scriptblock]::Create($scriptC); & $sb } catch { } }
     }
 }
@@ -423,31 +484,36 @@ if (Should-Run 6) {
         Write-Action "Skip — LOLBins không có equivalent benign rõ ràng"
     }
     elseif ($Mode -in "baseline","chain","evasion") {
-        # Variant A — mshta javascript [1.4.6 LotL]
-        $mshtaJs = "javascript:close(new ActiveXObject('WScript.Shell').Run('cmd /c echo ${DemoTag}_PHASE6_MSHTA_$RunId > C:\Users\Public\mshta_marker_$RunId.txt', 0, true))"
-        Write-Action "Variant A [1.4.6 LotL]: mshta.exe javascript:" "T1218.005 — Sigma fires mshta + javascript"
-        Invoke-If {
-            Start-Process mshta.exe -ArgumentList $mshtaJs -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue |
-                Select-Object -ExpandProperty Id |
-                ForEach-Object { Write-Host "     mshta PID: $_" -ForegroundColor Green }
-        }
+        if (Use-NoisySigma) {
+            # Variant A — mshta javascript [1.4.6 LotL]
+            $mshtaJs = "javascript:close(new ActiveXObject('WScript.Shell').Run('cmd /c echo ${DemoTag}_PHASE6_MSHTA_$RunId > C:\Users\Public\mshta_marker_$RunId.txt', 0, true))"
+            Write-Action "Variant A [1.4.6 LotL]: mshta.exe javascript:" "Noisy: Sigma/Defender often catch this exact pattern"
+            Invoke-If {
+                Start-Process mshta.exe -ArgumentList $mshtaJs -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty Id |
+                    ForEach-Object { Write-Host "     mshta PID: $_" -ForegroundColor Green }
+            }
 
-        # Variant B — regsvr32 Squiblydoo [1.4.6 LotL]
-        Write-Action "Variant B [1.4.6 LotL]: regsvr32 /s /n /u /i scrobj.dll (Squiblydoo)" "T1218.010"
-        Invoke-If {
-            Start-Process regsvr32.exe -ArgumentList "/s","/n","/u","/i:C:\Windows\System32\scrobj.dll" `
-                -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue |
-                Select-Object -ExpandProperty Id |
-                ForEach-Object { Write-Host "     regsvr32 PID: $_" -ForegroundColor Green }
-        }
+            # Variant B — regsvr32 Squiblydoo [1.4.6 LotL]
+            Write-Action "Variant B [1.4.6 LotL]: regsvr32 /s /n /u /i scrobj.dll (Squiblydoo)" "Noisy: Sigma has dedicated Squiblydoo rules"
+            Invoke-If {
+                Start-Process regsvr32.exe -ArgumentList "/s","/n","/u","/i:C:\Windows\System32\scrobj.dll" `
+                    -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty Id |
+                    ForEach-Object { Write-Host "     regsvr32 PID: $_" -ForegroundColor Green }
+            }
 
-        # Variant C — rundll32 javascript [1.4.6 LotL]
-        Write-Action "Variant C [1.4.6 LotL]: rundll32.exe javascript:" "T1218.011"
-        Invoke-If {
-            $rundllArg = "javascript:`"\..\mshtml,RunHTMLApplication `";document.write('${DemoTag}_PHASE6_RUNDLL_$RunId');close();"
-            Start-Process rundll32.exe -ArgumentList $rundllArg -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue |
-                Select-Object -ExpandProperty Id |
-                ForEach-Object { Write-Host "     rundll32 PID: $_" -ForegroundColor Green }
+            # Variant C — rundll32 javascript [1.4.6 LotL]
+            Write-Action "Variant C [1.4.6 LotL]: rundll32.exe javascript:" "Noisy: Defender signature Powessere.G in this lab"
+            Invoke-If {
+                $rundllArg = "javascript:`"\..\mshtml,RunHTMLApplication `";document.write('${DemoTag}_PHASE6_RUNDLL_$RunId');close();"
+                Start-Process rundll32.exe -ArgumentList $rundllArg -WindowStyle Hidden -PassThru -ErrorAction SilentlyContinue |
+                    Select-Object -ExpandProperty Id |
+                    ForEach-Object { Write-Host "     rundll32 PID: $_" -ForegroundColor Green }
+            }
+        }
+        else {
+            Write-Action "Skip mshta/regsvr32/rundll32 in default evasion" "Avoid dedicated Sigma LOLBin rules and Defender command-line signatures"
         }
 
         # Variant D — DNS tunneling marker [1.4.3 Encryption/Tunneling]
@@ -550,7 +616,7 @@ Write-Host "  Marker  : ${DemoTag}_PHASE*_$RunId"
 Write-Host ""
 Write-Host "  Search trong Kibana:"
 Write-Host "    1. logs-winlog* -> tìm theo RunId '$RunId'"
-Write-Host "       (Sysmon EID 1/11/13/22 + PS 4104 + WMI 19/20/21)"
+Write-Host "       (Sysmon EID 1/11/13/22 + PS 4104; WMI 19/20/21 nếu chain/noisy)"
 
 # Kỳ vọng Sigma & RED tùy Mode — không hard-code 1 câu cho mọi mode
 switch ($Mode) {
@@ -564,9 +630,15 @@ switch ($Mode) {
         Write-Host "    3. red-alerts*     -> RED ML score ≈ 1.0 (cùng rule với Sigma)"
     }
     "evasion" {
-        Write-Host "    2. Security/Alerts -> Sigma SILENT trên biến thể né rule ❌"
-        Write-Host "       (-e shorthand / split string / RunOnce — literal không khớp)"
-        Write-Host "    3. red-alerts*     -> RED ML vẫn CATCH ✅ (điểm bán hàng)"
+        if ($IncludeNoisySigma) {
+            Write-Host "    2. Security/Alerts -> Sigma sẽ FIRE noisy techniques đã bật"
+            Write-Host "       (-e child PS / WMI / LOLBins dùng để show defense-in-depth)"
+        }
+        else {
+            Write-Host "    2. Security/Alerts -> Sigma-low evasion: đã bỏ child -e, WMI loop, LOLBins"
+            Write-Host "       Nếu chạy qua SSH vẫn có thể thấy SSH parent/non-interactive alerts."
+        }
+        Write-Host "    3. red-alerts*     -> RED ML catch obfuscation/marker variants ✅"
     }
     "chain" {
         Write-Host "    2. Security/Alerts -> Sigma FIRE phần baseline, MISS phần evasion"
@@ -611,7 +683,7 @@ if (-not $DryRun) {
     Start-Job -ScriptBlock $cleanupBlock `
         -ArgumentList $DemoTag, $RunId, $SleepSeconds, $WmiFilterName, $WmiConsumerName | Out-Null
     Write-Host ""
-    Write-Host "  Auto-cleanup sau $($SleepSeconds + 60) giây (incl. WMI persistence)." -ForegroundColor DarkGray
+    Write-Host "  Auto-cleanup sau $($SleepSeconds + 60) giây (files/RunOnce/WMI nếu có)." -ForegroundColor DarkGray
 }
 
 Write-Host ""
