@@ -317,21 +317,49 @@ Supervisor (no tools) → Triage (3 tools)
 - Real mode: `export VR_USE_REAL=1 VR_API_CONFIG=...` + `pip install pyvelociraptor grpcio pyyaml` + điền `vr_client_map.yaml`
 - **Verified 2026-05-17**: pipeline 8-agent chạy với REAL Velociraptor query Windows VM (DESKTOP-2UQB61H, C.1b622eacffe8b75d), scan 166 real processes, agent honest verdict `inconclusive` khi không tìm thấy alert PID → **kháng hallucination measurable**
 
-**Velociraptor lab setup** (đã verify hoạt động):
+**Velociraptor lab setup** (đã verify hoạt động — updated 2026-05-23):
 - Server binary: `/usr/local/bin/velociraptor` (chạy systemd `velociraptor_server.service`)
 - Server config (root): `/etc/velociraptor/server.config.yaml`
 - User-owned configs: `~/velociraptor/{server,client,api}.config.yaml`
+- Project api.config: `velociraptor/api.config.yaml` (trong repo, dùng cho gRPC)
 - Datastore: `/var/lib/velociraptor` (owned by `velociraptor` user, 0750)
-- Server IP: `10.10.20.20`, frontend `:8000`, GUI `:8889`, API gRPC `:8001`
-- GUI admin: user `admin` / pass `tzxr` (lab only, đổi cho prod)
-- API user (cho agent): `agent` (role administrator) — phải tạo qua `user add` + restart server
-- Cần restart `velociraptor_server` sau khi `user add` để pick up user mới
-- API config required field `name` = API user (vd `agent`), NOT TLS hostname (TLS hardcoded `VelociraptorServer`)
+- Server IP: `127.0.0.1:8001` (gRPC API, localhost only), GUI `:8889`
+- GUI admin: user `admin` / pass `tzxr` (lab only)
+- API config required field `name` = username GUI (vd `admin`), NOT TLS hostname
+- TLS hostname hardcoded `VelociraptorServer` (trong grpc ssl_target_name_override)
+- **api.config.yaml hết hạn / sai CA** — regenerate bằng:
+  ```python
+  import yaml, os, tempfile, subprocess
+  with open('velociraptor/server.config.yaml') as f:
+      cfg = yaml.safe_load(f)
+  tmpdir = tempfile.mkdtemp()
+  os.makedirs(f"{tmpdir}/users", exist_ok=True)
+  cfg['Datastore']['location'] = tmpdir
+  tmp_cfg = f"{tmpdir}/server.config.yaml"
+  with open(tmp_cfg, 'w') as f: yaml.dump(cfg, f)
+  subprocess.run(['/usr/local/bin/velociraptor', '--config', tmp_cfg,
+                  'config', 'api_client', '--name', 'admin',
+                  '--role', 'administrator', 'velociraptor/api.config.yaml'])
+  ```
+  Lý do dùng tmpdir: `/var/lib/velociraptor/users` owned by `velociraptor` user → permission denied nếu chạy với user thường.
 
-**VQL pattern dùng trong vr_client.py**:
-- `collect_client(artifacts=['X'], timeout=60)` → flow_id
-- `watch_monitoring(artifact='System.Flow.Completion') WHERE FlowId = flow.flow_id LIMIT 1` → đợi flow xong
-- `source(client_id, flow_id, artifact='X')` → đọc kết quả
+**Velociraptor client_id mapping** (`agent/vr_client_map.yaml`):
+- `DESKTOP-2UQB61H: C.1b622eacffe8b75d` — demo VM cũ (10.10.20.x lab)
+- `DESKTOP-IQAM883: C.cd6bfbb23aee7979` — demo VM mới (192.168.10.103)
+- Tìm client_id mới: `curl -sk -u "admin:tzxr" "https://127.0.0.1:8889/api/v1/SearchClients?query=all"`
+
+**VQL pattern dùng trong vr_client.py** ⚠️ CRITICAL BUG đã fix 2026-05-23:
+- `LET _wait <= SELECT * FROM watch_monitoring(...)` là **lazy evaluation** — không bao giờ thực thi nếu `_wait` không được reference trong SELECT cuối. → **Lỗi**: 0 process trả về.
+- **Fix đúng**: dùng `foreach(row={watch_monitoring(...)}, query={source(...)})` — đảm bảo watch_monitoring thực thi trước khi source đọc kết quả.
+- Pattern chuẩn (đã apply cho cả 4 VQL trong vr_client.py):
+  ```sql
+  LET flow <= collect_client(client_id=ClientId, artifacts=['X'], timeout=60)
+  SELECT ... FROM foreach(
+      row={SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
+           WHERE FlowId = flow.flow_id LIMIT 1},
+      query={SELECT ... FROM source(client_id=ClientId, flow_id=flow.flow_id, artifact='X')}
+  )
+  ```
 - VQL của Velociraptor KHÔNG hỗ trợ subquery `IN { SELECT ... }` → filter trong Python
 - Artifacts dùng: `Windows.System.Pslist`, `Windows.Registry.NTUser`, `Windows.Network.NetstatEnriched`
 
@@ -576,7 +604,7 @@ sleep 90
 - Nếu accuracy giảm > 5% → revert tokenizer hoặc dùng dual-tokenization (keep both old + new tokens)
 - Cosine catalog có thể tăng lên ~1,500 rule (từ 1,367) sau Fix #4 — KHÔNG cần lo nếu < 2,000
 
-### Files khác đã update trong session này
+### Files khác đã update trong session này (2026-05-20)
 
 - `demo/apt_demo_scenario.md` — giải thích từng phase + Sigma rule match
 - `demo/apt_demo_scenario_demo_present.md` — hướng dẫn defense step-by-step + Phụ lục A Velociraptor
@@ -586,3 +614,106 @@ sleep 90
 - `agent/agents/{forensic,response,report}.py` — Forensic Agent + integration
 - `agent/vr_client.py` — Velociraptor gRPC wrapper
 - `red/rule_metadata.py` — SigmaRuleIndex enrichment
+
+---
+
+## ⏳ HANDOFF — Work-in-progress 2026-05-23 (IQAM883 lab + Elastic Agent ECS)
+
+### Môi trường lab mới (DESKTOP-IQAM883)
+
+Session này chuyển sang lab environment mới hoàn toàn:
+
+| Thành phần | Lab cũ (2026-05-20) | Lab mới (2026-05-23) |
+|---|---|---|
+| Windows VM | DESKTOP-2UQB61H | **DESKTOP-IQAM883** (192.168.10.103) |
+| ELK host | http://10.10.20.100:9200 | **https://192.168.10.10:9200** (HTTPS!) |
+| Kibana | http://10.10.20.100:5601 | https://192.168.10.10:5601 |
+| Agent trên Windows | Winlogbeat | **Elastic Agent v9.4.1** |
+| SSH | sshpass + openssh | **paramiko** (Python) |
+| VR client_id | C.1b622eacffe8b75d | **C.cd6bfbb23aee7979** |
+| Branch git | main | **elk_server** |
+
+### ✅ Fixes đã apply và commit (branch: elk_server)
+
+| Fix | File | Chi tiết |
+|---|---|---|
+| **VQL foreach** | `agent/vr_client.py` | `LET _wait` lazy eval → `foreach(row={watch_monitoring}, query={source()})`. Trước: 0 process; sau: 129 process. |
+| **IQAM883 VR map** | `agent/vr_client_map.yaml` | Thêm `DESKTOP-IQAM883: C.cd6bfbb23aee7979` |
+| **ForensicEvidence.kind** | `agent/schemas.py` | Mở rộng Literal: thêm `alert_correlation`, `sigma_rules`, `threat_intel`, `wmi` |
+| **HTTPS SSL verify** | `es_io.py`, `tools.py`, `inject_test_alert.py`, `detect_live.py` | `verify=ES_VERIFY` (từ `ES_VERIFY_SSL=false` trong .env) + suppress InsecureRequestWarning |
+| **Elastic Agent ECS** | `config/powershell.yaml` | Thêm `powershell.file.script_block_text` (primary) trước `winlog.event_data.ScriptBlockText` |
+| **Elastic Agent ECS** | `config/registry_event.yaml` | Thêm `registry.path` + `registry.data.strings` (list→join) trước Winlogbeat fields |
+| **extract_field list** | `scripts/detect_live.py` | Xử lý field là list (registry.data.strings) → join thành string |
+| **New demo guide** | `demo/apt_demo_scenario_demo_present_2.md` | File mới cho IQAM883, Elastic Agent, HTTPS ELK |
+
+### Elastic Agent ECS vs Winlogbeat field mapping
+
+Elastic Agent v9+ dùng ECS (Elastic Common Schema) — **khác hoàn toàn** Winlogbeat:
+
+| Sysmon field | Winlogbeat path | Elastic Agent ECS path |
+|---|---|---|
+| ScriptBlockText | `winlog.event_data.ScriptBlockText` | `powershell.file.script_block_text` |
+| TargetObject (registry key) | `winlog.event_data.TargetObject` | `registry.path` |
+| Details (registry value) | `winlog.event_data.Details` | `registry.data.strings` (LIST, không phải string!) |
+| CommandLine | `winlog.event_data.CommandLine` | `process.command_line` |
+| Image | `winlog.event_data.Image` | `process.executable` |
+| ParentImage | `winlog.event_data.ParentImage` | `process.parent.executable` |
+
+**`registry.data.strings` là list** → detect_live.py `extract_field()` phải join thành string.
+
+Config `event_field_map` trong YAML phải list cả 2 path (ECS primary, Winlogbeat fallback).
+
+### Clock skew: Windows @timestamp vs Ubuntu UTC
+
+**Vấn đề**: Windows VM múi giờ UTC+7. `Get-Date` hiện giờ local, nhưng Elastic Agent ghi `@timestamp` = giờ local của Windows (không phải UTC thật). Kết quả: event lúc demo 21:07 Ubuntu UTC → `@timestamp` = 14:07 UTC trong ES (lệch 7 tiếng).
+
+**Workaround khi start detect_live**:
+```bash
+# Tính Windows-time: lấy Ubuntu UTC trừ 7 giờ, set --since
+# Ubuntu UTC: date -u → 2026-05-22T21:07:00Z
+# Windows-time: 2026-05-22T14:07:00Z → dùng 13:30 cho safe margin
+python3 scripts/detect_live.py --config config/process_creation.yaml \
+  --since "2026-05-22T13:30:00Z" ...
+```
+
+**Fix lâu dài**: sync NTP trên Windows VM:
+```powershell
+w32tm /config /manualpeerlist:"pool.ntp.org" /syncfromflags:manual /reliable:YES /update
+w32tm /resync /force
+```
+
+### Elastic Agent OTel collector freeze bug
+
+**Triệu chứng**: `elastic-agent` service RUNNING nhưng events ngừng đến ES. Sub-process `elastic-otel-collector.exe` bị freeze (không crash, không restart). Log file dừng update.
+
+**Kiểm tra**: xem log file mới nhất trong `C:\Program Files\Elastic\Agent\data\elastic-agent-*\logs\`:
+- Nếu log `elastic-otel-collector-*.log` có dòng "Shutdown complete" → sub-process đã die
+- Nếu log không update trong > 5 phút → freeze
+
+**Fix**: Phải stop + start service (restart không đủ vì sub-process không respawn):
+```powershell
+sc stop "Elastic Agent"
+# Đợi 5-10s
+sc start "Elastic Agent"
+```
+
+### Kết quả demo thực tế 2026-05-23
+
+- **detect_live**: 1,026 alerts generated (process_creation + registry_event + powershell)
+- **AI Agent run**: INV-c48334e770f9, severity=CRITICAL, 252s, $0.076, `confirmed_malicious`
+- **Velociraptor**: 129 real processes scanned từ DESKTOP-IQAM883 (sau VQL foreach fix)
+- **ForensicOutput**: `evidence_grade=high`, `c2_confirmed=True` (network connection thấy)
+
+### ⏭️ Việc tiếp theo
+
+1. **Merge elk_server → main** khi sẵn sàng (hoặc giữ tách biệt nếu lab env khác nhau)
+2. **NTP sync** Windows VM DESKTOP-IQAM883 để fix clock skew vĩnh viễn
+3. **Verify PowerShell + Registry alerts**: chạy `--since` đúng window, check `powershell.file.script_block_text` có được index không
+4. **Còn pending từ 2026-05-20**: retrain Stage 1+2 sau Fix #1/#2/#4 vẫn chưa verify đầy đủ trên IQAM883 environment
+
+### Files chính cần đọc khi resume
+
+- `demo/apt_demo_scenario_demo_present_2.md` — hướng dẫn demo đầy đủ cho IQAM883 (thay thế _present.md cũ)
+- `agent/vr_client.py` — VQL queries (đã fix foreach)
+- `config/{powershell,registry_event}.yaml` — ECS field mapping
+- `.env` — `ES_VERIFY_SSL=false`, `VR_API_CONFIG` absolute path, `VR_USE_REAL=1`
