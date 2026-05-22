@@ -38,6 +38,10 @@ def extract_field(event: dict, paths: list) -> str:
             obj = obj.get(key) if isinstance(obj, dict) else None
         if obj and isinstance(obj, str):
             return obj
+        if obj and isinstance(obj, list):
+            joined = " ".join(str(x) for x in obj if x)
+            if joined:
+                return joined
     return ""
 
 

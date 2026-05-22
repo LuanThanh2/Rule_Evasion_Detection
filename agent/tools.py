@@ -22,6 +22,7 @@ ES_USER = os.environ.get("ES_USER", "elastic")
 ES_PASSWORD = os.environ.get("ES_PASSWORD", "")
 ES_AUTH = (ES_USER, ES_PASSWORD) if ES_PASSWORD else None
 ES_RED_INDEX = os.environ.get("ES_RED_INDEX", "red-alerts")
+ES_VERIFY = os.environ.get("ES_VERIFY_SSL", "true").lower() != "false"
 
 
 # ── Tool implementations ──────────────────────────────────────────
@@ -52,7 +53,7 @@ def query_es_history(host: str, hours: int = 24) -> dict:
     try:
         r = requests.get(
             f"{ES_HOST}/{ES_RED_INDEX}/_search",
-            json=query, auth=ES_AUTH, timeout=10,
+            json=query, auth=ES_AUTH, timeout=10, verify=ES_VERIFY,
         )
         hits = r.json().get("hits", {}).get("hits", [])
         return {"count": len(hits), "alerts": [h["_source"] for h in hits]}

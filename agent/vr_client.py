@@ -195,25 +195,33 @@ _VQL_PROCESS_TREE = """
 LET flow <= collect_client(client_id=ClientId,
                             artifacts=['Windows.System.Pslist'],
                             timeout=60)
-LET _wait <= SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
-             WHERE FlowId = flow.flow_id LIMIT 1
 SELECT Pid, Name, Exe, CommandLine, Username, Ppid,
        Authenticode.Trusted AS Trusted,
        Authenticode.IssuerName AS Publisher,
        CreateTime
-FROM source(client_id=ClientId, flow_id=flow.flow_id,
-            artifact='Windows.System.Pslist')
+FROM foreach(
+    row={SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
+         WHERE FlowId = flow.flow_id LIMIT 1},
+    query={SELECT Pid, Name, Exe, CommandLine, Username, Ppid,
+                  Authenticode.Trusted AS Trusted,
+                  Authenticode.IssuerName AS Publisher,
+                  CreateTime
+           FROM source(client_id=ClientId, flow_id=flow.flow_id,
+                       artifact='Windows.System.Pslist')}
+)
 """
 
 _VQL_STARTUP_ITEMS = """
 LET flow <= collect_client(client_id=ClientId,
                             artifacts=['Windows.Sys.StartupItems'],
                             timeout=60)
-LET _wait <= SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
-             WHERE FlowId = flow.flow_id LIMIT 1
 SELECT *
-FROM source(client_id=ClientId, flow_id=flow.flow_id,
-            artifact='Windows.Sys.StartupItems')
+FROM foreach(
+    row={SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
+         WHERE FlowId = flow.flow_id LIMIT 1},
+    query={SELECT * FROM source(client_id=ClientId, flow_id=flow.flow_id,
+                                artifact='Windows.Sys.StartupItems')}
+)
 LIMIT 200
 """
 
@@ -225,14 +233,18 @@ LET flow <= collect_client(client_id=ClientId,
                                 Calculate_Hash='Y'
                             )),
                             timeout=90)
-LET _wait <= SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
-             WHERE FlowId = flow.flow_id LIMIT 1
 SELECT OSPath AS FullPath, Size,
        MTime AS Modified,
        BTime AS Created,
        Hash.SHA256 AS SHA256
-FROM source(client_id=ClientId, flow_id=flow.flow_id,
-            artifact='Windows.Search.FileFinder')
+FROM foreach(
+    row={SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
+         WHERE FlowId = flow.flow_id LIMIT 1},
+    query={SELECT OSPath AS FullPath, Size,
+                  MTime AS Modified, BTime AS Created, Hash.SHA256 AS SHA256
+           FROM source(client_id=ClientId, flow_id=flow.flow_id,
+                       artifact='Windows.Search.FileFinder')}
+)
 LIMIT 100
 """
 
@@ -240,15 +252,20 @@ _VQL_NETSTAT = """
 LET flow <= collect_client(client_id=ClientId,
                             artifacts=['Windows.Network.NetstatEnriched'],
                             timeout=60)
-LET _wait <= SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
-             WHERE FlowId = flow.flow_id LIMIT 1
 SELECT Pid, Name AS ProcessName, Status,
        Laddr.IP AS LocalIP, Laddr.Port AS LocalPort,
        Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort
-FROM source(client_id=ClientId, flow_id=flow.flow_id,
-            artifact='Windows.Network.NetstatEnriched')
-WHERE Status = 'ESTABLISHED'
-  AND NOT (RemoteIP =~ '^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|127\\.|169\\.254\\.)')
+FROM foreach(
+    row={SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
+         WHERE FlowId = flow.flow_id LIMIT 1},
+    query={SELECT Pid, Name AS ProcessName, Status,
+                  Laddr.IP AS LocalIP, Laddr.Port AS LocalPort,
+                  Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort
+           FROM source(client_id=ClientId, flow_id=flow.flow_id,
+                       artifact='Windows.Network.NetstatEnriched')
+           WHERE Status = 'ESTABLISHED'
+             AND NOT (RemoteIP =~ '^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|127\\.|169\\.254\\.)')}
+)
 LIMIT 100
 """
 

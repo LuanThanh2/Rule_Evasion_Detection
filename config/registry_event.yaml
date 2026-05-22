@@ -16,10 +16,12 @@ data:
     - EventType
   event_field_map:
     TargetObject:
-      - winlog.event_data.TargetObject
+      - registry.path                    # Elastic Agent ECS (primary)
+      - winlog.event_data.TargetObject   # Winlogbeat / legacy
       - Details.RegKey
     Details:
-      - winlog.event_data.Details
+      - registry.data.strings            # Elastic Agent ECS (list → join, primary)
+      - winlog.event_data.Details        # Winlogbeat / legacy
       - Details.Details
     Image:
       - process.executable

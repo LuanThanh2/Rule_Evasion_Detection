@@ -69,7 +69,7 @@ class MitreOutput(BaseModel):
 
 class ForensicEvidence(BaseModel):
     """1 mảnh bằng chứng từ host (process / file / registry / network)."""
-    kind: Literal["process", "file", "registry", "network"]
+    kind: Literal["process", "file", "registry", "network", "alert_correlation", "sigma_rules", "threat_intel", "wmi"]
     description_vi: str
     raw: dict = Field(default_factory=dict)
     severity_contribution: Literal["high", "medium", "low", "exonerating"] = "medium"

@@ -22,6 +22,10 @@ ES_PASSWORD = os.environ.get("ES_PASSWORD", "")
 ES_AUTH = (ES_USER, ES_PASSWORD) if ES_PASSWORD else None
 ES_RED_INDEX = os.environ.get("ES_RED_INDEX", "red-alerts")
 ES_AI_INDEX = os.environ.get("ES_AI_INDEX", "ai-investigations")
+ES_VERIFY = os.environ.get("ES_VERIFY_SSL", "true").lower() != "false"
+if not ES_VERIFY:
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 STATE_FILE = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -124,7 +128,7 @@ AI_INDEX_MAPPING = {
 # ── Index management ────────────────────────────────────────────────
 def ensure_ai_index() -> bool:
     """Tạo ai-investigations index với mapping nếu chưa có."""
-    r = requests.head(f"{ES_HOST}/{ES_AI_INDEX}", auth=ES_AUTH, timeout=5)
+    r = requests.head(f"{ES_HOST}/{ES_AI_INDEX}", auth=ES_AUTH, timeout=5, verify=ES_VERIFY)
     if r.status_code == 200:
         logger.debug("Index %s đã tồn tại", ES_AI_INDEX)
         return True
@@ -135,6 +139,7 @@ def ensure_ai_index() -> bool:
             auth=ES_AUTH,
             json=AI_INDEX_MAPPING,
             timeout=10,
+            verify=ES_VERIFY,
         )
         if r2.ok:
             logger.info("✓ Index %s created", ES_AI_INDEX)
@@ -155,6 +160,7 @@ def write_investigation(inv: Investigation) -> dict:
         auth=ES_AUTH,
         json=doc,
         timeout=15,
+        verify=ES_VERIFY,
     )
     if not r.ok:
         raise RuntimeError(f"Index failed ({r.status_code}): {r.text}")
@@ -281,6 +287,7 @@ def poll_new_alerts(
         auth=ES_AUTH,
         json=query,
         timeout=15,
+        verify=ES_VERIFY,
     )
     if not r.ok:
         raise RuntimeError(f"Poll failed ({r.status_code}): {r.text}")
@@ -300,6 +307,7 @@ def get_alert_by_id(es_id: str) -> Optional[dict]:
         f"{ES_HOST}/{ES_RED_INDEX}/_doc/{es_id}",
         auth=ES_AUTH,
         timeout=10,
+        verify=ES_VERIFY,
     )
     if r.status_code == 404:
         return None
@@ -344,7 +352,7 @@ def reset_state() -> None:
 def check_es_connection() -> bool:
     """Verify ES reachable + credentials đúng."""
     try:
-        r = requests.get(f"{ES_HOST}/_cluster/health", auth=ES_AUTH, timeout=5)
+        r = requests.get(f"{ES_HOST}/_cluster/health", auth=ES_AUTH, timeout=5, verify=ES_VERIFY)
         if r.ok:
             health = r.json()
             logger.info("✓ ES connection OK: cluster=%s status=%s",

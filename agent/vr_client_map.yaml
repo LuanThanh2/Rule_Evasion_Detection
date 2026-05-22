@@ -12,4 +12,5 @@
 
 # VM Windows test (lab 10.10.20.20):
 WIN-01: C.1b622eacffe8b75d            # cho mock alert
-DESKTOP-2UQB61H: C.1b622eacffe8b75d   # tên thật của VM
+DESKTOP-2UQB61H: C.1b622eacffe8b75d   # demo VM cũ
+DESKTOP-IQAM883: C.cd6bfbb23aee7979   # demo VM mới (192.168.10.103, endpoint/123)

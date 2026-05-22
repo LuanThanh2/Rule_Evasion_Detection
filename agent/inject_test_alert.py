@@ -17,7 +17,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import requests
 
-from agent.es_io import ES_HOST, ES_AUTH, ES_RED_INDEX
+from agent.es_io import ES_HOST, ES_AUTH, ES_RED_INDEX, ES_VERIFY
 
 logger = logging.getLogger("inject")
 
@@ -66,6 +66,7 @@ def main():
         auth=ES_AUTH,
         json=alert,
         timeout=10,
+        verify=ES_VERIFY,
     )
     if r.ok:
         result = r.json()

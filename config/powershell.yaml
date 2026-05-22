@@ -20,7 +20,8 @@ data:
   # Mapping Sigma field name → list JSON paths để đọc event/log dict
   event_field_map:
     ScriptBlockText:
-      - winlog.event_data.ScriptBlockText
+      - powershell.file.script_block_text  # Elastic Agent ECS (primary)
+      - winlog.event_data.ScriptBlockText  # Winlogbeat / legacy
       - Details.ScriptBlockText
       - Details.ScriptBlock
       - Details.Cmdline
