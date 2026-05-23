@@ -1027,3 +1027,207 @@ EID 4104 score 0.8264  powershell_script_with_file_upload_capabilities  phase6 r
 - `git push origin elk_server` fail do `origin` HTTPS không có credential helper tương tác.
 - Push thành công bằng URL credential đã có trong `branch.elk_server.remote`.
 - Final status sau push: clean working tree trên branch `elk_server`.
+
+## HANDOFF — Session 2026-05-24 (apt_demo_v2 re-test resolved)
+
+### User issue
+
+User không thấy 6 Sigma target alerts trong Kibana Security Alerts khi chạy
+`apt_demo_v2.ps1 -Mode baseline`, nghi ngờ mapping trong `demo/apt_demo_v2.md`
+không đúng hoặc chưa được kiểm thử lại.
+
+### Work done in this session
+
+Đã thêm script kiểm thử tự động:
+
+```text
+scripts/test_apt_demo_v2.py
+```
+
+Script này làm 4 việc:
+- Load local NDJSON `data/sigma/elastic_rules/windows_sigma_elastic_ecs.ndjson`
+  và verify có đủ 6 target Sigma rule IDs.
+- Gọi Kibana API `/api/detection_engine/rules?rule_id=...` để kiểm tra rule
+  có tồn tại/enabled, index pattern, field profile.
+- Nếu dùng `--run-endpoint`, copy `demo/apt_demo_v2.ps1` sang
+  `192.168.10.103:C:/Users/endpoint/apt_demo_v2.ps1` bằng Paramiko/SFTP, thêm
+  UTF-8 BOM, rồi chạy baseline/evasion với RunId mới.
+- Poll Elasticsearch raw logs `logs-windows.*` theo RunId + live Kibana query
+  nếu rule check chạy được; fallback local NDJSON nếu `--skip-rule-check`. Sau đó
+  poll Security Alerts index `.alerts-security.alerts-*,.siem-signals-*`.
+
+Đã cập nhật:
+
+```text
+demo/apt_demo_v2.md     — thêm mục "Kiem thu lai baseline/evasion"
+requirements.txt        — thêm paramiko
+```
+
+Local verification đã chạy OK:
+
+```bash
+python3 -m py_compile scripts/test_apt_demo_v2.py
+python3 scripts/test_apt_demo_v2.py --check-only --skip-rule-check
+```
+
+Kiểm tra offline NDJSON: đủ 6/6 target rules, `enabled: true`, index
+`["logs-windows.*", "winlogbeat-*"]`, query dùng ECS (`process.*`,
+`powershell.*`).
+
+### Earlier blocker (resolved)
+
+Phiên Codex trước không chạy được end-to-end vì sandbox network bị chặn:
+
+```text
+curl https://192.168.10.10:9200  -> [Errno 1] Operation not permitted
+curl http://192.168.10.10:5601   -> [Errno 1] Operation not permitted
+```
+
+Đây là lỗi permission của sandbox Codex hiện tại, không chứng minh ELK/Kibana
+bị down. Session đang ở `sandbox_mode=workspace-write`, `network restricted`,
+`approval_policy=never`, nên agent không thể xin quyền network.
+
+User dự định chạy lại Codex bằng:
+
+```bash
+codex -a never -s danger-full-access
+```
+
+Sau khi vào phiên mới, cần verify lại network thật. Nếu vẫn lỗi
+`Operation not permitted`, nghĩa là CLI vẫn đang chạy trong môi trường bị chặn
+network hoặc route tới lab không có.
+
+### Commands to run in next session
+
+1. Verify ES/Kibana connectivity:
+
+```bash
+curl -sk -u elastic:'Admin123@' https://192.168.10.10:9200/_cluster/health
+curl -s  -u elastic:'Admin123@' http://192.168.10.10:5601/api/status
+```
+
+Important: Kibana API trong lab IQAM883 là HTTP:
+
+```text
+http://192.168.10.10:5601
+```
+
+Không dùng `https://192.168.10.10:5601` dù `.env` hiện đang có HTTPS.
+
+2. Check target rules in Kibana:
+
+```bash
+cd /home/ubuntu/rule_evasion_detection/Rule_Evasion_Detection
+python3 scripts/test_apt_demo_v2.py \
+  --check-only \
+  --kibana-url http://192.168.10.10:5601 \
+  --http-timeout 10
+```
+
+Expected: 6 dòng `OK`, `enabled=True`/state OK, index có `logs-windows.*`.
+
+3. Run baseline end-to-end:
+
+```bash
+python3 scripts/test_apt_demo_v2.py \
+  --mode baseline \
+  --run-endpoint \
+  --kibana-url http://192.168.10.10:5601 \
+  --wait-raw-seconds 180 \
+  --wait-alert-seconds 420
+```
+
+Expected:
+
+```text
+raw_sigma=PASS
+security_alerts=PASS
+```
+
+4. If baseline was already run manually and user has a RunId:
+
+```bash
+python3 scripts/test_apt_demo_v2.py \
+  --mode baseline \
+  --run-id <RunId> \
+  --kibana-url http://192.168.10.10:5601 \
+  --wait-alert-seconds 420
+```
+
+### How to interpret failures
+
+- `raw_events=0`: script event did not reach `logs-windows.*`; check Elastic
+  Agent, Sysmon EID 1, PowerShell 4104 logging, endpoint clock.
+- `raw_sigma=FAIL` with raw events present: mapping/query mismatch; inspect per
+  phase counts from script output.
+- `raw_sigma=PASS` but `security_alerts=FAIL`: demo generated correct raw event,
+  but Detection Engine did not materialize alerts. Check rule missing/disabled,
+  imported wrong field profile, wrong index pattern, or scheduler lag.
+- `--check-only` shows `fields=ecs`: đúng với lab IQAM883 hiện tại. Script ưu
+  tiên live Kibana query nên raw check khớp rule đang enabled trong Kibana.
+
+### Update — re-test completed in danger-full-access session
+
+Network lab đã hoạt động lại:
+
+```text
+ES https://192.168.10.10:9200/_cluster/health -> status=yellow, reachable
+Kibana http://192.168.10.10:5601/api/status -> overall available
+```
+
+Bug phát hiện trong script test: default local NDJSON trước đó dùng bản
+`windows_sigma_elastic_winlog_raw.ndjson`, nhưng 6 rule đang enabled trong
+Kibana là ECS query (`process.*`, `powershell.*`). Vì vậy baseline RunId
+`5826f4be` ban đầu có Security Alerts 6/6 nhưng `raw_sigma=FAIL` giả.
+
+Fix đã apply:
+- `scripts/test_apt_demo_v2.py`: default NDJSON đổi sang
+  `windows_sigma_elastic_ecs.ndjson`; raw check ưu tiên live Kibana Lucene query.
+- `demo/apt_demo_v2.md`: cập nhật runbook theo ECS/live Kibana query.
+
+Verified sau fix:
+
+| Test | RunId | Result |
+|---|---|---|
+| Baseline | `5826f4be` | raw Sigma 6/6 + Security Alerts 6/6 |
+| Evasion | `b64a6298` | raw Sigma 0/6 + Security Alerts 0/6 |
+| RED live catch evasion | `b64a6298` | `red-alerts-demo` 16 docs + `red-alerts-powershell-demo` 6 docs |
+
+Kết luận: mapping demo đúng. Nếu user không thấy đủ 6 alerts trong Kibana, nguyên
+nhân nhiều khả năng là scheduler lag/time window/filter trong UI, không phải
+`apt_demo_v2.ps1` hay mapping rule.
+
+### Update — demo runbook rewritten + benign mode documented
+
+User yêu cầu viết lại `demo/apt_demo_v2.md` và thêm hướng dẫn demo. Đã rewrite
+file này thành runbook đầy đủ:
+
+- Lab topology IQAM883, demo story, expected results.
+- Phase mapping 6 rule có thêm cột `Benign` / `Baseline` / `Evasion`.
+- Preflight ES/Kibana/SSH/rule check.
+- Fast automated flow với `scripts/test_apt_demo_v2.py`.
+- Manual presenter flow: copy script, dry-run, chạy từng phase, chạy trực tiếp
+  Windows.
+- Hướng dẫn xem Kibana Security Alerts và RED alerts trong Discover.
+- Verified results, troubleshooting, cleanup, short talk track.
+
+Đã thêm `benign` vào `scripts/test_apt_demo_v2.py`:
+
+```text
+--mode benign | baseline | evasion
+```
+
+Ý nghĩa:
+- `benign`: sanity check, 6 target Sigma rules phải 0/6 raw + 0/6 Security Alerts.
+- `baseline`: 6/6 fire.
+- `evasion`: 0/6 target Sigma fire, RED ML catch trong `red-alerts-*`.
+
+Verify nhẹ đã chạy OK:
+
+```bash
+python3 -m py_compile scripts/test_apt_demo_v2.py
+python3 scripts/test_apt_demo_v2.py --mode benign --check-only --skip-rule-check
+```
+
+Chưa chạy full endpoint `--mode benign --run-endpoint` để tránh mất thời gian
+poll; command đã có trong `demo/apt_demo_v2.md`.

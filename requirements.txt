@@ -7,6 +7,7 @@ luqum>=0.13
 scikit-learn-intelex>=2024.0
 tqdm>=4.65
 requests
+paramiko
 
 # Sigma -> Elastic Detection Rules
 sigma-cli>=3.0.2
