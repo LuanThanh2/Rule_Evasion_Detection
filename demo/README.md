@@ -186,6 +186,13 @@ hơn log gốc hoặc cảnh báo RED.
 
 ## 4. Sinh log trên máy Windows
 
+Quick path moi cho demo "baseline 6 Sigma fire / evasion 6 Sigma miss + RED catch":
+
+```text
+demo/apt_demo_v2.ps1
+demo/apt_demo_v2.md
+```
+
 Ba script demo tạo ba loại log khác nhau:
 
 | Script | Loại log RED xử lý | Log cần có | File cấu hình |

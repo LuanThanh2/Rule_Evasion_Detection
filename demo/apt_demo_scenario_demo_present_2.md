@@ -48,6 +48,10 @@
 2. **RED ML** (Stage 1+2, 1,579 Cosine rule) — bắt cả baseline lẫn evasion
 3. **AI Agent** (8 agent, ~250s/alert, ~$0.076 với real VR) — triage + Velociraptor forensic + báo cáo Vietnamese
 
+**Fast-path v2 đã verify**: nếu cần demo ngắn đúng claim "baseline fire đúng 6
+Sigma target rules, evasion miss 6/6 nhưng RED ML vẫn catch", dùng
+`demo/apt_demo_v2.ps1` và mapping/kết quả trong `demo/apt_demo_v2.md`.
+
 ---
 
 ## 2. Pre-demo checklist
