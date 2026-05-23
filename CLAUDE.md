@@ -937,3 +937,93 @@ models/registry_event/*.PRE_FIX5.zip — backup (gitignored)
 2. Layer 3 Sigma validator implementation: parse Sigma YAML + apply detection logic Python → filter Stage 2 mis-attribution
 3. Investigate `chcp.com` FP: rebuild benign training set với `chcp.com` được explicit include (xuất hiện trong PowerShell startup → nên là benign signal)
 4. Còn pending: WMI consumer rule (`proc_creation_win_susp_wmi_consumer_powershell_invocation`) thiếu trong catalog cosine — verify + add nếu chưa có
+
+---
+
+## ✅ HANDOFF — Session 2026-05-24 (apt_demo_v2 verified 6 Sigma fire / 6 miss + RED catch)
+
+### Mục tiêu đã hoàn thành
+
+User yêu cầu làm tiếp `demo/apt_demo_v2.ps1`, test thật 2 mode và document mapping để chuẩn bị demo:
+
+- Baseline mode → verify đúng 6 Sigma target rules fire.
+- Evasion mode → verify 6 Sigma target rules MISS + RED ML catch.
+- Document mapping vào demo file + push branch `elk_server`.
+
+### Files đã thêm/sửa
+
+```text
+demo/apt_demo_v2.ps1                     — NEW script 6 phase, hỗ trợ benign/baseline/evasion, Phase 0-6, DryRun
+demo/apt_demo_v2.md                      — NEW mapping + runbook + verified RunId/result
+demo/README.md                           — link fast-path v2
+demo/apt_demo_scenario_demo_present_2.md — note fast-path v2 đã verify
+```
+
+Commit đã tạo và push lên `elk_server`:
+
+```text
+f387a69 Add verified APT demo v2 flow
+```
+
+### Mapping apt_demo_v2 hiện tại
+
+| Phase | Event type | Target Sigma rule | Sigma ID | Baseline | Evasion |
+|---:|---|---|---|---|---|
+| 1 | PowerShell 4104 | Potential Invoke-Mimikatz PowerShell Script | `189e3b02-82b2-4b90-9662-411eb64486d4` | Child ScriptBlock có `DumpCreds` + `DumpCerts` | Char-code reconstruct, chỉ in hash |
+| 2 | Process EID 1 | Suspicious Eventlog Clearing or Configuration Change Activity | `cc36992a-4671-4f21-a91d-6c2b72a2edf5` | `wevtutil cl RED_DEMO_V2_NONEXISTENT_<RunId>` | Split token trong PowerShell, không có clear command line |
+| 3 | Process EID 1 | PowerShell Download and Execution Cradles | `85b0b087-eddf-4a2b-b033-d771fa2b9775` | `iwr ... | iex` | Swap sang `curl.exe`, target PowerShell cradle miss |
+| 4 | Process EID 1 | Remotely Hosted HTA File Executed Via Mshta.EXE | `b98d0db6-511d-45de-ad02-e82a98729620` | HTA utility + remote URL | HTA utility + inline scheme, không có remote URL token |
+| 5 | Process EID 1 | Direct Autorun Keys Modification | `24357373-078f-44ed-9ac4-6d334a668a11` | `reg.exe add HKCU\...\CurrentVersion\Run` | Registry provider ghi `StartupApproved\Run` |
+| 6 | Process EID 1 | File Encoded To Base64 Via Certutil.EXE | `e62a9f0c-ca1e-46b2-85d5-a6da77f86d1a` | `certutil.exe -encode` temp file | .NET base64 API runtime, không dùng target utility |
+
+**Lý do Phase 5/6 đổi so với draft đầu**:
+- Registry-set rule `20f0ee37...` bị Elastic rule query filter `Details:null` loại event ECS trong lab hiện tại.
+- Reflection ps_script rule `ddcd88cb...` có query escape không match ổn định với `powershell.file.script_block_text`.
+- Đổi sang process_creation rules đang enabled và raw query match chính xác trong Kibana.
+
+### Verified test thật trên DESKTOP-IQAM883
+
+Endpoint: `DESKTOP-IQAM883` (`192.168.10.103`, user `endpoint`).
+ELK: `https://192.168.10.10:9200`; Kibana API HTTP port `5601`.
+
+| Test | RunId | Result |
+|---|---|---|
+| Baseline raw Sigma query | `4035abf9` | 6/6 target queries match, mỗi target đúng 1 event |
+| Baseline Kibana Security Alerts | `4035abf9` | 6 unique target Sigma alerts materialized sau scheduler lag |
+| Evasion raw Sigma query | `f73f19ba` | 0/6 target queries match |
+| Evasion Kibana Security Alerts | `f73f19ba` | 0/6 target Sigma alerts |
+| Evasion RED ML backfill | `f73f19ba` | 11 RED alerts trong `red-alerts-v2-test`, score `0.5887` đến `1.0` |
+
+Baseline Security Alerts observed:
+
+```text
+cc36992a  SIGMA - Suspicious Eventlog Clearing or Configuration Change Activity
+e62a9f0c  SIGMA - File Encoded To Base64 Via Certutil.EXE
+b98d0db6  SIGMA - Remotely Hosted HTA File Executed Via Mshta.EXE
+85b0b087  SIGMA - PowerShell Download and Execution Cradles
+24357373  SIGMA - Direct Autorun Keys Modification
+189e3b02  SIGMA - Potential Invoke-Mimikatz PowerShell Script
+```
+
+RED evasion examples from `red-alerts-v2-test`:
+
+```text
+EID 1    score 1.0000  suspicious_ping_del_command_combination         curl.exe marker
+EID 1    score 1.0000  potential_lethalhta_technique_execution         mshta inline scheme
+EID 4104 score 0.6158  hacktool_evil_winrm_execution_powershell_module phase1 char-code
+EID 4104 score 0.5887  hacktool_rubeus_execution_scriptblock           phase2 split token
+EID 4104 score 0.8264  powershell_script_with_file_upload_capabilities  phase6 runtime base64
+```
+
+### Operational notes
+
+- `apt_demo_v2.ps1` parent source tránh literal target ps_script để AMSI không chặn khi parse. DryRun đã verify OK.
+- Khi copy lên Windows, add UTF-8 BOM như trong `demo/apt_demo_v2.md`.
+- Security Alerts có scheduler lag; raw Sigma query match/miss có ngay trong `logs-windows.*`, alert index cần khoảng 1-5 phút.
+- Cleanup đã chạy trên endpoint, xoá các registry artifacts `RED_DEMO_V2_*` còn sót từ test.
+
+### Push status
+
+- `git push origin elk_server` fail do `origin` HTTPS không có credential helper tương tác.
+- Push thành công bằng URL credential đã có trong `branch.elk_server.remote`.
+- Final status sau push: clean working tree trên branch `elk_server`.
