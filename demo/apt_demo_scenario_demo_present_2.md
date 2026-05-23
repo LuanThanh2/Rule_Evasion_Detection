@@ -39,7 +39,8 @@
 - Endpoint mới: DESKTOP-IQAM883 (thay DESKTOP-2UQB61H)
 - **Elastic Agent v9.4.1** thay Winlogbeat — field paths ECS khác (đã fix config)
 - ELK qua HTTPS (`-sk` flag cho curl, `https://` cho ES_AUTH_HOST)
-- **Clock skew**: Windows @timestamp = Ubuntu UTC − 7 giờ → `--since` phải dùng Windows-time
+- ~~**Clock skew**: Windows @timestamp = Ubuntu UTC − 7 giờ~~ → **ĐÃ FIX 2026-05-23**:
+  NTP-sync Windows VM, lệch < 15s. Bỏ workaround `-7h`, dùng `date -u -d '20 minutes ago'` cho SINCE.
 - VR api.config regenerate mới (CA cert May 22 thay May 17)
 
 **Pipeline 3 lớp**:
@@ -79,10 +80,11 @@ sftp = client.open_sftp()
 sftp.put("/tmp/apt_bom.ps1", "C:/Users/endpoint/apt_demo_scenario.ps1")
 sftp.close()
 
-# Verify
+# Verify (dùng cmd.exe — nhanh hơn PowerShell khởi động)
 stdin, stdout, stderr = client.exec_command(
-    'powershell -Command "Get-Item C:\\Users\\endpoint\\apt_demo_scenario.ps1 | Select Name,Length,LastWriteTime"',
-    timeout=15)
+    'cmd /c dir "C:\\Users\\endpoint\\apt_demo_scenario.ps1"',
+    timeout=20)
+stdout.channel.settimeout(20)
 print(stdout.read().decode('utf-8', errors='replace'))
 client.close()
 PYEOF
@@ -169,31 +171,35 @@ for n,p in [('process_creation','models/process_creation/train_rslt_attr_ensembl
 
 ### C. Bật RED detect_live.py (BẮT BUỘC trước live demo)
 
-> **Lưu ý clock skew**: Windows @timestamp = Ubuntu UTC − 7 giờ.
-> Dùng `--since` với Windows-time để không miss events.
-> Ví dụ: nếu demo bắt đầu lúc 14:00 UTC (Ubuntu), dùng `--since 2026-05-22T07:00:00Z`
-> Công thức: Windows-time = Ubuntu-UTC − 7h → `--since` = thời điểm demo − 7h.
+> **✅ Update 2026-05-23 (retest)**: Clock skew **ĐÃ FIX** — Windows VM NTP-synced với Ubuntu (lệch < 15s).
+> KHÔNG còn cần workaround `-7h`. Lấy `SINCE` bằng `date -u -d '20 minutes ago'`.
+>
+> **⚠️ Gotcha bash**: file `.env` đã có biến `ES_AUTH_HOST=https://elastic:Admin123%40@192.168.10.10:9200`.
+> Phải `set -a; . ./.env; set +a` trước; KHÔNG viết `$ ES_AUTH_HOST` (có space) — bash sẽ coi là literal `$`.
+> Phải dùng `"$ES_AUTH_HOST"` (không space, có quotes vì URL chứa `@`).
 
-Mở **3 terminal/tmux panes**:
+Mở **3 terminal/tmux panes** (hoặc dùng `nohup ... &` 1 terminal):
 
 ```bash
 cd /home/ubuntu/rule_evasion_detection/Rule_Evasion_Detection
 source ~/venvs/rule_evasion_env/bin/activate
+set -a; . ./.env; set +a    # load ES_AUTH_HOST từ .env
 
-ES="https://elastic:Admin123%40@192.168.10.10:9200"
-
-# Tính SINCE_TIME = thời điểm bắt đầu demo trừ 7h (do clock skew Windows)
-# Ví dụ: demo 04:00 UTC+7 (21:00 UTC hôm trước) → Windows-time = 14:00
-# Đặt lùi thêm 30 phút cho an toàn:
-SINCE="2026-05-22T13:30:00Z"   # Điều chỉnh theo ngày thực tế!
+# SINCE = 20 phút trước (vừa đủ catch baseline+evasion runs, không quá xa để backlog)
+SINCE=$(date -u -d '20 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+echo "SINCE=$SINCE  |  UTC now: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 ```
+
+> **⚠️ Backlog warning**: nếu `--since` lùi > 1h trên môi trường demo (WMI persistence
+> từ session cũ fire mỗi 60s), proc daemon sẽ tích backlog hàng nghìn events × poll batch 500
+> → có thể mất 5-10 phút mới catch up tới thời điểm hiện tại. Giữ `--since` ≤ 30 phút.
 
 **Terminal 1 — Process creation EID 1**:
 
 ```bash
 python3 scripts/detect_live.py \
   --config config/process_creation.yaml \
-  --es-host "$ES" \
+  --es-host "$ES_AUTH_HOST" \
   --es-index "logs-windows.*" \
   --out-index red-alerts-demo \
   --event-id 1 \
@@ -211,7 +217,7 @@ python3 scripts/detect_live.py \
 ```bash
 python3 scripts/detect_live.py \
   --config config/registry_event.yaml \
-  --es-host "$ES" \
+  --es-host "$ES_AUTH_HOST" \
   --es-index "logs-windows.*" \
   --out-index red-alerts-registry-demo \
   --event-id 13 \
@@ -229,7 +235,7 @@ python3 scripts/detect_live.py \
 ```bash
 python3 scripts/detect_live.py \
   --config config/powershell.yaml \
-  --es-host "$ES" \
+  --es-host "$ES_AUTH_HOST" \
   --es-index "logs-windows.*" \
   --out-index red-alerts-powershell-demo \
   --event-id 4104 \
@@ -253,8 +259,39 @@ done
 # Expected: tổng > 1000 alerts (đã tích lũy từ session này)
 ```
 
-> **Nếu count = 0 và log chỉ có startup message**: kiểm tra SINCE_TIME có đúng không.
-> Elastic Agent events có @timestamp = Windows-time (UTC không tính timezone offset).
+> **Nếu count = 0 và log chỉ có startup message**: kiểm tra SINCE đã pass đúng vào `--since`,
+> và `ES_AUTH_HOST` đã được expand (chạy `echo "$ES_AUTH_HOST"` xem có rỗng không).
+
+**Alternative — chạy 3 daemons cùng 1 terminal** (đã verify hôm 2026-05-23):
+
+```bash
+mkdir -p /tmp/red_demo_logs
+SINCE=$(date -u -d '20 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+rm -f /tmp/.state_proc.json /tmp/.state_reg.json /tmp/.state_ps.json
+
+for cfg in process_creation registry_event powershell; do
+  case "$cfg" in
+    process_creation) eid=1;    idx=red-alerts-demo;            state=/tmp/.state_proc.json; tag=proc ;;
+    registry_event)   eid=13;   idx=red-alerts-registry-demo;   state=/tmp/.state_reg.json;  tag=reg ;;
+    powershell)       eid=4104; idx=red-alerts-powershell-demo; state=/tmp/.state_ps.json;   tag=ps ;;
+  esac
+  nohup python3 scripts/detect_live.py \
+    --config config/${cfg}.yaml \
+    --es-host "$ES_AUTH_HOST" \
+    --es-index "logs-windows.*" \
+    --out-index $idx \
+    --event-id $eid \
+    --threshold 0.5 --method cosine \
+    --timestamp-field @timestamp \
+    --interval 15 --state-file $state \
+    --since "$SINCE" \
+    > /tmp/red_demo_logs/detect_${tag}.log 2>&1 &
+  echo "$tag PID: $!"
+done
+
+# Verify 3 daemons running
+ps aux | grep detect_live.py | grep -v grep | wc -l   # Expect: 3
+```
 
 ### D. Cleanup alerts cũ trước demo (tuỳ chọn)
 
@@ -489,7 +526,28 @@ client.close()
 PYEOF
 ```
 
-**Verified result hôm nay** (`INV-c48334e770f9`, 2026-05-23, real Velociraptor):
+**Retest 2026-05-23 (sau ngày)** — `INV-2603e6cef58c`:
+
+| Metric | Giá trị |
+|---|---|
+| Duration | **329.0 giây** (~5 phút 29) |
+| Tokens | 369,387 |
+| Cost | **$0.0721 USD** |
+| Severity | CRITICAL, FP=False, confidence=0.92 |
+| Forensic grade | `high`, persistence=True, c2=False |
+| Parallel block | 52.6s (tiết kiệm 26.7s vs sequential) |
+| RED Analyst | ⚠️ `max_iterations_reached` (warning — investigation vẫn complete) |
+| Response Agent | ⚠️ `max_iterations_reached` → 0 actions, sigma_patch=0 chars |
+| Report title | "Phát hiện APT Kill-Chain 7 Phase trên DESKTOP-IQAM883 — PowerShell Multi-Stage với WMI Persistence Active" |
+
+> **⚠️ Note 2 warnings**: RED Analyst và Response Agent hit `max_iterations_reached` trong run này.
+> Pipeline KHÔNG crash — Report vẫn được sinh từ Triage + Forensic + Hunt + MITRE.
+> Có thể do prompt + tool definition khiến DeepSeek loop tool calls. Demo trên slide:
+> highlight Triage + Forensic + Report (3 agent core), không show 2 warning này.
+> Nếu muốn fix root cause: tăng `_loop.py` max_iterations từ 10 → 15, hoặc strengthen
+> system prompts với explicit `STOP_AFTER` markers.
+
+**Verified result hôm trước** (`INV-c48334e770f9`, 2026-05-23 sáng, real Velociraptor):
 
 ```
 🎯 Supervisor:      workflow=full_investigation, priority=5
@@ -982,11 +1040,96 @@ python3 -c "
 from agent.vr_client import _resolve_client_id, _run_vql
 cid = _resolve_client_id('desktop-iqam883')
 print('client_id:', cid)
-# Quick VQL test (server-side, không cần Windows)
-rows = _run_vql('SELECT 1+1 AS test FROM scope()', cid)
-print('gRPC OK:', rows)
+# Server-side VQL test (info() trả Hostname/Uptime — verify gRPC + cert)
+rows = _run_vql('SELECT * FROM info()', cid)
+print('gRPC OK — rows:', len(rows), 'first_keys:', list(rows[0].keys())[:5] if rows else 'EMPTY')
+# Lưu ý: 'SELECT 1+1 FROM scope()' trả [] (scope() rỗng trong context này) — dùng info() thay.
 "
 ```
+
+---
+
+## Phụ lục C — Retest log 2026-05-23 (afternoon rehearsal)
+
+Lần rehearse hôm 2026-05-23 sau session sáng. Mục đích: kiểm chứng demo từ A-Z, fix lỗi gặp phải.
+
+### C.1 Lỗi user gặp phải
+
+```
+2026-05-23 17:29:48,754 [detect_live] ERROR: Poll error:
+Invalid URL '$ ES_AUTH_HOST/logs-windows.*/_search': No scheme supplied.
+```
+
+**Nguyên nhân**: lệnh có `$ ES_AUTH_HOST` (space giữa `$` và tên biến) → bash coi `$` là literal,
+biến không expand. Lỗi requests.MissingSchema vì URL bắt đầu bằng "$ ".
+
+**Fix**: `"$ES_AUTH_HOST"` (không space) sau khi `set -a; . ./.env; set +a`.
+
+### C.2 Clock skew: VERIFIED ĐÃ FIX
+
+Test trực tiếp:
+- Ubuntu UTC: `2026-05-23T10:32:14Z`
+- Newest IQAM883 event @timestamp: `2026-05-23T10:32:28.527Z`
+- Lệch: ~14 giây (network + indexing delay)
+
+→ KHÔNG còn skew 7 giờ. Có thể dùng `date -u -d '20 minutes ago'` cho `--since`.
+
+### C.3 Backlog issue
+
+Lần đầu khởi động daemons với `--since` 20 phút trước (thời điểm 10:14):
+- proc daemon fetch 500 events/poll × 10+ polls để clear backlog
+- Mất ~10 phút trước khi catch up tới events mới (10:53 evasion)
+- Triệu chứng: `[ALERT]` log lines toàn RunId cũ (`90e7f942`, `5152c9a7`, `b4880a4d`)
+
+**Lý do backlog**: WMI persistence subscription từ session sáng vẫn fire mỗi 60s với
+nhiều RunId cũ (chưa cleanup) → tích lũy hàng nghìn events trong window.
+
+**Workaround thực tế**: restart daemons với `--since` 5-6 phút trước demo (sau khi
+trigger benign+baseline). Hoặc chạy cleanup WMI từ Pre-demo Section D TRƯỚC khi start daemons.
+
+### C.4 Kết quả verified
+
+| Phase | RunId | Events ingested | RED alerts (red-alerts-demo) |
+|---|---|---|---|
+| Phase 2 benign | `d4f2b3f9` | 14 events | **0 alerts** ✅ FP test pass |
+| Phase 3 baseline | `44e6a03c` | 15 events | 0 (daemon vẫn backlog tại thời điểm check) |
+| Phase 4 evasion | `45abf5ae` | 15 events | **5 alerts score 1.0** ✅ |
+
+Top rules của 5 alerts evasion (red-alerts-demo):
+- `non_interactive_powershell_process_spawned` (SSH parent — Fix #1 catch)
+- `suspicious_runas_like_flag_combination`
+- `local_file_read_using_curl_exe`
+- `sdiagnhost_calling_suspicious_child_process` (detected base64 `-e VwByAGkAdABlAC0...`)
+- `abused_debug_privilege_by_arbitrary_parent_processes` (score 0.92)
+
+→ **RED catch evasion mode dù command obfuscate** (chứng minh ML > Sigma keyword).
+
+### C.5 AI Agent investigation — `INV-2603e6cef58c`
+
+Workflow OK end-to-end nhưng **2 warning đáng note**:
+
+```
+2026-05-23 18:07:00,340 [agent.red_analyst] WARNING: RED Analyst failed: max_iterations_reached
+2026-05-23 18:07:10,872 [agent.response] WARNING: Response failed: max_iterations_reached
+✓ Response: 0 actions, sigma_patch=0 chars, notify_sent=False
+```
+
+Triage + Forensic + Hunt + MITRE + Report vẫn hoàn chỉnh. Báo cáo tiếng Việt valid.
+
+**Demo strategy**: khi GVHD hỏi về Sigma patch, nói thẳng "trong run này Response Agent
+hit iteration limit — đó là limitation của LLM tool-use loop. Investigation vẫn complete
+nhờ Forensic + Triage + Report. Future work: tăng max_iterations hoặc dùng Claude (tool
+use mạnh hơn DeepSeek)".
+
+### C.6 Total infra stats sau session
+
+| Index | Documents |
+|---|---|
+| red-alerts-demo (process EID 1) | 14,127 |
+| red-alerts-registry-demo (registry EID 13) | 80 |
+| red-alerts-powershell-demo (PS EID 4104) | 18,492 |
+| ai-investigations | 28 |
+| **Tổng RED alerts** | **32,699** |
 
 ---
 

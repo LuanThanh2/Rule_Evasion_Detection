@@ -663,20 +663,22 @@ Elastic Agent v9+ dùng ECS (Elastic Common Schema) — **khác hoàn toàn** Wi
 
 Config `event_field_map` trong YAML phải list cả 2 path (ECS primary, Winlogbeat fallback).
 
-### Clock skew: Windows @timestamp vs Ubuntu UTC
+### Clock sync: Windows @timestamp vs Ubuntu UTC ✅ RESOLVED 2026-05-23
 
-**Vấn đề**: Windows VM múi giờ UTC+7. `Get-Date` hiện giờ local, nhưng Elastic Agent ghi `@timestamp` = giờ local của Windows (không phải UTC thật). Kết quả: event lúc demo 21:07 Ubuntu UTC → `@timestamp` = 14:07 UTC trong ES (lệch 7 tiếng).
+**Lịch sử**: Trước đây Windows VM ghi `@timestamp` lệch 7 tiếng so với Ubuntu UTC (do múi giờ UTC+7 không sync NTP đúng). Phải dùng workaround `--since` trừ 7h.
 
-**Workaround khi start detect_live**:
+**Hiện tại (2026-05-23)**: NTP đã sync trên Windows VM. Verify:
+- Ubuntu UTC: `2026-05-23T10:23:57Z`
+- Event mới nhất từ DESKTOP-IQAM883: `2026-05-23T10:24:00Z`
+- Lệch ~3s (network + indexing delay) — chấp nhận được
+
+**Cách dùng `--since` đúng**: lấy giờ UTC hiện tại trừ window mong muốn, KHÔNG cần workaround -7h.
 ```bash
-# Tính Windows-time: lấy Ubuntu UTC trừ 7 giờ, set --since
-# Ubuntu UTC: date -u → 2026-05-22T21:07:00Z
-# Windows-time: 2026-05-22T14:07:00Z → dùng 13:30 cho safe margin
-python3 scripts/detect_live.py --config config/process_creation.yaml \
-  --since "2026-05-22T13:30:00Z" ...
+SINCE=$(date -u -d '15 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+python3 scripts/detect_live.py --config config/process_creation.yaml --since "$SINCE" ...
 ```
 
-**Fix lâu dài**: sync NTP trên Windows VM:
+**Nếu skew xuất hiện lại** (Windows VM restart, NTP fail): chạy trên Windows
 ```powershell
 w32tm /config /manualpeerlist:"pool.ntp.org" /syncfromflags:manual /reliable:YES /update
 w32tm /resync /force
@@ -707,7 +709,7 @@ sc start "Elastic Agent"
 ### ⏭️ Việc tiếp theo
 
 1. **Merge elk_server → main** khi sẵn sàng (hoặc giữ tách biệt nếu lab env khác nhau)
-2. **NTP sync** Windows VM DESKTOP-IQAM883 để fix clock skew vĩnh viễn
+2. ~~NTP sync Windows VM~~ ✅ Đã sync 2026-05-23, lệch <3s
 3. **Verify PowerShell + Registry alerts**: chạy `--since` đúng window, check `powershell.file.script_block_text` có được index không
 4. **Còn pending từ 2026-05-20**: retrain Stage 1+2 sau Fix #1/#2/#4 vẫn chưa verify đầy đủ trên IQAM883 environment
 
