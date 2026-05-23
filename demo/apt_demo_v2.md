@@ -491,6 +491,7 @@ Verified tren `DESKTOP-IQAM883`, ngay `2026-05-24` gio VN.
 | Evasion RED ML backfill | `f73f19ba` | 11 RED alerts trong `red-alerts-v2-test`, score `0.5887` den `1.0` |
 | Re-test baseline | `5826f4be` | raw Sigma 6/6 + Security Alerts 6/6 voi live Kibana ECS query |
 | Re-test evasion | `b64a6298` | raw Sigma 0/6 + Security Alerts 0/6; RED live catch 22 alerts |
+| Benign sanity end-to-end | `87d05364` | 21 raw events ingested; raw Sigma 0/6 + Security Alerts 0/6 (PASS = expected) |
 
 Baseline Security Alerts observed:
 
