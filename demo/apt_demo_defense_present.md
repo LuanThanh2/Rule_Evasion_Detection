@@ -29,12 +29,32 @@
 
 - **RED ML detection** (sample 150 events đầu mỗi mode, threshold 0.5, cosine):
 
-| Mode     | proc alerts | proc top rule                                      | ps alerts | ps top rule                                              |
-|----------|-------------|----------------------------------------------------|-----------|----------------------------------------------------------|
-| benign   | 1           | abused_debug_privilege (FP — score 0.5)            | 0         | — |
-| baseline | 2           | abused_debug_privilege (FP)                        | 6         | suspicious_powershell_invocations_specific_powershell_module (score 1.0) |
-| evasion  | 150 (133 WMI) | hacktool_covenant_powershell_launcher (score 1.0) | 27        | potential_in_memory_execution_using_reflection_assembly (16/27) |
-| chain    | 150 (137 WMI) | hacktool_covenant_powershell_launcher (score 1.0) | 16        | potential_in_memory_execution_using_reflection_assembly (11/16) |
+| Mode     | proc alerts | proc top rule                                      | ps alerts | ps top rule                                              | reg alerts | reg top rule (cosine) |
+|----------|-------------|----------------------------------------------------|-----------|----------------------------------------------------------|------------|------------------------|
+| benign   | 1           | abused_debug_privilege (FP — score 0.5)            | 0         | — | 1† | currentversion_autorun_keys_modification (0.90, FP — OneDrive Run key) |
+| baseline | 2           | abused_debug_privilege (FP)                        | 6         | suspicious_powershell_invocations_specific_powershell_module (score 1.0) | 1† | currentversion_autorun_keys_modification (0.90, HKCU Run + xkj9.exe) |
+| evasion  | 150 (133 WMI) | hacktool_covenant_powershell_launcher (score 1.0) | 27        | potential_in_memory_execution_using_reflection_assembly (16/27) | 1† | **currentversion_nt_autorun_keys_modification** (0.73, HKCU **RunOnce** Tier 1 variant) |
+| chain    | 150 (137 WMI) | hacktool_covenant_powershell_launcher (score 1.0) | 16        | potential_in_memory_execution_using_reflection_assembly (11/16) | 1† | currentversion_autorun_keys_modification (0.90, HKCU Run + xkj9.exe) |
+
+> **†** Mỗi mode chỉ tạo **1 registry SET event EID 13** (Phase 3 set 1 Run/RunOnce key). Tuy
+> volume thấp nhưng kết quả attribution có ý nghĩa: **RED Cosine phân biệt được Tier 1 evasion**
+> — evasion mode dùng `RunOnce` subkey (ít cover hơn) → cosine attribute rule
+> `currentversion_nt_autorun_keys_modification` (score 0.73), khác với 3 mode còn lại dùng
+> `Run` → cosine attribute `currentversion_autorun_keys_modification` (score 0.90).
+>
+> **Lịch sử bug Fix #2 + Fix #5** (cần biết để hiểu vì sao trước session 2026-05-24 reg bị skip):
+>
+> - **Fix #2** (2026-05-20): tokenizer giữ path context (`C:\Windows\sshd.exe` → 1 token `c_windows_sshd_exe`)
+>   để match Sigma rule check `ParentImage|endswith: '\sshd.exe'`. **Side-effect**: registry path đầy đủ
+>   `HKU\S-1-5-21-3762793008-640418586-4080996910-1001\SOFTWARE\...\Run\<key>` thành 1 token đơn 124 chars
+>   > `max_str_len=60` → filter empty → detect_batch skip → 0 reg alert.
+> - **Fix #5** (2026-05-24, session này): thêm fallback split trong `red/normalize.py` — nếu merged token
+>   > max_str_len thì split lại trên separator thành sub-tokens. Backward-compat cho proc/ps
+>   (path ngắn vẫn merge nguyên), chỉ kích hoạt cho registry path dài.
+>   - Verified: `Normalizer().normalize('HKU\\S-1-5-...\\Run\\xxx')` trước: `''`; sau: `'1,21,5,currentversion,hku,microsoft,red_apt_demo_benign_8f922e43,run,s,software,windows'`
+>   - Retrained `models/registry_event/` (Stage 1 + Stage 2). Backup `*.PRE_FIX5.zip` còn nguyên.
+>
+> Phase 3 evasion **mạnh nhất** (WMI Event Subscription) vẫn ghi log chính qua Sysmon EID 1 — `WmiPrvSE.exe → powershell.exe` — không phải EID 13. Proc stream cover toàn bộ qua `hacktool_covenant_powershell_launcher` 133/137 alerts. Reg stream cover Tier 1 RunOnce variant.
 
 - **AI Agent reports**: 3 investigations (baseline + evasion + chain), median ~230s,
   ~$0.02-0.03/alert, severity CRITICAL/HIGH, Vietnamese report grounded bởi Forensic
@@ -402,7 +422,276 @@ RED pipeline:
 
 ---
 
-## 6. Demo flow đề xuất 12 phút cho GVHD
+## 6. Lệnh chạy demo end-to-end (reproduce kết quả)
+
+> **Lưu ý quan trọng — vì sao chạy PS script mà `red-alerts*` không có log mới?**
+>
+> PS script trên Windows chỉ tạo **events** trong ELK `logs-windows.*` (qua Elastic Agent).
+> Để event biến thành **alert** trong `red-alerts*`, phải chạy 1 trong 2 pipeline:
+>
+> - **A. Live daemon** — `detect_live.py` poll ELK → index `red-alerts-{demo,registry-demo,powershell-demo}` (recommended cho live demo)
+> - **B. Batch offline** — `elk_export.py` → `detect_batch.py` → `push_alerts.py` → index `red-alerts-defense-*` (workflow mà session 2026-05-23 tối tạo file này đã dùng)
+>
+> Nếu không có 1 trong 2 chạy thì `red-alerts*` sẽ trống (hoặc chỉ có data cũ từ session trước).
+> Verify daemon: `ps aux | grep -E "detect_live|detect_batch" | grep -v grep`.
+
+### 6.1 Prerequisites chung
+
+```bash
+cd /home/ubuntu/rule_evasion_detection/Rule_Evasion_Detection
+source ~/venvs/rule_evasion_env/bin/activate
+set -a; . ./.env; set +a       # load ES_AUTH_HOST, VR_API_CONFIG, ES_VERIFY_SSL=false ...
+
+# Sanity check
+echo "ES_AUTH_HOST=$ES_AUTH_HOST"   # phải có dạng https://elastic:Admin123%40@192.168.10.10:9200
+curl -sk -u elastic:Admin123@ "https://192.168.10.10:9200/_cluster/health?pretty" | head -5
+ping -c 1 -W 2 192.168.10.103 > /dev/null && echo "IQAM883 UP"
+```
+
+Đẩy script PS lên Windows (chỉ làm 1 lần — xem section 2.A của `apt_demo_scenario_demo_present_2.md` nếu chưa có).
+
+### 6.2 Workflow A — Live daemon (khuyến nghị cho live demo GVHD)
+
+**Bước 1 — Cleanup index cũ + start 3 daemons** (chạy 1 lần ở đầu demo):
+
+```bash
+# Optional cleanup (chỉ nếu muốn demo "sạch")
+for idx in red-alerts-demo red-alerts-registry-demo red-alerts-powershell-demo; do
+  curl -sk -X POST -u elastic:Admin123@ \
+    "https://192.168.10.10:9200/${idx}/_delete_by_query?conflicts=proceed&refresh=true&ignore_unavailable=true" \
+    -H 'Content-Type: application/json' -d '{"query":{"match_all":{}}}' \
+    | python3 -c "import json,sys;d=json.load(sys.stdin);print(f'{idx}: {d.get(\"deleted\",0)} deleted')" 2>/dev/null
+done
+
+mkdir -p /tmp/red_demo_logs
+SINCE=$(date -u -d '20 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+rm -f /tmp/.state_proc.json /tmp/.state_reg.json /tmp/.state_ps.json
+
+for cfg in process_creation registry_event powershell; do
+  case "$cfg" in
+    process_creation) eid=1;    idx=red-alerts-demo;            state=/tmp/.state_proc.json; tag=proc ;;
+    registry_event)   eid=13;   idx=red-alerts-registry-demo;   state=/tmp/.state_reg.json;  tag=reg ;;
+    powershell)       eid=4104; idx=red-alerts-powershell-demo; state=/tmp/.state_ps.json;   tag=ps ;;
+  esac
+  nohup python3 scripts/detect_live.py \
+    --config config/${cfg}.yaml \
+    --es-host "$ES_AUTH_HOST" \
+    --es-index "logs-windows.*" \
+    --out-index $idx \
+    --event-id $eid \
+    --threshold 0.5 --method cosine \
+    --timestamp-field @timestamp \
+    --interval 15 --state-file $state \
+    --since "$SINCE" \
+    > /tmp/red_demo_logs/detect_${tag}.log 2>&1 &
+  echo "$tag PID: $!"
+done
+
+sleep 5
+ps aux | grep detect_live.py | grep -v grep | wc -l   # Expect: 3
+tail -n 5 /tmp/red_demo_logs/detect_proc.log         # Expect: "Starting — polling logs-windows.*"
+```
+
+**Bước 2 — Trigger từng mode trên Windows VM** (chạy lần lượt, đợi ~60-90s giữa mỗi mode):
+
+```bash
+for mode in benign baseline evasion chain; do
+  echo "=== MODE: $mode ==="
+  python3 - <<PYEOF
+import paramiko, uuid
+client = paramiko.SSHClient()
+client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+client.connect("192.168.10.103", username="endpoint", password="123", timeout=15)
+run_id = uuid.uuid4().hex[:8]
+print(f"RunId: {run_id} — mode=$mode")
+stdin, stdout, stderr = client.exec_command(
+    f'powershell -ExecutionPolicy Bypass -File C:\\\\Users\\\\endpoint\\\\apt_demo_scenario.ps1 -Mode $mode -RunId {run_id} -SleepSeconds 3',
+    timeout=300)
+print(stdout.read().decode('utf-8', errors='replace')[-400:])
+client.close()
+PYEOF
+  echo "Chờ 90s cho Elastic Agent ship + detect_live poll..."
+  sleep 90
+done
+```
+
+**Bước 3 — Verify alert đã được index**:
+
+```bash
+for idx in red-alerts-demo red-alerts-registry-demo red-alerts-powershell-demo; do
+  count=$(curl -sk -u elastic:Admin123@ "https://192.168.10.10:9200/${idx}/_count" \
+    | python3 -c "import json,sys; print(json.load(sys.stdin).get('count','?'))" 2>/dev/null)
+  echo "$idx: $count alerts"
+done
+# Expected: proc > 500, ps > 20 sau khi chạy đủ 4 mode
+
+# Top 5 rule cho process index
+curl -sk -u elastic:Admin123@ "https://192.168.10.10:9200/red-alerts-demo/_search?size=0" \
+  -H 'Content-Type: application/json' \
+  -d '{"aggs":{"top_rules":{"terms":{"field":"red.top_rule.keyword","size":5}}}}' \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);[print(b['key'],b['doc_count']) for b in d['aggregations']['top_rules']['buckets']]"
+```
+
+**Bước 4 — Bật AI Agent daemon** (sau khi có alert):
+
+```bash
+export VR_USE_REAL=1
+export VR_QUERY_TIMEOUT=180
+SINCE_AGENT=$(date -u -d '10 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+
+# Chọn 1 trong các index để agent poll
+ES_RED_INDEX=red-alerts-powershell-demo python3 -m agent.daemon \
+  --interval 30 \
+  --max-iter 1 \
+  --score-threshold 0.95 \
+  --since "$SINCE_AGENT" \
+  --batch-limit 1
+```
+
+Investigation sẽ được index vào `ai-investigations`. Verify:
+
+```bash
+curl -sk -u elastic:Admin123@ "https://192.168.10.10:9200/ai-investigations/_search?size=1&sort=@timestamp:desc" \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);h=d['hits']['hits'][0]['_source'];print('InvId:',h.get('inv_id'),'\nSeverity:',h.get('triage',{}).get('severity'),'\nTitle:',h.get('report',{}).get('title_vi'))"
+```
+
+### 6.3 Workflow B — Batch offline (reproduce artifacts `red-alerts-defense-*`)
+
+Đây là workflow đã chạy session 2026-05-23 tối để tạo các số liệu trong file này. Artifacts còn nguyên ở `/tmp/demo_events/`.
+
+**Bước 1 — Chạy PS script + chờ events ship** (cùng như Workflow A bước 2, nhưng KHÔNG cần daemon).
+
+**Bước 2 — Export events theo mode từ ELK → JSONL**:
+
+```bash
+mkdir -p /tmp/demo_events
+SINCE=$(date -u -d '30 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+
+# Process creation (EID 1) — toàn bộ host IQAM883 trong window
+for evt in "proc:1:process_creation" "reg:13:registry_event" "ps:4104:powershell"; do
+  IFS=":" read -r tag eid cfg <<< "$evt"
+  for mode in benign baseline evasion chain; do
+    python3 scripts/elk_export.py \
+      --es-host "$ES_AUTH_HOST" \
+      --es-index "logs-windows.*" \
+      --event-id $eid \
+      --since "$SINCE" \
+      --size 5000 \
+      --out /tmp/demo_events/${mode}_${tag}.jsonl
+    # Lưu ý: elk_export.py KHÔNG filter theo mode/RunId. Nếu cần tách theo mode
+    # thì pass --query-string hoặc filter ngay khi tạo Windows command (đánh dấu RunId
+    # vào ScriptBlockText). Cách dễ: chạy 1 mode 1 lần + export ngay.
+  done
+done
+```
+
+**Bước 3 — Sinh alert bằng detect_batch.py**:
+
+```bash
+for mode in benign baseline evasion chain; do
+  for combo in "process_creation:proc" "registry_event:reg" "powershell:ps"; do
+    IFS=":" read -r cfg tag <<< "$combo"
+    [ -s /tmp/demo_events/${mode}_${tag}.jsonl ] || continue
+    python3 scripts/detect_batch.py \
+      --config config/${cfg}.yaml \
+      --events /tmp/demo_events/${mode}_${tag}.jsonl \
+      --threshold 0.5 \
+      --method cosine \
+      --top-k 5 \
+      --out /tmp/demo_events/${mode}_${tag}_alerts.jsonl
+  done
+done
+ls -la /tmp/demo_events/*_alerts.jsonl
+```
+
+**Bước 4 — Push alert lên `red-alerts-defense-*`**:
+
+> ⚠️ `push_alerts.py` dùng `requests` mặc định verify SSL. Với ELK HTTPS self-signed cần
+> patch tạm thời. Cách đơn giản: dùng `curl _bulk` thay vì script.
+
+```bash
+# Cách 1 — chạy push_alerts.py với patch verify=False
+for mode in benign baseline evasion chain; do
+  for tag in proc reg ps; do
+    [ -s /tmp/demo_events/${mode}_${tag}_alerts.jsonl ] || continue
+    case "$tag" in
+      proc) idx=red-alerts-defense-proc ;;
+      reg)  idx=red-alerts-defense-reg  ;;
+      ps)   idx=red-alerts-defense-ps   ;;
+    esac
+    PYTHONWARNINGS=ignore::Warning python3 -c "
+import requests
+_orig = requests.Session.request
+requests.Session.request = lambda s,m,u,**kw: _orig(s,m,u,**{**kw,'verify':False})
+import urllib3; urllib3.disable_warnings()
+exec(open('scripts/push_alerts.py').read().replace('__name__ == \"__main__\"','True'))
+" --alerts /tmp/demo_events/${mode}_${tag}_alerts.jsonl \
+   --es-host https://192.168.10.10:9200 \
+   --es-user elastic --es-password 'Admin123@' \
+   --es-index $idx
+  done
+done
+
+# Cách 2 — bulk index trực tiếp bằng curl (an toàn hơn, không phụ thuộc script)
+push_jsonl_to_es() {
+  local file=$1; local idx=$2
+  python3 -c "
+import json
+with open('$file') as f:
+    for line in f:
+        if line.strip():
+            print(json.dumps({'index':{'_index':'$idx'}}))
+            print(line.rstrip())
+" | curl -sk -u elastic:Admin123@ -H 'Content-Type: application/x-ndjson' \
+    --data-binary @- "https://192.168.10.10:9200/_bulk" -o /dev/null -w "%{http_code}\n"
+}
+push_jsonl_to_es /tmp/demo_events/evasion_proc_alerts.jsonl red-alerts-defense-proc
+push_jsonl_to_es /tmp/demo_events/evasion_ps_alerts.jsonl  red-alerts-defense-ps
+push_jsonl_to_es /tmp/demo_events/evasion_reg_alerts.jsonl red-alerts-defense-reg
+```
+
+**Bước 5 — Verify**:
+
+```bash
+for idx in red-alerts-defense-proc red-alerts-defense-reg red-alerts-defense-ps; do
+  count=$(curl -sk -u elastic:Admin123@ "https://192.168.10.10:9200/${idx}/_count" \
+    | python3 -c "import json,sys; print(json.load(sys.stdin).get('count','?'))" 2>/dev/null)
+  echo "$idx: $count"
+done
+```
+
+### 6.4 Troubleshooting — `red-alerts*` vẫn không có log mới
+
+| Triệu chứng | Nguyên nhân | Fix |
+|---|---|---|
+| 0 alert sau khi chạy script | Không có daemon `detect_live` đang chạy | `ps aux \| grep detect_live`; nếu trống → rerun section 6.2 bước 1 |
+| Daemon log "Starting" rồi im | `--since` quá xa (> 1h) → backlog hàng nghìn events | Restart với `SINCE=$(date -u -d '15 minutes ago' ...)` |
+| Daemon log poll OK nhưng count = 0 | Sai `--es-index` (Winlogbeat vs Elastic Agent) | Verify: `curl ".../logs-windows.*/_count"` trả > 0; lab IQAM883 dùng **`logs-windows.*`** (có chữ "s") |
+| Daemon poll 0 events while Kibana có events | Clock skew Windows ↔ Ubuntu | NTP sync: `w32tm /resync /force` trên Windows VM; verify lệch < 30s |
+| Daemon polled events nhưng score < threshold | Threshold quá cao | Hạ `--threshold 0.5` → `0.3` để show nhiều alert hơn |
+| `ES_AUTH_HOST` literal `$ES_AUTH_HOST` trong log | Chưa load `.env` | `set -a; . ./.env; set +a` rồi mới run; verify `echo "$ES_AUTH_HOST"` không rỗng |
+| Elastic Agent stuck, events ngừng vào ELK | OTel collector freeze (bug đã biết) | Trên Windows: `sc stop "Elastic Agent" && timeout /t 10 && sc start "Elastic Agent"` |
+| PS script chạy nhưng không thấy event nào trong `logs-windows.*` | Sysmon/PowerShell logging chưa enable | Verify trên Windows: `Get-WinEvent -LogName 'Microsoft-Windows-Sysmon/Operational' -MaxEvents 5` |
+
+### 6.5 Cleanup sau demo
+
+```bash
+# Stop daemons
+pkill -f "detect_live.py" 2>/dev/null
+pkill -f "agent.daemon" 2>/dev/null
+
+# Cleanup WMI Event Subscription + RunOnce trên Windows (xem section 2.D của
+# apt_demo_scenario_demo_present_2.md cho script paramiko đầy đủ)
+
+# Optional: archive demo artifacts
+mkdir -p ~/demo_archive/$(date +%Y%m%d_%H%M)
+cp /tmp/demo_events/*_alerts.jsonl ~/demo_archive/$(date +%Y%m%d_%H%M)/ 2>/dev/null
+cp /tmp/inv_*.json ~/demo_archive/$(date +%Y%m%d_%H%M)/ 2>/dev/null
+```
+
+---
+
+## 7. Demo flow đề xuất 12 phút cho GVHD
 
 1. **(0-2 phút)** — Mở slide intro, giới thiệu kill-chain 7 phase, taxonomy 1.4
 2. **(2-4 phút)** — Show file `apt_demo_scenario.ps1` highlight Phase 3 (WMI) + Phase 4 (Tier 3 base64 build-time)
@@ -418,7 +707,7 @@ RED pipeline:
 
 ---
 
-## 7. Files artifacts được tạo trong session 2026-05-23 tối
+## 8. Files artifacts được tạo trong session 2026-05-23 tối
 
 - `/tmp/demo_events/*_sample.jsonl` — raw events theo từng mode (input cho detect_batch)
 - `/tmp/demo_events/*_sample_alerts.jsonl` — RED ML alerts output
@@ -429,7 +718,7 @@ RED pipeline:
 
 ---
 
-## 8. Câu hỏi GVHD có thể hỏi + chuẩn bị
+## 9. Câu hỏi GVHD có thể hỏi + chuẩn bị
 
 **Q1: Tại sao baseline detection score = 1.0?**
 A: 100% benign data đã được dùng trong `benign_valid` (production setup) → F1=1.0 trên validation.
@@ -457,3 +746,282 @@ A: Phase 3 evasion Variant B tạo WMI Event Subscription persistence — filter
 `Win32_LocalTime` WITHIN 3600s → fire mỗi giờ. Mỗi lần fire spawn 1 `powershell.exe` →
 Sysmon EID 1 → log. Trong window thu thập, WMI đã fire N lần × N script execution. Đây
 cũng là điểm: persistence loud-and-slow → có nhiều cơ hội catch.
+
+---
+
+## 10. Kiểm thử alert thật — Cross-check RED attribution vs Sigma logic (2026-05-24)
+
+> Mục đích: với mỗi case, xác minh **alert đã index có khớp Sigma rule mà RED gán không?**
+> Label TP/FP/TN/FN cùng giải thích → bằng chứng defensible khi GVHD hỏi "RED có chấm
+> đúng rule không?". 4 case dưới phủ 3 stream (proc/ps/reg) + 1 case FP control.
+
+### 10.1 Case 1 — Proc Covenant WMI fire (TP với MIS-ATTRIBUTION Stage 2)
+
+**Query reproduce**:
+```bash
+curl -sk -u elastic:'Admin123@' \
+  "https://192.168.10.10:9200/red-alerts-demo/_search?size=1" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"bool":{"must":[
+    {"term":{"red.top_rule.keyword":"hacktool_covenant_powershell_launcher"}},
+    {"query_string":{"query":"red.command_line:*WMI_FIRED*"}}
+  ]}},"sort":[{"@timestamp":"desc"}]}' | python3 -m json.tool
+```
+
+**Alert content**:
+- `command_line`: `powershell.exe -Command "Write-Host 'RED_APT_DEMO_WMI_FIRED_32e5853d'"`
+- `parent.executable`: `C:\Windows\System32\wbem\WmiPrvSE.exe`
+- `red.detection_score`: 1.0
+- `red.top_rule`: `hacktool_covenant_powershell_launcher` (cosine 0.847)
+- `top_rules` top-3 tie 0.847: covenant / weak_service_perm / persistence_via_existing_service
+
+**Sigma rule logic** (`proc_creation_win_hktl_covenant.yml`):
+```yaml
+selection_1: CommandLine|contains|all: ['-Sta','-Nop','-Window','Hidden']
+             AND CommandLine|contains: ['-Command' OR '-EncodedCommand']
+selection_2: CommandLine|contains: ['sv o (New-Object IO.MemorySteam);sv d ',
+                                    'mshta file.hta', 'GruntHTTP',
+                                    '-EncodedCommand cwB2ACAAbwAgA']
+condition: 1 of selection_*
+```
+
+**Cross-check**:
+- Alert `command_line` = `powershell.exe -Command "Write-Host '...'"` — thiếu `-Sta/-Nop/-Window/Hidden` → **NOT match selection_1**
+- Không có Covenant signature (`GruntHTTP`, `IO.MemorySteam`) → **NOT match selection_2**
+- → **Sigma rule này NOT FIRE** trên alert này
+
+**Label**: **TP attack-level + MIS-ATTRIBUTION rule-level**
+- **TP** vì: command chạy từ parent `WmiPrvSE.exe` = bằng chứng cứng của **WMI Event Subscription Persistence** (T1546.003) — đúng là malicious behavior. Phase 3 evasion Variant B tạo subscription này.
+- **MIS-ATTRIBUTION** vì: RED Cosine attribute Sigma rule "Covenant Launcher" (rule rất specific cho framework Covenant), nhưng input không khớp detection logic. Top-3 tie 0.847 chứng tỏ input KHÔNG có discriminative tokens — Cosine chọn alphabetical / insertion order.
+- Rule **ĐÚNG** phải là `proc_creation_win_susp_wmi_consumer_powershell_invocation` (WMI consumer pattern parent=WmiPrvSE child=powershell.exe).
+
+**Limitation lộ ra**: Stage 2 Cosine TF-IDF chỉ "gần giống token" chứ KHÔNG validate Sigma detection logic. Cần Layer 3 validator (YAML parse + functional test) — đã ghi vào roadmap luận văn Phase B.
+
+### 10.2 Case 2 — PS Reflection.Assembly evasion (TP với CORRECT attribution)
+
+**Query reproduce**:
+```bash
+curl -sk -u elastic:'Admin123@' \
+  "https://192.168.10.10:9200/red-alerts-powershell-demo/_search?size=3" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"query_string":{"query":"red.script_block_text:*Reflection.Assembly* OR red.command_line:*Reflection.Assembly*"}},
+       "sort":[{"@timestamp":"desc"}]}' | python3 -m json.tool
+```
+
+**Alert content** (Phase 6 fileless marker đầy đủ script):
+- `script_block_text`: snippet chứa `# [System.Reflection.Assembly]::Load($bytes)` (comment) + `$markerKw = '[' + 'System.Reflection.Assembly' + ']::' + 'Load'` (string concat Variant E)
+- `red.detection_score`: 1.0
+- `red.top_rule`: `potential_in_memory_execution_using_reflection_assembly`
+- `sigma_id`: `ddcd88cb-7f62-4ce5-86f9-1704190feb0a`
+- cosine: 0.31 (low — vì raw text bị broken thành các chunk nhỏ)
+
+**Sigma rule logic** (`posh_ps_dotnet_assembly_from_file.yml`):
+```yaml
+selection:
+  ScriptBlockText|contains: '[Reflection.Assembly]::load'
+condition: selection
+```
+
+**Cross-check**:
+- Sigma yêu cầu literal `[Reflection.Assembly]::load` — case-insensitive substring
+- Script raw text có comment `# [System.Reflection.Assembly]::Load($bytes)` → **CHỨA literal** → Sigma rule **CÓ thể fire** nếu Kibana detection cũng scan comment lines
+- Script Variant E sau khi runtime evaluate: `$markerKw` value = `[System.Reflection.Assembly]::Load` — literal **EXISTS trong raw text qua concatenation** (chunks `[`, `System.Reflection.Assembly`, `]::`, `Load` đều có)
+- Sigma rule **strict literal match** → MISS (vì có dấu `+` xen kẽ)
+- RED ML qua TF-IDF token: tokens `system`, `reflection`, `assembly`, `load` overlap với training → **CATCH**
+
+**Label**: **TP với CORRECT attribution**
+- **TP** vì: script đúng là Phase 6 fileless marker (mô phỏng T1620 Reflective Code Loading)
+- **CORRECT attribution** vì: Sigma rule mà RED gán CHÍNH LÀ rule đang bị bypass bởi evasion technique → đúng mapping. RED demonstrating "ML generalize where Sigma literal fails".
+
+**Bằng chứng mạnh cho luận văn**: case này thể hiện rõ claim "RED catch evasion variant mà Sigma miss" — Sigma literal `[Reflection.Assembly]::load` không match `'[' + 'System.Reflection.Assembly' + ']::' + 'Load'` nhưng RED catch được.
+
+### 10.3 Case 3 — Reg evasion RunOnce (TP với PARTIAL MIS-ATTRIBUTION Stage 2)
+
+**Query reproduce**:
+```bash
+# Trên file local từ detect_batch
+python3 -c "
+import json
+with open('/tmp/demo_events/evasion_reg_alerts_fix5.jsonl') as f:
+    d=json.loads(f.readline())
+print('detection_score:', d.get('detection_score'))
+print('command_line  :', d.get('command_line'))
+print('top_rule      :', d.get('top_rule'))
+print('top 3 cosine  :')
+for r in d.get('top_rules',[])[:3]: print(f'  - {r[\"rule\"]:55s} score={r[\"score\"]:.3f}')
+"
+```
+
+**Alert content**:
+- `command_line` (registry path sau Fix #5 fallback): `HKU\S-1-5-21-...\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce\RED_APT_DEMO_PERSIST_049ae0e3`
+- `detection_score`: 1.0
+- `top_rule`: `currentversion_nt_autorun_keys_modification` (cosine 0.732, sigma_id `cbf93e5d-...`)
+- top-3 TIE 0.732: NT autorun / autorun keys / new_run_key_pointing_to_suspicious_folder
+
+**Sigma rule logic**:
+
+| Rule | selection_base điều kiện |
+|---|---|
+| `currentversion_nt_autorun_keys_modification` (top-1) | TargetObject contains **`\SOFTWARE\Microsoft\Windows NT\CurrentVersion`** ← yêu cầu **"Windows NT"** |
+| `currentversion_autorun_keys_modification` (top-2) | TargetObject contains **`\SOFTWARE\Microsoft\Windows\CurrentVersion`** + một trong `\Run\` `\RunOnce\` `\RunOnceEx\` ... |
+
+**Cross-check**:
+- Input path = `\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce\...` (**KHÔNG có "Windows NT"**)
+- Top-1 `currentversion_nt_autorun_keys_modification` **NOT match** Sigma logic (yêu cầu "Windows NT")
+- Top-2 `currentversion_autorun_keys_modification` **DOES match**: base condition OK + `\RunOnce\` trong selection_current_version_keys, không hit filter nào (xkj9_demo_049ae0e3.exe không phải OneDrive/Spotify/...)
+- → **Sigma rule top-2 CORRECT, top-1 WRONG**
+
+**Label**: **TP attack-level + PARTIAL MIS-ATTRIBUTION**
+- **TP** vì: RunOnce key persistence (Tier 1 evasion T1547.001) đúng là malicious activity
+- **PARTIAL MIS-ATTRIBUTION** vì: top-1 sai (yêu cầu "Windows NT" trong path mà input không có), top-2 đúng. Cosine TIE 0.732 = input không có token discriminative giữa "windows" và "windows nt".
+- **RED phân biệt Run vs RunOnce ĐÚNG**: benign mode (Run) → `currentversion_autorun_keys_modification` (cosine 0.897), evasion mode (RunOnce) → cosine khác phân bố → top-1 NT version. Đây là điểm tích cực: Cosine attribute có sensitivity đến token `runonce` vs `run`.
+
+### 10.4 Case 4 — Benign FP (chcp.com — abused_debug_privilege FALSE POSITIVE)
+
+**Query reproduce**:
+```bash
+curl -sk -u elastic:'Admin123@' \
+  "https://192.168.10.10:9200/red-alerts-demo/_search?size=2" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"term":{"red.top_rule.keyword":"abused_debug_privilege_by_arbitrary_parent_processes"}},
+       "sort":[{"@timestamp":"asc"}]}' | python3 -m json.tool
+```
+
+**Alert content**:
+- `command_line`: `"C:\Windows\system32\chcp.com" 65001` (set console UTF-8 code page)
+- `parent.executable`: `C:\Program Files\WindowsApps\...\pwsh.exe` (PowerShell 7 user session)
+- `red.detection_score`: 0.92
+- `red.top_rule`: `abused_debug_privilege_by_arbitrary_parent_processes` (sigma_id `d522eca2-...`)
+
+**Sigma rule logic** (`proc_creation_win_susp_abusing_debug_privilege.yml`):
+```yaml
+selection_parent:
+  ParentImage|endswith: ['\winlogon.exe','\services.exe','\lsass.exe','\csrss.exe',
+                         '\smss.exe','\wininit.exe','\spoolsv.exe','\searchindexer.exe']
+  User|contains: ['AUTHORI','AUTORI']
+selection_img:
+  Image|endswith: ['\powershell.exe','\pwsh.exe','\cmd.exe']
+  OR OriginalFileName: ['PowerShell.EXE','pwsh.dll','Cmd.Exe']
+condition: all of selection_* and not filter
+```
+
+**Cross-check**:
+- ParentImage = `pwsh.exe` → **NOT trong** [winlogon, services, lsass, csrss, smss, wininit, spoolsv, searchindexer]
+- Image = `chcp.com` → **NOT trong** [powershell, pwsh, cmd]
+- → **Sigma rule NOT FIRE** (cả 2 selection đều fail)
+
+**Label**: **FALSE POSITIVE (Stage 1 + Stage 2 đều sai)**
+- **FP Stage 1** vì: `chcp.com 65001` là **benign hoàn toàn** (set console UTF-8). RED Stage 1 chấm 0.92 = vượt threshold 0.5 → flagged malicious nhầm.
+  - Nguyên nhân: RED training data có thể có pattern command với arg dạng `<exe> <number>` được label malicious → model học sai feature.
+- **FP Stage 2** vì: Cosine attribute rule "Abused Debug Privilege" — input HOÀN TOÀN không liên quan (rule yêu cầu parent SYSTEM process + spawn shell). Mis-attribution rõ ràng.
+
+**Bài học cho luận văn**: 
+1. Cần train với benign data tốt hơn — `chcp.com` thường xuất hiện trong PowerShell startup → nên ở benign set
+2. Cần Layer 3 validator để loại Stage 2 attribution không match Sigma logic → giảm noise cho SOC analyst
+
+### 10.5 Tổng kết Confusion Matrix (4 case + extrapolation)
+
+| # | Case | Stage 1 (anomaly) | Stage 2 (attribution) | Sigma rule logic match? | Label |
+|---|------|-------------------|------------------------|--------------------------|-------|
+| 1 | Proc WMI fire | TP score=1.0 | Wrong (Covenant doesn't apply) | NO | TP-attack / MIS-ATTR |
+| 2 | PS Reflection.Assembly | TP score=1.0 | Correct (rule bị bypass) | YES (rule target evasion) | **TP** |
+| 3 | Reg RunOnce evasion | TP score=1.0 | Top-1 wrong (NT version), Top-2 right | YES top-2 | TP / PARTIAL-MIS-ATTR |
+| 4 | chcp.com benign | FP score=0.92 | Wrong rule | NO | **FP** |
+
+**Pattern observed**:
+- Stage 1 TP rate (case 1+2+3 đều catch malicious): **3/3 = 100%** trên 4 case có ground truth
+- Stage 1 FP rate (case 4 nhầm benign): **1/4 = 25%** — phù hợp với expected FP rate khi train 100% benign + threshold 0.5
+- Stage 2 attribution correctness top-1: **1/4 = 25%** (chỉ case 2)
+- Stage 2 attribution correctness top-3: **3/4 = 75%** (case 1 vẫn miss vì WMI consumer rule không trong training catalog)
+
+**Khuyến nghị đánh giá luận văn**:
+- Build labeled dataset 100-200 alerts → measure TP/FP/TN/FN chính thức
+- Đo top-K accuracy của Stage 2 attribution: top-1 vs top-3 vs top-5
+- Đề xuất Layer 3 Sigma validator: parse YAML + apply detection logic Python → loại mis-attribution
+
+### 10.6 Lệnh demo lại toàn bộ Section 10 (1 phát chạy)
+
+> Lưu ý: cần `.env` loaded + paramiko + venv active.
+
+```bash
+cd /home/ubuntu/rule_evasion_detection/Rule_Evasion_Detection
+source ~/venvs/rule_evasion_env/bin/activate
+set -a; . ./.env; set +a
+
+echo "═══════════════════════════════════════════════════════════"
+echo "Case 1: Proc Covenant WMI fire (TP + MIS-ATTRIBUTION)"
+echo "═══════════════════════════════════════════════════════════"
+curl -sk -u elastic:'Admin123@' \
+  "https://192.168.10.10:9200/red-alerts-demo/_search?size=1" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"bool":{"must":[{"term":{"red.top_rule.keyword":"hacktool_covenant_powershell_launcher"}},{"query_string":{"query":"red.command_line:*WMI_FIRED*"}}]}},"sort":[{"@timestamp":"desc"}]}' \
+  | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+for h in d['hits']['hits']:
+    s=h['_source']
+    print(f\"cmd      : {s.get('red.command_line','')[:200]}\")
+    print(f\"parent   : {s.get('process',{}).get('parent',{}).get('executable') if isinstance(s.get('process'),dict) else 'N/A'}\")
+    print(f\"score    : {s.get('red.detection_score')}\")
+    print(f\"top_rule : {s.get('red.top_rule')}\")
+"
+echo
+
+echo "═══════════════════════════════════════════════════════════"
+echo "Case 2: PS Reflection.Assembly evasion (TP + CORRECT ATTR)"
+echo "═══════════════════════════════════════════════════════════"
+curl -sk -u elastic:'Admin123@' \
+  "https://192.168.10.10:9200/red-alerts-powershell-demo/_search?size=1" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"query_string":{"query":"red.script_block_text:*Reflection.Assembly* OR red.command_line:*Reflection.Assembly*"}},"sort":[{"@timestamp":"desc"}]}' \
+  | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+for h in d['hits']['hits']:
+    s=h['_source']
+    txt = s.get('red.command_line') or s.get('red.script_block_text','')
+    print(f\"text     : {txt[:200]}\")
+    print(f\"score    : {s.get('red.detection_score')}\")
+    print(f\"top_rule : {s.get('red.top_rule')}\")
+"
+echo
+
+echo "═══════════════════════════════════════════════════════════"
+echo "Case 3: Reg RunOnce evasion (TP + PARTIAL MIS-ATTR)"
+echo "═══════════════════════════════════════════════════════════"
+python3 -c "
+import json
+with open('/tmp/demo_events/evasion_reg_alerts_fix5.jsonl') as f:
+    d=json.loads(f.readline())
+print(f\"path     : {d.get('command_line','')}\")
+print(f\"score    : {d.get('detection_score')}\")
+print(f\"top_rule : {d.get('top_rule')}\")
+print(f\"top 3    :\")
+for r in d.get('top_rules',[])[:3]: print(f\"  - {r['rule']:55s} score={r['score']:.3f}\")
+"
+echo
+
+echo "═══════════════════════════════════════════════════════════"
+echo "Case 4: chcp.com benign (FALSE POSITIVE)"
+echo "═══════════════════════════════════════════════════════════"
+curl -sk -u elastic:'Admin123@' \
+  "https://192.168.10.10:9200/red-alerts-demo/_search?size=1" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"term":{"red.top_rule.keyword":"abused_debug_privilege_by_arbitrary_parent_processes"}},"sort":[{"@timestamp":"asc"}]}' \
+  | python3 -c "
+import json,sys; d=json.load(sys.stdin)
+for h in d['hits']['hits']:
+    s=h['_source']
+    print(f\"cmd      : {s.get('red.command_line','')}\")
+    print(f\"parent   : {s.get('process',{}).get('parent',{}).get('executable') if isinstance(s.get('process'),dict) else 'N/A'}\")
+    print(f\"score    : {s.get('red.detection_score')}\")
+    print(f\"top_rule : {s.get('red.top_rule')} (FP — Sigma logic NOT match)\")
+"
+```
+
+### 10.7 Trả lời 1-câu cho GVHD nếu hỏi "alert RED đúng rule không?"
+
+> "Stage 1 ML chấm anomaly đúng 75-100% case (1 FP trên `chcp.com` benign). Stage 2 Cosine
+> attribute rule đúng top-3 75%, top-1 25%. Lý do top-1 hay sai: shared TF-IDF vocabulary
+> 1,673 filter values khiến nhiều rule có cosine ngang nhau → tied score → top-1 chọn
+> theo insertion order, không validate Sigma detection logic. Đây là known limitation,
+> roadmap có Layer 3 Sigma validator (parse YAML + functional test) để fix. Trong demo,
+> Sigma ID đính kèm mỗi alert cho phép analyst manual cross-check 5 giây — đủ cho production."

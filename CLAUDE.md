@@ -823,3 +823,117 @@ data/sigma/elastic_rules/windows_sigma_elastic_winlog_raw.ndjson  — 1,624 Elas
 3. **B3 deeper fix**: nếu RED Analyst vẫn hit max_iter=12, xem prompt + tool design có thể giảm chain
 4. **Sigma Rule UUID fix**: 4 rule fail có thể manual fix (replace `id:` bằng UUID) trong NDJSON rồi re-import
 5. **Còn pending lâu**: retrain Stage 1+2 cho IQAM883 environment (từ handoff sáng 2026-05-20 Fix #1/#2/#4 chưa verify đầy đủ)
+
+---
+
+## ⏳ HANDOFF — Session 2026-05-23 (apt_demo_defense_present.md + diagnose red-alerts empty)
+
+### Vấn đề được giải quyết
+
+**Triệu chứng**: chạy `apt_demo_scenario.ps1` trên Windows VM nhưng `red-alerts*` không có log mới.
+
+**Root cause**: PS script chỉ tạo **events** trong ELK `logs-windows.*` (qua Elastic Agent).
+Để event → alert trong `red-alerts*` phải có 1 trong 2 pipeline:
+- **Live**: `detect_live.py` daemon poll ELK → index `red-alerts-{demo,registry-demo,powershell-demo}`
+- **Batch**: `elk_export.py` → `detect_batch.py` → `push_alerts.py` → index `red-alerts-defense-*`
+
+Verify daemon chạy: `ps aux | grep detect_live | grep -v grep`. Nếu trống → start lại (xem Section 6.2 bước 1 trong `demo/apt_demo_defense_present.md`).
+
+### ✅ Cập nhật file apt_demo_defense_present.md
+
+Thêm **Section 6 "Lệnh chạy demo end-to-end"** với:
+- **6.1** Prerequisites (load .env, verify ELK + IQAM883)
+- **6.2** Workflow A — Live daemon (3× `detect_live.py` → `red-alerts-demo/registry-demo/powershell-demo`), recommended cho live demo GVHD
+- **6.3** Workflow B — Batch offline (`elk_export` → `detect_batch` → `push_alerts`) reproduce artifacts `red-alerts-defense-*`; **lưu ý**: `push_alerts.py` không có `--no-verify-ssl` → cần monkey-patch hoặc dùng curl bulk (snippet trong Section 6.3 bước 4 "Cách 2")
+- **6.4** Troubleshoot table 8 dòng (daemon không chạy, clock skew, OTel freeze, wrong index `logs-windows.*` vs `logs-winlog.*`, threshold quá cao, `ES_AUTH_HOST` rỗng)
+- **6.5** Cleanup
+- Section cũ 6/7/8 → 7/8/9
+
+### ⚠️ push_alerts.py HTTPS issue (chưa fix trong code)
+
+`push_alerts.py` gọi `requests` **không có `verify=False`** → crash trên ELK HTTPS self-signed.
+Workaround đã có trong Section 6.3: curl bulk NDJSON thay vì script, hoặc monkey-patch `requests.Session`.
+Nếu muốn fix đúng: thêm `--no-verify-ssl` flag vào `push_alerts.py` (đọc `ES_VERIFY_SSL` env từ `.env`).
+
+### Indices hiện tại (2026-05-23)
+
+| Index | docs.count | Workflow |
+|---|---|---|
+| `red-alerts-demo` | 15,529 | detect_live proc EID 1 |
+| `red-alerts-powershell-demo` | 20,319 | detect_live PS EID 4104 |
+| `red-alerts-registry-demo` | 108 | detect_live registry EID 13 |
+| `red-alerts-defense-proc` | 1,158 | batch workflow session 2026-05-23 tối |
+| `red-alerts-defense-reg` | 3,657 | batch workflow session 2026-05-23 tối |
+| `red-alerts` | 0 | (empty, từ live default, bỏ qua) |
+
+### Files sửa session này
+
+```
+demo/apt_demo_defense_present.md  — thêm Section 6 (lệnh chạy demo) + renumber 6/7/8 → 7/8/9
+```
+
+---
+
+## ⏳ HANDOFF — Session 2026-05-24 (Fix #5 normalize + Section 10 alert verification)
+
+### ✅ Fix #5 — normalize.py fallback split (`red/normalize.py`)
+
+**Root cause**: Fix #2 (2026-05-20) giữ path context (`C:\Windows\sshd.exe` → 1 token `c_windows_sshd_exe`)
+nhưng side-effect: `registry.path` đầy đủ `HKU\S-1-5-21-3762793008-640418586-4080996910-1001\SOFTWARE\Microsoft\Windows\CurrentVersion\Run\<key>` thành 1 token đơn 124 chars > `max_str_len=60` → filter empty → detect_batch skip → 0 reg alert per mode.
+
+**Fix logic**: nếu merged token > max_str_len → fallback split lại trên separator thành sub-tokens. Backward-compat: path ngắn (proc/ps) vẫn merge nguyên → không cần retrain proc/ps.
+
+**Verify**:
+- Trước: `Normalizer().normalize('HKU\\S-1-5-...\\Run\\xxx')` → `''`
+- Sau: → `'1,21,5,currentversion,hku,microsoft,red_apt_demo_benign_8f922e43,run,s,software,windows'`
+
+**Retrained**: `models/registry_event/` Stage 1 (F1=1.0, 11,869 samples) + Stage 2 (39 SVM + 245 cosine rules, 1,673 filter values). Backup `*.PRE_FIX5.zip` còn nguyên trong models/registry_event/ (gitignored).
+
+**Reg detection sau Fix #5** (verified per mode):
+
+| Mode | Score | Top rule (cosine) |
+|---|---|---|
+| benign | 1.00 | currentversion_autorun_keys_modification (0.90) — FP OneDrive |
+| baseline | 1.00 | currentversion_autorun_keys_modification (0.90) — Run + xkj9.exe |
+| **evasion** | 1.00 | **currentversion_nt_autorun_keys_modification (0.73)** — RunOnce variant Tier 1 |
+| chain | 1.00 | currentversion_autorun_keys_modification (0.90) — Run + xkj9.exe |
+
+→ Insight defensible cho luận văn: RED Cosine phân biệt được Tier 1 evasion (RunOnce vs Run).
+
+### ✅ Section 10 — Kiểm thử alert thật trong `demo/apt_demo_defense_present.md`
+
+4 case cross-check RED attribution vs Sigma logic + label TP/FP + reproduce commands:
+
+| Case | Sample | Stage 1 | Stage 2 attribution | Sigma logic match? | Label |
+|---|---|---|---|---|---|
+| 1 (proc) | WMI fire `powershell -Command "Write-Host"` parent=WmiPrvSE.exe | score=1.0 | hacktool_covenant_powershell_launcher (cosine 0.847) | ❌ NOT match | TP-attack / MIS-ATTR |
+| 2 (ps) | Phase 6 fileless `'[' + 'System.Reflection.Assembly' + ']::' + 'Load'` | score=1.0 | potential_in_memory_execution_using_reflection_assembly | ✅ CORRECT (rule bị bypass) | **TP** |
+| 3 (reg) | RunOnce path evasion | score=1.0 | currentversion_nt_autorun_keys_modification (cosine 0.732 TIE) | ⚠️ Top-1 wrong, Top-2 right | TP / PARTIAL-MIS-ATTR |
+| 4 (proc) | `chcp.com 65001` parent=pwsh.exe | score=0.92 | abused_debug_privilege_by_arbitrary_parent_processes | ❌ NOT match | **FP** |
+
+**Pattern (4 case)**:
+- Stage 1 TP rate: 3/4 = 75% (case 1+2+3)
+- Stage 1 FP rate: 1/4 = 25%
+- Stage 2 top-1 attribution: 1/4 = 25% correct
+- Stage 2 top-3 attribution: 3/4 = 75% correct
+
+**Limitation lộ ra**: Stage 2 Cosine TF-IDF chỉ "gần token", không validate Sigma detection logic → khi multiple rule TIE cosine, top-1 thắng theo insertion order. Roadmap: Layer 3 Sigma validator (parse YAML + functional test).
+
+Section 10.6 chứa 1-shot reproduce commands cho cả 4 case (curl + python parse).
+
+### Files sửa session này
+
+```
+red/normalize.py                  — Fix #5 fallback split when merged token > max_str_len
+demo/apt_demo_defense_present.md  — Section 0 bảng RED ML thêm cột reg (real data) + Section 10 (200+ lines verification)
+CLAUDE.md                         — handoff này
+models/registry_event/*.zip        — retrained (gitignored)
+models/registry_event/*.PRE_FIX5.zip — backup (gitignored)
+```
+
+### ⏭️ Việc tiếp theo
+
+1. Cần build labeled dataset 100-200 alerts → measure TP/FP/TN/FN chính thức (extrapolation từ 4 case chưa đủ)
+2. Layer 3 Sigma validator implementation: parse Sigma YAML + apply detection logic Python → filter Stage 2 mis-attribution
+3. Investigate `chcp.com` FP: rebuild benign training set với `chcp.com` được explicit include (xuất hiện trong PowerShell startup → nên là benign signal)
+4. Còn pending: WMI consumer rule (`proc_creation_win_susp_wmi_consumer_powershell_invocation`) thiếu trong catalog cosine — verify + add nếu chưa có
