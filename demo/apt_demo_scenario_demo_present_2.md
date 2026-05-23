@@ -186,8 +186,8 @@ source ~/venvs/rule_evasion_env/bin/activate
 set -a; . ./.env; set +a    # load ES_AUTH_HOST từ .env
 
 # SINCE = 20 phút trước (vừa đủ catch baseline+evasion runs, không quá xa để backlog)
-SINCE=$(date -u -d '20 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
-echo "SINCE=$SINCE  |  UTC now: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+SINCE=$(date -d '20 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+echo "SINCE=$SINCE  |  UTC now: $(date +%Y-%m-%dT%H:%M:%SZ)"
 ```
 
 > **⚠️ Backlog warning**: nếu `--since` lùi > 1h trên môi trường demo (WMI persistence
@@ -207,7 +207,7 @@ python3 scripts/detect_live.py \
   --method cosine \
   --timestamp-field @timestamp \
   --interval 20 \
-  --state-file /tmp/.state_proc.json \
+  --no-state
   --since "$SINCE" \
   2>&1 | tee /tmp/detect_proc.log
 ```
@@ -225,7 +225,7 @@ python3 scripts/detect_live.py \
   --method cosine \
   --timestamp-field @timestamp \
   --interval 20 \
-  --state-file /tmp/.state_reg.json \
+  --no-state
   --since "$SINCE" \
   2>&1 | tee /tmp/detect_reg.log
 ```
@@ -243,7 +243,7 @@ python3 scripts/detect_live.py \
   --method cosine \
   --timestamp-field @timestamp \
   --interval 20 \
-  --state-file /tmp/.state_ps.json \
+  --no-state
   --since "$SINCE" \
   2>&1 | tee /tmp/detect_ps.log
 ```
@@ -503,7 +503,7 @@ ES_RED_INDEX=red-alerts-powershell-demo python3 -m agent.daemon \
   --interval 30 \
   --max-iter 1 \
   --score-threshold 0.95 \
-  --since "2026-05-22T14:00:00Z" \
+  --since "$SINCE" \
   --batch-limit 1
 ```
 
