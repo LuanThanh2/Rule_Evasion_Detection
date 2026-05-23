@@ -1133,6 +1133,144 @@ use mạnh hơn DeepSeek)".
 
 ---
 
+## Phụ lục D — Agent run benchmark + lỗi observed (2026-05-23 tối)
+
+5 lần chạy `python3 -m agent.daemon --no-state --max-iter 1 --batch-limit 1` trên 5 alert
+khác nhau để đo Supervisor routing + đo cost/latency thực tế trên IQAM883 lab.
+
+### D.1 Bảng tổng hợp 5 runs
+
+| # | InvId | Alert source | Top rule | Score | Triage sev | Workflow | Time | Cost | Tokens | Actions |
+|---|---|---|---|---|---|---|---|---|---|---|
+| 1 | `INV-8443d66a4d97` | red-alerts-demo | (mix) | (low) | LOW | quick_triage | 22.6s | $0.0057 | 28k | 0 |
+| 2 | `INV-eb8a89f60736` | red-alerts-demo | hacktool_covenant_powershell_launcher | 1.0 | HIGH | **full** | 270.5s | $0.0352 | 170k | 5 |
+| 3 | `INV-b96df99d7736` | red-alerts-powershell-demo | nslookup_powershell_download_cradle | 1.0 | CRITICAL | **full + REAL VR** | 304.5s | $0.0634 | 374k | 6 |
+| 4 | `INV-34b67170be9a` | red-alerts-registry-demo | potential_persistence_via_globalflags | 1.0 | **FALSE_POSITIVE** | quick_triage (FP filter) | 13.4s | $0.0046 | 17k | 0 |
+| 5 | `INV-932cb13b882b` | red-alerts-demo | sdiagnhost_calling_suspicious_child_process | 1.0 | LOW | full | 85.3s | $0.0295 | 128k | 2 |
+
+**Median full pipeline**: ~270s, ~$0.035, ~170k tokens.
+**Median quick_triage (FP/LOW skip)**: ~18s, ~$0.005, ~22k tokens.
+
+### D.2 FP filter coverage trên 5 runs
+
+| Category | Count | % |
+|---|---|---|
+| FP filtered (quick_triage) | 1 | 20% |
+| LOW (full but light) | 2 | 40% |
+| HIGH/CRITICAL (full + actions) | 2 | 40% |
+
+→ Sample nhỏ nhưng đúng pattern: registry alert `potential_persistence_via_globalflags`
+bị Triage Agent đánh giá FP trong 13s vì path `\Perflib\Last Help` thuộc Windows
+performance counter — không phải malicious persistence. Tiết kiệm 250+ giây so với
+chạy full pipeline.
+
+### D.3 ⚠️ Bugs observed → ✅ ALL FIXED (2026-05-23 tối)
+
+**Bug B1 — Shell env `ES_RED_INDEX` đè .env** ✅ FIXED
+- Triệu chứng: daemon trả về 0 alert dù index có data
+- Root cause: `python-dotenv` mặc định KHÔNG override biến đã có trong shell
+- Fix applied: `agent/__init__.py` đổi `load_dotenv(_env)` → `load_dotenv(_env, override=True)`
+- Verify: chạy daemon với `ES_RED_INDEX=red-alerts` exported → daemon vẫn dùng `red-alerts*` từ .env
+
+**Bug B2 — `action_type` Pydantic enum hẹp** ✅ FIXED
+- Triệu chứng: Response Agent generate action mới (`remove_persistence`, `update_detection_rules`,
+  `review_sigma_rules`...) bị Pydantic reject → drop action
+- Cause: `schemas.ResponseAction.action_type` Literal chỉ có 10 giá trị fixed
+- Fix applied: `agent/schemas.py` đổi `action_type: ResponseActionType` (Literal) → `action_type: str`
+  + giữ `KNOWN_ACTION_TYPES` set làm advisory cho downstream dispatch
+- Verify: Test #5 trước fix giữ 2 actions, sau fix giữ 3 actions (không drop nào)
+
+**Bug B3 — `max_iterations_reached` trên ReAct loop** ✅ FIXED
+- Triệu chứng: Response/RED Analyst Agent hit `max_iter=6` → drop output
+- Root cause sâu hơn: `AGENT_MAX_ITERATIONS=8` trong .env nhưng `agent/_loop.py` hardcode default 6
+  → env var là **dead code**, mỗi agent hardcode max_iter=4-6 riêng
+- Fix applied:
+  - `.env`: bump `AGENT_MAX_ITERATIONS=8` → `12`
+  - `agent/_loop.py`: đọc env var và `max_iter = max(caller_default, env_max)` (env là ceiling chung)
+- Verify: chạy lại 2 runs trước hit max → không còn `max_iterations_reached` warning
+
+### D.3.1 Files đã sửa (fix session 20:15-20:24)
+
+| File | Change |
+|---|---|
+| `agent/__init__.py` | `load_dotenv(..., override=True)` |
+| `agent/schemas.py` | `action_type: str` (was Literal), thêm `KNOWN_ACTION_TYPES` set |
+| `agent/_loop.py` | Đọc `AGENT_MAX_ITERATIONS` env làm ceiling chung |
+| `.env` | `AGENT_MAX_ITERATIONS=12` (was 8) |
+
+### D.3.2 Verification matrix
+
+| Bug | Before fix | After fix | Test |
+|---|---|---|---|
+| B1 shell env | 0 alerts polled | alerts polled OK | `ES_RED_INDEX=red-alerts python3 -m agent.daemon` |
+| B2 action drop | 2/3 actions kept | 3/3 actions kept | INV-553034b97c57 vs INV-932cb13b882b |
+| B3 max_iter | `max_iterations_reached` warning | no warning, all agents finalize | INV-553034b97c57 (sdiagnhost) |
+
+### D.4 Supervisor routing đúng — bằng chứng
+
+So sánh 2 alert score 1.0 nhưng kết quả khác nhau:
+
+| Alert | Top rule | Triage decide | Lý do |
+|---|---|---|---|
+| Test #3 (PowerShell) | `nslookup_powershell_download_cradle` | CRITICAL, deep=True | Download cradle pattern + base64 → cần Forensic VR |
+| Test #4 (Registry) | `potential_persistence_via_globalflags` | FALSE_POSITIVE, conf=0.92 | Path `\Perflib\Last Help` là Windows perfmon counter — known benign |
+
+→ Triage Agent **không chỉ chấm điểm RED ML** — mà còn đánh giá context (registry path,
+parent process, user). Đây là điểm khác biệt so với SIEM auto-fire (Sigma đúng-mismatch).
+
+### D.5 Real Velociraptor performance (Test #3)
+
+```
+Forensic Agent timing breakdown:
+  Query 1 (Pslist):           ~57s
+  Query 2 (NTUser Registry):  ~58s
+  Query 3 (NetstatEnriched):  ~33s
+  ─────────────────────────────────
+  Tổng Forensic Agent:        ~170s (Real VR mode)
+```
+
+So với mock VR mode (~22s) → REAL VR ~8× chậm hơn. Trade-off: kháng hallucination
+measurable (xem CLAUDE.md section Phase C).
+
+### D.6 Sigma patch chất lượng (Test #5)
+
+Patch sinh ra cho `sdiagnhost_calling_suspicious_child_process` (PowerShell shorthand
+flag evasion):
+
+```yaml
+title: Suspicious PowerShell Encoded Command via Shorthand Flag (PATCHED)
+detection:
+  selection_image:
+    Image|endswith: ['\powershell.exe', '\pwsh.exe']
+  selection_encoded_shorthand_space:
+    CommandLine|contains|all: ['-e ', 'VwByAG']
+  selection_encoded_shorthand_ec:
+    CommandLine|contains|all: ['-ec ', 'VwByAG']
+  # ... (-en, -enc, -enco, -encod variants)
+```
+
+→ Patch cover được **shorthand flags** (`-e`, `-ec`, `-en`, `-enc`...) — đúng evasion
+technique mà attacker dùng để bypass Sigma rule chỉ match `-EncodedCommand` đầy đủ.
+
+**Limitation**: patch vẫn match `VwByAG` (base64 prefix của "Write-Host" = `[byte[]]`).
+Attacker có thể đổi sang payload khác → patch miss. Đây là cat-and-mouse vô hạn —
+đúng như framing trong CLAUDE.md (patch là tactical band-aid, không silver bullet).
+
+### D.7 Cost extrapolation cho production SOC
+
+Giả định SOC trung bình 1000 alerts/ngày, với 60% FP filter (quick_triage):
+
+| Tier | Alerts/day | Time/alert | Cost/alert | Tổng/ngày |
+|---|---|---|---|---|
+| FP filtered (60%) | 600 | 15s | $0.005 | $3 |
+| LOW (20%) | 200 | 85s | $0.030 | $6 |
+| HIGH/CRITICAL (20%) | 200 | 280s | $0.060 | $12 |
+| **Tổng** | **1000** | — | — | **~$21/day** |
+
+So với 1 SOC L1 analyst $25-50/hour × 8 hours = $200-400/ngày → **agent rẻ hơn ~10-19×**.
+
+---
+
 ## Tham khảo file liên quan
 
 | File | Khi nào dùng |

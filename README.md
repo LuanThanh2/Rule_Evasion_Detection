@@ -113,14 +113,19 @@ Các biến tối thiểu:
 
 ```text
 DEEPSEEK_API_KEY=sk-your-deepseek-key
-ES_HOST=http://10.10.20.100:9200
+ES_HOST=https://192.168.10.10:9200      # ES có thể HTTPS — set ES_VERIFY_SSL=false nếu self-signed
 ES_USER=elastic
 ES_PASSWORD=your-es-password
-ES_RED_INDEX=red-alerts
+ES_VERIFY_SSL=false                      # cho self-signed cert
+ES_RED_INDEX=red-alerts*                 # wildcard match cả live + replay indices
 ES_AI_INDEX=ai-investigations
+AGENT_MAX_ITERATIONS=12                  # ceiling chung cho mọi ReAct agent
 ```
 
-Lưu ý: module `agent` tự load `.env`. Riêng `detect_live.py` không tự load `.env` và cũng không có option `--es-user` / `--es-password`; khi cần xác thực, hãy đặt credential trong `--es-host`, ví dụ `http://elastic:PASSWORD@10.10.20.100:9200`.
+Lưu ý:
+- Module `agent` tự load `.env` với `override=True` → giá trị trong `.env` thắng biến shell (fix 2026-05-23).
+- `detect_live.py` không tự load `.env` và cũng không có option `--es-user` / `--es-password`; khi cần xác thực, hãy đặt credential trong `--es-host`, ví dụ `http://elastic:PASSWORD@10.10.20.100:9200`.
+- Nếu shell có biến `ES_RED_INDEX` cũ (ví dụ `red-alerts`), `unset ES_RED_INDEX` trước khi chạy. Từ 2026-05-23 `agent/__init__.py` đã dùng `override=True` nên .env thắng, nhưng cẩn thận với script không qua module `agent`.
 
 ## Cấu Trúc Repo
 
@@ -288,14 +293,19 @@ State file mặc định là `.detect_live_state.json`. Dùng `--reset-state` kh
 
 ### Convert Sigma Sang Elastic Rules
 
-Nếu Kibana chưa có Detection Rules, chuyển Sigma YAML sang Elastic NDJSON:
+Nếu Kibana chưa có Detection Rules, chuyển Sigma YAML sang Elastic NDJSON. Đường dẫn
+dưới đây dùng `~/data/sigma/...` — sửa lại theo môi trường của bạn nếu khác.
 
 ```bash
 python3 scripts/convert_sigma_to_elastic.py \
-  --index-pattern "logs-winlog.*" \
+  --index-pattern "logs-windows.*" \
+  --index-pattern "winlogbeat-*" \
   --field-profile winlog-raw \
-  --out /home/luanthanh/data/sigma/elastic_rules/windows_sigma_elastic_winlog_raw.ndjson
+  --out data/sigma/elastic_rules/windows_sigma_elastic_winlog_raw.ndjson
 ```
+
+> ⚠️ Index pattern phải khớp với data stream thật. Trên lab IQAM883 (Elastic Agent v9)
+> là `logs-windows.*` (có chữ **s**), KHÔNG phải `logs-winlog.*`.
 
 Import qua Kibana UI:
 
@@ -303,14 +313,15 @@ Import qua Kibana UI:
 Kibana -> Security -> Rules -> Import rules
 ```
 
-Hoặc import bằng API:
+Hoặc import bằng API. Lưu ý Kibana chạy **HTTP** trên port 5601 (chỉ Elasticsearch
+là HTTPS), nên `--kibana-url` phải dùng `http://`:
 
 ```bash
 python3 scripts/convert_sigma_to_elastic.py \
   --skip-convert \
-  --out /home/luanthanh/data/sigma/elastic_rules/windows_sigma_elastic_winlog_raw.ndjson \
+  --out data/sigma/elastic_rules/windows_sigma_elastic_winlog_raw.ndjson \
   --import-to-kibana \
-  --kibana-url http://10.10.20.100:5601 \
+  --kibana-url http://192.168.10.10:5601 \
   --kibana-user elastic \
   --kibana-password "$KIBANA_PASSWORD" \
   --import-chunk-size 200 \
@@ -318,6 +329,10 @@ python3 scripts/convert_sigma_to_elastic.py \
 ```
 
 Dùng `--field-profile winlog-raw` khi log còn ở field gốc như `winlog.event_data.CommandLine`. Nếu log đã chuẩn ECS, có thể bỏ option này.
+
+**Kết quả thực tế trên lab IQAM883 (2026-05-23)**: import 1,620/1,624 rules thành công
+qua 9 chunks × 200 (mất ~3 phút). 4 rule fail vì `Invalid UUID` (Sigma rule id không
+phải UUID format — Kibana reject).
 
 ## AI Agent SOC Triage
 

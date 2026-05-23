@@ -71,6 +71,14 @@ async def react_loop(
     verbose: bool = True,
 ) -> dict:
     """Generic ReAct loop. Return parsed <final> JSON hoặc {"error": ...}."""
+    # AGENT_MAX_ITERATIONS env var = absolute ceiling cho tất cả agents.
+    # Nếu env set và lớn hơn caller default → dùng env (cho phép bump global).
+    env_max = os.environ.get("AGENT_MAX_ITERATIONS")
+    if env_max:
+        try:
+            max_iter = max(max_iter, int(env_max))
+        except ValueError:
+            pass
     tools_schema = get_tools_schema(tool_names) if tool_names else None
 
     messages: list[dict[str, Any]] = [

@@ -91,16 +91,25 @@ class ForensicOutput(BaseModel):
     confidence: float = Field(ge=0, le=1)
 
 
-ResponseActionType = Literal[
+KNOWN_ACTION_TYPES = {
     "isolate_host", "kill_process", "block_ip", "block_domain",
     "disable_user", "reset_credentials", "create_case", "send_alert",
     "scan_host", "collect_forensics",
-]
+    "remove_persistence", "update_detection_rules", "quarantine_file",
+    "kill_service", "delete_registry_key", "delete_scheduled_task",
+    "delete_wmi_subscription", "rotate_secret", "restore_backup",
+    "patch_vulnerability", "deploy_yara_rule",
+}
 
 
 class ResponseAction(BaseModel):
-    """1 hành động containment/response — có thể cần human approval."""
-    action_type: ResponseActionType
+    """1 hành động containment/response — có thể cần human approval.
+
+    action_type là free-form string: LLM hay sinh tên action chưa có trong enum.
+    KNOWN_ACTION_TYPES dùng để downstream dispatch — unknown vẫn được giữ làm
+    advisory cho analyst chứ không drop.
+    """
+    action_type: str
     target: str
     priority: int = Field(ge=1, le=5)
     needs_approval: bool = True

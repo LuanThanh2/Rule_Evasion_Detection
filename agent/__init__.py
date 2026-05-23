@@ -6,7 +6,7 @@ import os
 try:
     from dotenv import load_dotenv
     _env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
-    load_dotenv(_env)
+    load_dotenv(_env, override=True)
 except ImportError:
     pass
 

@@ -719,3 +719,107 @@ sc start "Elastic Agent"
 - `agent/vr_client.py` — VQL queries (đã fix foreach)
 - `config/{powershell,registry_event}.yaml` — ECS field mapping
 - `.env` — `ES_VERIFY_SSL=false`, `VR_API_CONFIG` absolute path, `VR_USE_REAL=1`
+
+---
+
+## ⏳ HANDOFF — Session 2026-05-23 tối (Sigma import + 3 bug fixes)
+
+Tiếp sau handoff IQAM883 buổi sáng. Buổi tối làm 2 việc lớn:
+1. Benchmark 5 agent runs đa dạng + document chi tiết
+2. **Fix 3 bugs hệ thống** đã observed trong các runs
+
+### ✅ Bug fixes (verified + smoke-tested)
+
+| Bug | File sửa | Thay đổi | Verify |
+|---|---|---|---|
+| **B1 dotenv override** | `agent/__init__.py` | `load_dotenv(_env)` → `load_dotenv(_env, override=True)` | Daemon poll OK dù `ES_RED_INDEX=red-alerts` exported sẵn trong shell |
+| **B2 action_type Literal hẹp** | `agent/schemas.py` | `action_type: ResponseActionType` (Literal 10 giá trị) → `action_type: str` + giữ `KNOWN_ACTION_TYPES` set làm advisory | Cùng alert sdiagnhost: trước fix 2 actions, sau fix 3 actions (không drop nào) |
+| **B3 max_iter dead code** | `agent/_loop.py` + `.env` | `_loop.py` đọc `AGENT_MAX_ITERATIONS` env làm ceiling chung (`max(caller_default, env)`); `.env` bump 8→12 | `max_iterations_reached` warning biến mất trên smoke test |
+
+**Root cause B3** (quan trọng): `.env` đã có `AGENT_MAX_ITERATIONS=8` từ trước nhưng
+`_loop.py` chỉ dùng param default `max_iter=6` — env var là **dead code**. Mỗi agent
+hardcode max_iter riêng (triage=6, mitre=5, hunt=5, red_analyst=4, forensic, response=6,
+report=3) → tăng .env không có tác dụng. Sau fix, env làm ceiling: nếu env ≥ caller default
+thì env thắng.
+
+### ✅ Sigma → Elastic NDJSON + Kibana import (1,620/1,624 rules)
+
+**Script**: `scripts/convert_sigma_to_elastic.py` (đã có sẵn từ trước)
+
+**2 lỗi hit khi import trên IQAM883**:
+
+| Lỗi | Triệu chứng | Fix |
+|---|---|---|
+| **SSL WRONG_VERSION_NUMBER** | `--kibana-url https://...:5601` → `requests.exceptions.SSLError` | Kibana chạy **HTTP** (không HTTPS) trên port 5601. ES mới HTTPS. Dùng `http://192.168.10.10:5601` |
+| **Invalid UUID** | 4/1624 rules fail với `id: Invalid UUID` | Sigma rule field `id:` phải là UUID format — 4 rule trong catalog có id không UUID → Kibana reject. Skip được, không critical |
+
+**Commands chuẩn** (cho lab IQAM883):
+```bash
+# Convert + Import 1 lệnh
+python3 scripts/convert_sigma_to_elastic.py \
+  --index-pattern "logs-windows.*" \
+  --index-pattern "winlogbeat-*" \
+  --field-profile winlog-raw \
+  --out data/sigma/elastic_rules/windows_sigma_elastic_winlog_raw.ndjson \
+  --import-to-kibana \
+  --kibana-url http://192.168.10.10:5601 \
+  --kibana-user elastic \
+  --kibana-password 'Admin123@' \
+  --import-chunk-size 200 \
+  --import-timeout 300
+```
+
+**Lưu ý index pattern**: data stream thật trên cluster là `logs-windows.*` (có chữ **s**),
+KHÔNG phải `logs-winlog.*`. Các index có data:
+- `.ds-logs-windows.powershell-*` (374k docs)
+- `.ds-logs-windows.sysmon_operational-*` (99k)
+- `.ds-logs-windows.powershell_operational-*` (94k)
+
+**Sau import**: Kibana `Security → Rules` có **1,645 rules** (1,620 mới + 25 đã có sẵn).
+
+### Benchmark 5 agent runs (2026-05-23 tối)
+
+| InvId | Alert | Triage | Workflow | Time | Cost | Tokens |
+|---|---|---|---|---|---|---|
+| `INV-eb8a89f60736` | Covenant PS WMI | HIGH | full | 270.5s | $0.0352 | 170k |
+| `INV-8443d66a4d97` | (low score) | LOW | quick_triage | 22.6s | $0.0057 | 28k |
+| `INV-b96df99d7736` | nslookup_powershell_download_cradle | CRITICAL | full + REAL VR | 304.5s | $0.0634 | 374k |
+| `INV-34b67170be9a` | potential_persistence_via_globalflags | **FP** | quick_triage (skip) | 13.4s | $0.0046 | 17k |
+| `INV-932cb13b882b` | sdiagnhost shorthand-flag evasion | LOW | full | 85.3s | $0.0295 | 128k |
+| `INV-553034b97c57` | sdiagnhost (sau fix B2/B3) | LOW | full | 78.0s | $0.0247 | 128k |
+
+**Insights**:
+- Median full pipeline: ~270s, ~$0.035 (REAL VR thêm ~150s + $0.02)
+- Median quick_triage (FP filter): ~15s, ~$0.005
+- FP filter coverage: 1/5 = 20% (sample nhỏ; field claim 60-80%)
+- Cost extrapolation 1000 alerts/day: ~$21 (vs analyst $200-400 → 10-19× rẻ hơn)
+
+### ⚠️ Limitation còn lại (chưa fix)
+
+- **B2 mở rộng action_type sang `str`** — match được mọi LLM output, nhưng downstream
+  dispatch logic mất type safety. Nếu sau này thêm executor cho từng action type, cần
+  re-introduce dispatch table với `if action_type in KNOWN_ACTION_TYPES`.
+- **`max_iterations_reached` Test #3 (PowerShell)** — vẫn xảy ra với RED Analyst dù tăng
+  lên 12. Có thể tăng thêm hoặc đổi prompt để giảm tool-call chain.
+
+### Files đã sửa session này
+
+```
+agent/__init__.py           — load_dotenv(override=True)
+agent/schemas.py            — action_type: str + KNOWN_ACTION_TYPES set + mở rộng ForensicEvidence.kind (đã làm sáng)
+agent/_loop.py              — đọc AGENT_MAX_ITERATIONS env làm ceiling
+.env                        — AGENT_MAX_ITERATIONS=8 → 12
+README.md                   — sửa convert_sigma_to_elastic.py example (http kibana, logs-windows.*)
+demo/apt_demo_scenario_demo_present_2.md  — thêm Phụ lục D (benchmark + bugs)
+data/sigma/elastic_rules/windows_sigma_elastic_winlog_raw.ndjson  — 1,624 Elastic rules
+```
+
+### ⏭️ Việc tiếp theo (sau session này)
+
+1. **Smoke test daemon full**: chạy với 5-10 alerts liên tiếp (`--max-iter 5`) để verify B1/B2/B3 fix hoạt động ổn định
+2. **Kibana Detection Rules tuning**: sau khi 1,620 rules enable, sẽ có nhiều FP. Cần
+   - Disable rule severity informational (Sigma có ~30% là info)
+   - Tune `interval` từ default 5m → 15m cho rule không critical
+3. **B3 deeper fix**: nếu RED Analyst vẫn hit max_iter=12, xem prompt + tool design có thể giảm chain
+4. **Sigma Rule UUID fix**: 4 rule fail có thể manual fix (replace `id:` bằng UUID) trong NDJSON rồi re-import
+5. **Còn pending lâu**: retrain Stage 1+2 cho IQAM883 environment (từ handoff sáng 2026-05-20 Fix #1/#2/#4 chưa verify đầy đủ)
