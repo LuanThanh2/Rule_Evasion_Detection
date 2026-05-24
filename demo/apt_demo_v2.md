@@ -31,6 +31,10 @@
 **Thông điệp 1 câu**: Sigma exact-match miss khi attacker đổi representation, nhưng RED ML
 vẫn fire và attribute về Sigma rule họ hàng gần nhất.
 
+**Layer 3 (tuỳ chọn)**: AI Agent đọc 1 RED evasion alert → 8-agent pipeline +
+Velociraptor evidence → báo cáo tiếng Việt + Sigma patch trong `ai-investigations`
+(~120-210s, ~$0.02/alert). Chi tiết Section 7.
+
 ---
 
 ## 1. Lab Topology
@@ -397,9 +401,178 @@ red-alerts-v2-ps: 3
 
 ---
 
-## 7. Xem trên Kibana UI (live demo)
+## 7. AI Agent — Triage và Report (tuỳ chọn nhưng khuyến nghị)
 
-### 7.1 Security → Alerts (Sigma layer)
+> **Mục đích**: sau khi RED daemon đẩy alerts vào `red-alerts-v2-*`, AI Agent
+> (8-agent pipeline + Velociraptor evidence) sẽ tự investigate, output 1
+> Vietnamese SOC report → index `ai-investigations`. Đây là Layer 3 trên cùng
+> của claim luận văn (multi-layer adversarial-aware detection).
+>
+> Có thể bỏ qua section này nếu chỉ demo ML pure (Sigma vs RED). Nếu chạy thì
+> nên chạy **sau khi `--mode evasion` xong**, vì alert evasion mới là input
+> thú vị cho LLM.
+
+### 7.1 Preflight
+
+```bash
+# Sanity check env vars (đã có sẵn trong .env)
+grep -E "^(DEEPSEEK_API_KEY|ES_AI_INDEX|VR_USE_REAL|VR_API_CONFIG|AGENT_MAX_ITERATIONS)=" .env
+
+# Velociraptor server alive (nếu VR_USE_REAL=1)
+sudo systemctl status velociraptor_server.service --no-pager | head -5
+curl -sk -u "admin:tzxr" "https://127.0.0.1:8889/api/v1/SearchClients?query=all" -m 5 \
+  | python3 -c "import sys,json; d=json.load(sys.stdin); print('VR clients:', len(d.get('items',[])))"
+
+# (Nếu VR sập / không cần real evidence) fallback mock
+# export VR_USE_REAL=0   # → tools dùng mock data, ai-investigations vẫn ghi nhưng evidence là synthetic
+```
+
+### 7.2 One-shot — investigate 1 evasion alert (cho demo trên hội đồng)
+
+> ⚠️ **Gotcha**: `agent/__init__.py:9` gọi `load_dotenv(override=True)` →
+> mọi `ES_RED_INDEX=...` prefix trước `python3 -m agent.daemon` đều bị `.env`
+> **ghi đè**. Phải sửa `ES_RED_INDEX` trực tiếp trong `.env` (hoặc xoá tạm
+> dòng đó), không thể override qua shell prefix.
+
+Sau khi `--mode evasion` xong, lấy `RunId` (ví dụ `cae65ce1`) → chạy daemon
+1 lần để pick 1 alert cao điểm nhất:
+
+```bash
+export RUN_ID="<RunId_evasion>"   # ví dụ cae65ce1
+
+# Backup + sửa .env để agent chỉ poll red-alerts-v2-*
+cp .env .env.bak
+sed -i 's|^ES_RED_INDEX=.*|ES_RED_INDEX=red-alerts-v2-proc,red-alerts-v2-ps,red-alerts-v2-reg|' .env
+grep "^ES_RED_INDEX=" .env   # verify
+
+SINCE_AGENT=$(date -u -d '15 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+
+PYTHONUNBUFFERED=1 python3 -m agent.daemon \
+  --interval 15 \
+  --max-iter 1 \
+  --batch-limit 1 \
+  --score-threshold 0.9 \
+  --since "$SINCE_AGENT" \
+  --query-string "*${RUN_ID}*" \
+  --no-state \
+  2>&1 | tee /tmp/red_demo_v2_logs/agent_one_shot.log
+
+# Restore .env sau khi xong
+mv .env.bak .env
+```
+
+Expected log đoạn cuối (verified 2026-05-24, host `desktop-iqam883`, score 1.00):
+
+```text
+✓ Done in ~150-210s — severity=CRITICAL, 6 actions, ~180k tokens, $0.03-0.05
+→ Indexed: ai-investigations/INV-<12hex>
+```
+
+> **Note cost**: alert score 1.0 + Forensic real VR → token cao hơn (~180k vs
+> mock ~80k). Nếu cần demo nhanh và rẻ, có thể `export VR_USE_REAL=0` (mock
+> Velociraptor data) → giảm xuống ~$0.015-0.02.
+
+### 7.3 Daemon mode — tự động investigate mọi alert mới
+
+> ⚠️ **Token cost**: mỗi alert ~$0.03-0.05. Daemon chạy lâu + nhiều alert =
+> tiền thật. Khuyến nghị **chỉ chạy foreground**, hoặc set `--max-iter` nhỏ.
+> Đừng `nohup ... &` trừ khi bạn đã set budget với DeepSeek.
+
+Sửa `.env` (như 7.2) rồi chạy foreground:
+
+```bash
+sed -i 's|^ES_RED_INDEX=.*|ES_RED_INDEX=red-alerts-v2-*|' .env
+SINCE_AGENT=$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+
+PYTHONUNBUFFERED=1 python3 -m agent.daemon \
+  --interval 30 \
+  --score-threshold 0.9 \
+  --batch-limit 3 \
+  --max-iter 5 \
+  --since "$SINCE_AGENT" \
+  2>&1 | tee /tmp/red_demo_v2_logs/agent_daemon.log
+```
+
+> **Note**: ES search API tự nhận wildcard `red-alerts-v2-*` → daemon hoạt
+> động đúng. Nếu cần list cụ thể, dùng `red-alerts-v2-proc,red-alerts-v2-ps,red-alerts-v2-reg`.
+
+### 7.4 Verify investigation document trong `ai-investigations`
+
+```bash
+curl -sk -u "$ES_USER:$ES_PASS" \
+  "https://192.168.10.10:9200/ai-investigations/_search?size=3&sort=@timestamp:desc" \
+  -H 'Content-Type: application/json' \
+  -d "{\"query\":{\"query_string\":{\"query\":\"*${RUN_ID}*\"}}}" \
+  | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+print(f'Total: {d[\"hits\"][\"total\"][\"value\"]} investigation(s)')
+for h in d['hits']['hits']:
+    s=h['_source']
+    inv=s.get('investigation_id','?')
+    sev=s.get('triage',{}).get('severity','?')
+    title=s.get('report',{}).get('title_vi','')[:80]
+    cost=s.get('estimated_cost_usd',0)
+    elapsed=s.get('elapsed_seconds',0)
+    print(f'\n  inv_id={inv}')
+    print(f'  severity={sev} elapsed={elapsed:.1f}s cost=\${cost:.4f}')
+    print(f'  title_vi={title}')
+"
+```
+
+Expected output (verified pattern 2026-05-24):
+
+```text
+Total: 1 investigation(s)
+
+  inv_id=INV-37200b9402d2
+  severity=CRITICAL elapsed=180.8s cost=$0.0413
+  title_vi=Phát hiện SSH Remote Port Forwarding (sshd.exe -R) trên host đã bị
+           compromise hoàn toàn — Chain tấn công LaZagne → hashcat → NetSupport
+           RAT → SSH Tunnel T1572
+```
+
+> **Note**: trong document ES, một số field như `host.name` và `forensic.verdict`
+> hiển thị `None` khi parse trực tiếp do nested mapping; nội dung chính nằm trong
+> `report.title_vi`, `report.executive_summary_vi`, `report.body_vi`. Khi xem trên
+> Kibana Discover (Section 8.2 style) → expand row sẽ thấy đủ.
+
+### 7.5 Talk track tại Kibana (AI Agent layer)
+
+Mở Discover → data view `ai-investigations` → search `*${RUN_ID}*` → expand 1 row:
+
+| Field | Mô tả |
+|---|---|
+| `triage.severity` / `triage.is_fp` | Quyết định FP filter của Triage agent |
+| `forensic.process_tree` | Bằng chứng từ Velociraptor (PID, parent, command line) |
+| `hunt.iocs` / `hunt.timeline` | IOC + timeline lateral hunt |
+| `red_analyst.explanation_vi` | LLM giải thích WHY là evasion (token-level) |
+| `mitre.ttps` | TTP chain T1XXX |
+| `response.containment_actions` | Hành động đề xuất + Sigma patch YAML |
+| `report.body_vi` | Báo cáo tiếng Việt full markdown |
+| `total_tokens` / `estimated_cost_usd` | Cost transparency cho luận văn |
+
+> "Khác biệt với Elastic AI Assistant: AI Agent của chúng tôi có **Forensic agent**
+> kéo evidence cứng từ Velociraptor (không hallucinate process tree), **RED Analyst**
+> dịch ML score thành lý do token-level, và **Response agent** sinh Sigma patch
+> grounded trên evidence. End-to-end ~98s (mock) / ~210s (real VR), $0.020/alert
+> vs ~5-15 phút và $25-50 của analyst Tier-1."
+
+### 7.6 Cleanup AI Agent
+
+```bash
+pkill -f "agent.daemon" 2>/dev/null
+sleep 2
+ps -ef | grep "agent.daemon" | grep -v grep | wc -l   # Expect: 0
+```
+
+(Cleanup đầy đủ trong Section 11. Phần cleanup script `apt_demo_v2.ps1` đã bao gồm `pkill -f "agent.daemon"`.)
+
+---
+
+## 8. Xem trên Kibana UI (live demo)
+
+### 8.1 Security → Alerts (Sigma layer)
 
 Set time range `Last 30 minutes`. Search bar nhập:
 
@@ -419,7 +592,7 @@ e62a9f0c-ca1e-46b2-85d5-a6da77f86d1a   File Encoded To Base64 Via Certutil.EXE
 
 Search `<RunId_evasion>`: **0 alert** từ 6 target rule IDs.
 
-### 7.2 Discover → red-alerts-v2-* (RED layer)
+### 8.2 Discover → red-alerts-v2-* (RED layer)
 
 Chọn data view `red-alerts-v2-proc,red-alerts-v2-ps,red-alerts-v2-reg` (hoặc index pattern `red-alerts-v2-*`).
 
@@ -448,7 +621,7 @@ red.command_line
 
 ---
 
-## 8. Verified results (chạy thật 2026-05-24)
+## 9. Verified results (chạy thật 2026-05-24)
 
 | Test | RunId | Kết quả |
 |---|---|---|
@@ -467,7 +640,7 @@ RED attribution highlights (evasion):
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 | Triệu chứng | Nguyên nhân thường gặp | Cách xử lý |
 |---|---|---|
@@ -482,6 +655,11 @@ RED attribution highlights (evasion):
 | UI Kibana không thấy alert dù script PASS | Time range UI quá hẹp | Chọn `Last 30 minutes`, search field theo RunId |
 | Evasion vẫn có Security Alerts từ rule khác | Catalog 1,620 rule khác fire trùng pattern | Demo claim chỉ nói **6 target rule IDs** miss — không claim 0 alert toàn catalog |
 | `ES_AUTH_HOST` literal `$ES_AUTH_HOST` trong log | Chưa load `.env` | `set -a; . ./.env; set +a` rồi mới run; verify `echo "$ES_AUTH_HOST"` |
+| AI Agent crash `DEEPSEEK_API_KEY chưa set` | `.env` chưa load trước khi chạy `agent.daemon` | `set -a; . ./.env; set +a` rồi rerun (Section 7.2) |
+| AI Agent log "polled 0 alerts" dù có RED alert | `--since` của agent trễ hơn timestamp alert, hoặc sai `ES_RED_INDEX` | Đặt `SINCE_AGENT=$(date -u -d '15 minutes ago' ...)` và verify `ES_RED_INDEX=red-alerts-v2-*` (kèm wildcard) |
+| AI Agent pick alert từ **wrong index** (e.g. `red-alerts-demo` thay vì `red-alerts-v2-*`) | `agent/__init__.py:9` `load_dotenv(override=True)` ghi đè mọi shell-prefix `ES_RED_INDEX=...` | Sửa trực tiếp `ES_RED_INDEX` trong `.env` (xem Section 7.2 — backup `.env`, `sed -i`, run, rồi restore) |
+| AI Agent hit `max_iter=12` ceiling (RED Analyst loop) | PowerShell alert phức tạp, LLM lặp tool call | Tăng `AGENT_MAX_ITERATIONS=20` trong `.env` rồi rerun; hoặc giảm `--score-threshold` chỉ lấy alert cao điểm |
+| Forensic agent trả `inconclusive` / không có process tree | Velociraptor gRPC sập hoặc client offline | `sudo systemctl restart velociraptor_server.service`; nếu cần hoãn → `export VR_USE_REAL=0` cho demo mock |
 
 ### Restart Elastic Agent (nếu events ngừng vào ELK)
 
@@ -503,7 +681,7 @@ tail -f /tmp/red_demo_v2_logs/detect_*.log
 
 ---
 
-## 10. Cleanup sau demo
+## 11. Cleanup sau demo
 
 ```bash
 # Stop daemons
@@ -544,7 +722,7 @@ cp /tmp/red_demo_v2_logs/*.log ~/demo_archive/v2_$(date +%Y%m%d_%H%M)/ 2>/dev/nu
 
 ---
 
-## 11. Short talk track (1-2 phút)
+## 12. Short talk track (1-2 phút)
 
 ```text
 Demo này gồm 3 mode chạy trên cùng 6 phase. Benign là sanity check: 6 target
@@ -562,11 +740,17 @@ mshta inline scheme attribute đúng family LethalHTA, curl swap attribute famil
 LOLBins network, char-code reconstruct attribute family PowerShell credential
 tooling. Đây không phải thay thế Sigma — đây là LAYER 2 adversarial-aware bám
 sát Sigma rule semantics nhưng generalize qua TF-IDF + Cosine.
+
+Layer 3 là AI Agent: với 1 RED evasion alert, 8 agent (Triage, Forensic,
+Hunt, RED Analyst, MITRE, Response, Report) sẽ tự kéo evidence từ Velociraptor,
+giải thích token-level vì sao alert này là evasion, generate Sigma patch
+grounded trên process tree thật, và ghi báo cáo tiếng Việt vào
+ai-investigations — end-to-end ~210 giây, chi phí ~2 cent/alert.
 ```
 
 ---
 
-## 12. Liên kết
+## 13. Liên kết
 
 - **Defense full** (apt_demo_scenario.ps1 7-phase): `demo/apt_demo_defense_present.md`
 - **Phase mapping chi tiết** + Velociraptor + AI Agent: `demo/apt_demo_scenario_demo_present_2.md`
