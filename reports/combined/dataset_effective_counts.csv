@@ -1,0 +1,5 @@
+event_type,train_benign,train_malicious,valid_benign,valid_evasion,test_benign,test_match,test_evasion
+process_creation,1279,6745,274,107,275,62,109
+powershell,2986,3294,639,30,641,21,34
+registry_event,8243,1551,1766,3,1767,14,4
+Tổng,12508,11590,2679,140,2683,97,147

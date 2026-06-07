@@ -1,0 +1,54 @@
+# RED-Linux - Stage 1 on clean GTFOBins LOLBin-abuse data.
+# benign = Linux-APT-2024 auditd/process commands
+# malicious = GTFOBins command snippets with MITRE labels, independent of Sigma
+
+data:
+  benign_train: /home/luanthanh/data/red_linux/benign/process_creation/benign_split_train.txt
+  benign_valid: /home/luanthanh/data/red_linux/benign/process_creation/benign_split_valid.txt
+  benign_test:  /home/luanthanh/data/red_linux/benign/process_creation/benign_split_test.txt
+  benign_field: process.command_line
+
+  events_dir:       /home/luanthanh/data/red_linux/split_gtfobins/match_train
+  events_valid_dir: /home/luanthanh/data/red_linux/split_gtfobins/match_valid
+  events_test_dir:  /home/luanthanh/data/red_linux/split_gtfobins/match_test
+
+  rules_dir: /home/luanthanh/data/sigma/rules/linux
+
+  search_fields:
+    - CommandLine
+    - Image
+  event_field_map:
+    CommandLine:
+      - process.command_line
+    Image:
+      - process.executable
+      - exe
+  max_benign_samples: 12000
+
+training:
+  malicious_samples: matches
+  normalize_benign: true
+  vectorization: tfidf
+  ngram_range: [1, 1]
+  search_params: true
+  ensemble: true
+  ensemble_members: [svm, lr, cnb]
+  scoring: f1
+  cv_folds: 5
+  num_jobs: 3
+
+validation:
+  malicious_samples: matches
+
+scaling:
+  mcc_scaling: true
+  mcc_threshold: 0.1
+  num_mcc_samples: 50
+
+evaluation:
+  num_thresholds: 50
+
+output:
+  dir: models/linux_gtfobins
+  result_name: ensemble_gtfobins
+  train_result_path: models/linux_gtfobins/train_rslt_ensemble_gtfobins.zip

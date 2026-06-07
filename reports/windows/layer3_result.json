@@ -1,0 +1,116 @@
+[
+  {
+    "event_type": "process_creation",
+    "config": "/home/luanthanh/KLTN/KLTN/Rule_Evasion_Detection_2/Rule_Evasion_Detection/config/process_creation.yaml",
+    "attr_path": "models/process_creation/train_rslt_attr_ensemble.zip",
+    "events_dir": "/home/luanthanh/data/sigma/events_hayabusa/windows/process_creation_test",
+    "split": "test",
+    "dedupe_by": "sample_rule",
+    "gt_source": "dir",
+    "n": 68,
+    "cosine": {
+      "1": 38.23529411764706,
+      "3": 64.70588235294117,
+      "5": 75.0,
+      "10": 79.41176470588235
+    },
+    "layer3": {
+      "3": {
+        "1": 64.70588235294117,
+        "3": 64.70588235294117,
+        "5": 75.0,
+        "10": 79.41176470588235
+      },
+      "5": {
+        "1": 75.0,
+        "3": 75.0,
+        "5": 75.0,
+        "10": 79.41176470588235
+      },
+      "10": {
+        "1": 79.41176470588235,
+        "3": 79.41176470588235,
+        "5": 79.41176470588235,
+        "10": 79.41176470588235
+      }
+    },
+    "rescued_top2_to_top10": 41.17647058823529,
+    "detail_path": "/home/luanthanh/KLTN/KLTN/Rule_Evasion_Detection_2/Rule_Evasion_Detection/reports/windows/layer3_process_creation_test_details.jsonl"
+  },
+  {
+    "event_type": "powershell",
+    "config": "/home/luanthanh/KLTN/KLTN/Rule_Evasion_Detection_2/Rule_Evasion_Detection/config/powershell.yaml",
+    "attr_path": "models/powershell/train_rslt_attr_ensemble.zip",
+    "events_dir": "/home/luanthanh/data/sigma/events_hayabusa/windows/powershell_test",
+    "split": "test",
+    "dedupe_by": "sample_rule",
+    "gt_source": "dir",
+    "n": 23,
+    "cosine": {
+      "1": 73.91304347826087,
+      "3": 95.65217391304348,
+      "5": 95.65217391304348,
+      "10": 100.0
+    },
+    "layer3": {
+      "3": {
+        "1": 95.65217391304348,
+        "3": 95.65217391304348,
+        "5": 95.65217391304348,
+        "10": 100.0
+      },
+      "5": {
+        "1": 95.65217391304348,
+        "3": 95.65217391304348,
+        "5": 95.65217391304348,
+        "10": 100.0
+      },
+      "10": {
+        "1": 100.0,
+        "3": 100.0,
+        "5": 100.0,
+        "10": 100.0
+      }
+    },
+    "rescued_top2_to_top10": 26.086956521739125,
+    "detail_path": "/home/luanthanh/KLTN/KLTN/Rule_Evasion_Detection_2/Rule_Evasion_Detection/reports/windows/layer3_powershell_test_details.jsonl"
+  },
+  {
+    "event_type": "registry_event",
+    "config": "/home/luanthanh/KLTN/KLTN/Rule_Evasion_Detection_2/Rule_Evasion_Detection/config/registry_event.yaml",
+    "attr_path": "models/registry_event/train_rslt_attr_ensemble.zip",
+    "events_dir": "/home/luanthanh/data/sigma/events_hayabusa/windows/registry_event_test",
+    "split": "test",
+    "dedupe_by": "sample_rule",
+    "gt_source": "dir",
+    "n": 14,
+    "cosine": {
+      "1": 71.42857142857143,
+      "3": 92.85714285714286,
+      "5": 92.85714285714286,
+      "10": 100.0
+    },
+    "layer3": {
+      "3": {
+        "1": 92.85714285714286,
+        "3": 92.85714285714286,
+        "5": 92.85714285714286,
+        "10": 100.0
+      },
+      "5": {
+        "1": 92.85714285714286,
+        "3": 92.85714285714286,
+        "5": 92.85714285714286,
+        "10": 100.0
+      },
+      "10": {
+        "1": 100.0,
+        "3": 100.0,
+        "5": 100.0,
+        "10": 100.0
+      }
+    },
+    "rescued_top2_to_top10": 28.57142857142857,
+    "detail_path": "/home/luanthanh/KLTN/KLTN/Rule_Evasion_Detection_2/Rule_Evasion_Detection/reports/windows/layer3_registry_event_test_details.jsonl"
+  }
+]

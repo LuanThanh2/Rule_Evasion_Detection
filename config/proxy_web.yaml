@@ -1,0 +1,39 @@
+# Configuration for Proxy Web event type experiments
+
+data:
+  benign_train: ~/data/benign/proxy_web/benign_train.txt
+  benign_field: url
+  events_dir: ~/data/sigma/events_hayabusa/windows/proxy_web
+  rules_dir: ~/data/sigma/rules/proxyweb/proxy_generic
+  # Sigma native field names — proxy event JSON dùng cùng tên (không cần map)
+  search_fields:
+    - url
+    - c-uri
+    - cs-uri-stem
+    - cs-uri-query
+  # event_field_map rỗng → fallback tên Sigma làm JSON path trực tiếp
+  event_field_map: {}
+  max_benign_samples: 10000
+  max_attribution_benign: 8000     # cap Stage 2 per-rule benign
+
+training:
+  malicious_samples: rule_filters
+  vectorization: tfidf
+  ngram_range: [1, 1]
+  search_params: true
+  scoring: f1
+  cv_folds: 5
+  num_jobs: 3
+
+scaling:
+  mcc_scaling: true
+  mcc_threshold: 0.1
+  num_mcc_samples: 50
+
+evaluation:
+  num_thresholds: 50
+
+output:
+  dir: models/proxy_web
+  result_name: ensemble_f1
+  attr_result_name: attr_ensemble

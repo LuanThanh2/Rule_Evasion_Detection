@@ -1,0 +1,361 @@
+#!/usr/bin/env python3
+"""Train per-rule attribution models (C3).
+
+Trains one binary SVM per Sigma rule: benign vs. rule_X filter values.
+Uses the best hyperparameters from the misuse model (C1) training.
+
+Pipeline:
+  1. Load rule set data
+  2. Load best params from misuse training result
+  3. For each rule with evasions:
+     a. Create training data: benign vs. rule_X filters
+     b. Normalize → TF-IDF → SVC with fixed params
+     c. Create MCC scaler
+  4. Save MultiTrainingResult (.zip)
+
+Usage:
+  python scripts/train_attribution.py --config config/process_creation.yaml
+  python scripts/train_attribution.py --benign-samples ... --events-dir ... \\
+         --rules-dir ... --model-params models/train_rslt_*_info.json
+"""
+
+import os
+import sys
+import json
+import argparse
+import logging
+import numpy as np
+from tqdm import tqdm
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from red.data import (
+    load_rule_set,
+    benign_samples_iter,
+    count_benign_samples,
+    extract_commandlines,
+    extract_filter_values,
+    extract_sigma_detection_values,
+    resolve_event_paths,
+    create_labels,
+)
+from red.normalize import normalize_samples
+from red.features import create_vectorizer
+from red.models import train_svc_fixed
+from red.evaluate import create_mcc_scaler
+from red.attribution import CosineRuleAttributor
+from red.persist import save_result, load_result
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(levelname)s: %(message)s")
+logger = logging.getLogger("train_attribution")
+
+
+CHECKPOINT_EVERY = 20  # save partial result every N rules to survive crashes
+
+
+def train_samples_iter(benign_path, malicious_samples, benign_field=None, max_benign=None):
+    """Yield benign first (capped) then malicious samples."""
+    for sample in benign_samples_iter(benign_path, field=benign_field, max_samples=max_benign):
+        yield sample
+    for sample in malicious_samples:
+        yield sample
+
+
+def _save_checkpoint(rule_models, cosine_attributor, svc_params, out_dir, result_name, n):
+    """Persist partial training state so a crash mid-loop doesn't lose work."""
+    ckpt = {
+        "rule_models": rule_models,
+        "cosine_attributor": cosine_attributor,
+        "svc_params": svc_params,
+        "checkpoint_at": n,
+    }
+    info = {
+        "result_name": f"{result_name}_ckpt_{n}",
+        "num_rules": len(rule_models),
+        "rules": list(rule_models.keys()),
+        "checkpoint_at": n,
+    }
+    save_result(ckpt, f"train_rslt_{result_name}_ckpt_{n}", out_dir, info=info)
+    logger.info("Checkpoint saved: %d rules trained", n)
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Train per-rule attribution models")
+    parser.add_argument("--config", type=str, help="Path to YAML config file")
+    parser.add_argument("--benign-samples", type=str)
+    parser.add_argument("--events-dir", type=str)
+    parser.add_argument("--rules-dir", type=str)
+    parser.add_argument("--search-fields", type=str, nargs="+",
+                        default=["CommandLine"],
+                        help="Sigma native field names (e.g. CommandLine, ScriptBlockText)")
+    parser.add_argument("--model-params", type=str,
+                        help="JSON file or TrainingResult .zip with best SVC params")
+    parser.add_argument("--vectorization", type=str, default="tfidf")
+    parser.add_argument("--ngram-range", type=str, default="(1,1)")
+    parser.add_argument("--mcc-scaling", action="store_true", default=True)
+    parser.add_argument("--mcc-threshold", type=float, default=0.1)
+    parser.add_argument("--cosine", action="store_true", default=True,
+                        help="Also build cosine attributor alongside per-rule SVMs")
+    parser.add_argument("--no-cosine", dest="cosine", action="store_false")
+    parser.add_argument("--benign-field", type=str, default=None,
+                        help="Dot-separated field path to extract from JSON/CSV benign data")
+    parser.add_argument("--max-attribution-benign", type=int, default=15000,
+                        help="Cap benign samples per rule (Stage 2 trains 100+ models, so cap matters)")
+    parser.add_argument("--out-dir", type=str, default="models")
+    parser.add_argument("--result-name", type=str, default="attr_svc_rules")
+    args = parser.parse_args()
+
+    if args.config:
+        import yaml
+        with open(args.config, "r") as f:
+            cfg = yaml.safe_load(f)
+        data_cfg = cfg.get("data", {})
+        train_cfg = cfg.get("training", {})
+        scale_cfg = cfg.get("scaling", {})
+        out_cfg = cfg.get("output", {})
+        args.benign_samples = args.benign_samples or data_cfg.get("benign_train")
+        args.events_dir = args.events_dir or data_cfg.get("events_dir")
+        args.rules_dir = args.rules_dir or data_cfg.get("rules_dir")
+        args.evasions_dir = data_cfg.get("evasions_dir")
+        args.search_fields = data_cfg.get("search_fields", args.search_fields)
+        args.event_field_map = data_cfg.get("event_field_map", {})
+        args.benign_field = data_cfg.get("benign_field", args.benign_field)
+        args.max_attribution_benign = data_cfg.get(
+            "max_attribution_benign", args.max_attribution_benign,
+        )
+        args.vectorization = train_cfg.get("vectorization", args.vectorization)
+        args.mcc_scaling = scale_cfg.get("mcc_scaling", args.mcc_scaling)
+        args.mcc_threshold = scale_cfg.get("mcc_threshold", args.mcc_threshold)
+        args.out_dir = out_cfg.get("dir", args.out_dir)
+        args.result_name = out_cfg.get("attr_result_name", args.result_name)
+        args.model_params = args.model_params or out_cfg.get("train_result_path")
+
+        ngram = train_cfg.get("ngram_range", [1, 1])
+        args.ngram_range = f"({ngram[0]},{ngram[1]})"
+    else:
+        args.event_field_map = {}
+
+    if not args.benign_samples or not args.events_dir or not args.rules_dir:
+        parser.error("--benign-samples, --events-dir, and --rules-dir are required")
+
+    args.benign_samples = os.path.expanduser(args.benign_samples)
+    args.events_dir = os.path.expanduser(args.events_dir)
+    args.rules_dir = os.path.expanduser(args.rules_dir)
+    args.out_dir = os.path.expanduser(args.out_dir)
+
+    # Pre-flight validation
+    if not os.path.isfile(args.benign_samples):
+        parser.error(f"Benign file not found: {args.benign_samples}")
+    if not os.path.isdir(args.events_dir):
+        parser.error(f"Events dir not found: {args.events_dir}")
+    if not os.path.isdir(args.rules_dir):
+        parser.error(f"Rules dir not found: {args.rules_dir}")
+
+    sample_check = list(benign_samples_iter(args.benign_samples, args.benign_field, max_samples=10))
+    if len(sample_check) == 0:
+        parser.error(
+            f"Benign file produced 0 samples — check format/field mapping: "
+            f"{args.benign_samples} (benign_field={args.benign_field})"
+        )
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    ngram_range = eval(args.ngram_range)
+
+    # Load best params from misuse training
+    svc_params = {"C": 1.0, "kernel": "linear", "class_weight": "balanced"}
+    if args.model_params:
+        if args.model_params.endswith(".zip"):
+            train_rslt = load_result(args.model_params)
+            best_params = train_rslt.get("best_params", {})
+            if "svm" in best_params:
+                best_params = best_params["svm"]
+            svc_params = {
+                "C": best_params.get("C", 1.0),
+                "kernel": best_params.get("kernel", "linear"),
+                "class_weight": best_params.get("class_weight", "balanced"),
+            }
+        elif args.model_params.endswith(".json"):
+            with open(args.model_params) as f:
+                info = json.load(f)
+            if "estimator_params" in info:
+                p = info["estimator_params"]
+                svc_params = {"C": p.get("C", 1.0), "kernel": p.get("kernel", "linear"),
+                              "class_weight": p.get("class_weight", "balanced")}
+            elif "best_params" in info:
+                svc_params = info["best_params"]
+
+    logger.info("Using SVC params: %s", svc_params)
+
+    # Load rule set
+    evasions_dir = os.path.expanduser(getattr(args, "evasions_dir", None) or "")
+    evasions_dir = evasions_dir if os.path.isdir(evasions_dir) else None
+    rule_set = load_rule_set(args.events_dir, args.rules_dir, evasions_dir=evasions_dir)
+    num_benign = count_benign_samples(
+        args.benign_samples, args.benign_field, max_samples=args.max_attribution_benign,
+    )
+    logger.info("Stage 2 benign cap: %d (per-rule training)", num_benign)
+
+    # Pre-collect normalized filter values per rule (used by both SVM and Cosine).
+    # Ưu tiên nguồn (theo chất lượng):
+    #   1. Raw Sigma detection blocks (rule_data.sigma_values) — match nếu YAML tìm được
+    #   2. AMIDES Lucene filter strings (rule_data.filters) — AMIDES preprocessed format
+    #   3. Match events fallback (rule_data.matches) — dùng khi YAML không tìm được
+    #      (vì Sigma YAML filename ≠ Hayabusa events dir name)
+    event_paths = resolve_event_paths(args.search_fields, args.event_field_map)
+    rule_filters_normalized = {}
+    for rule_name, rule_data in rule_set.items():
+        rule_filter_values = []
+        # Raw Sigma detection blocks
+        for detection in rule_data.sigma_values:
+            if isinstance(detection, dict):
+                vals = extract_sigma_detection_values(detection, args.search_fields)
+                rule_filter_values.extend(vals)
+        # AMIDES Lucene filter strings (event_paths vì Lucene dùng Hayabusa field names)
+        for filt in rule_data.filters:
+            vals = extract_filter_values(filt, event_paths)
+            rule_filter_values.extend(vals)
+        # Fallback: match events — khi YAML không match được theo tên file
+        if not rule_filter_values and rule_data.matches:
+            rule_filter_values = extract_commandlines(rule_data.matches, event_paths)
+            if rule_filter_values:
+                logger.info("Rule %s: YAML not found, using %d match events as positives",
+                            rule_name, len(rule_filter_values))
+        if len(rule_filter_values) == 0:
+            logger.warning("Rule %s has no filter values and no match events, skipping", rule_name)
+            continue
+        normalized = normalize_samples(rule_filter_values)
+        if normalized:
+            rule_filters_normalized[rule_name] = normalized
+
+    # Train per-rule SVM models — checkpoint every CHECKPOINT_EVERY rules to survive crashes
+    rule_models = {}
+    trained_count = 0
+
+    rule_iter = tqdm(rule_filters_normalized.items(), desc="Per-rule SVM", unit="rule")
+    for rule_name, malicious_normalized in rule_iter:
+        try:
+            # Create vectorizer and transform (capped benign + this rule's filters)
+            vectorizer = create_vectorizer(args.vectorization, ngram_range=ngram_range)
+            feature_vectors = vectorizer.fit_transform(
+                train_samples_iter(
+                    args.benign_samples, malicious_normalized,
+                    benign_field=args.benign_field,
+                    max_benign=args.max_attribution_benign,
+                )
+            )
+            labels = create_labels(num_benign, len(malicious_normalized))
+
+            # Train SVC with fixed params (best params from Stage 1)
+            estimator = train_svc_fixed(feature_vectors, labels, **svc_params)
+
+            # MCC scaler
+            scaler, shift = None, 0.0
+            if args.mcc_scaling:
+                df_values = estimator.decision_function(feature_vectors)
+                try:
+                    scaler, shift = create_mcc_scaler(
+                        df_values, labels, mcc_threshold=args.mcc_threshold,
+                    )
+                except Exception as e:
+                    logger.warning("MCC scaler failed for %s: %s", rule_name, e)
+
+            rule_models[rule_name] = {
+                "estimator": estimator,
+                "vectorizer": vectorizer,
+                "scaler": scaler,
+                "shift": shift,
+            }
+            trained_count += 1
+            rule_iter.set_postfix({"trained": trained_count, "n_mal": len(malicious_normalized)})
+
+            # Periodic checkpoint
+            if trained_count > 0 and trained_count % CHECKPOINT_EVERY == 0:
+                _save_checkpoint(
+                    rule_models, None, svc_params,
+                    args.out_dir, args.result_name, trained_count,
+                )
+        except Exception as e:
+            logger.error("Failed to train rule %s: %s — skipping", rule_name, e)
+            continue
+
+    logger.info("Trained %d rule models", trained_count)
+
+    # ── Cosine attributor — EXPANDED 2026-05-19 ──
+    # Cosine không cần match events, chỉ cần filter values từ YAML detection block.
+    # Vì vậy bổ sung TẤT CẢ rule trong rules_dir (1,624 catalog) vào Cosine fit,
+    # KHÔNG giới hạn ở rule có Hayabusa match events (~146 rule).
+    #
+    # Nguyên tắc merge:
+    #   - Rule đã có trong rule_filters_normalized (event-based, có match events)
+    #     → giữ nguyên filter values + match events
+    #   - Rule chỉ có YAML (chưa Hayabusa scan) → thêm vào với filter values từ YAML
+    cosine_filters_normalized = dict(rule_filters_normalized)
+    if args.cosine and args.rules_dir:
+        from red.rule_metadata import normalize_title
+        catalog_added = 0
+        catalog_skipped = 0
+        rules_dir_path = os.path.expanduser(args.rules_dir)
+        if os.path.isdir(rules_dir_path):
+            logger.info("Loading catalog rule set from %s for Cosine expansion...", rules_dir_path)
+            # Force pure-catalog mode: events_dir=None để load theo YAML files
+            catalog_rule_set = load_rule_set(events_dir=None, rules_dir=rules_dir_path,
+                                              evasions_dir=None)
+            for rule_name, rule_data in catalog_rule_set.items():
+                # Normalize key sang Hayabusa convention (snake_case) để khớp với
+                # SigmaRuleIndex lookup. rule_name từ catalog = raw title (vd
+                # "Suspicious PowerShell Download") → normalize trước.
+                normalized_key = normalize_title(rule_name) if rule_name else rule_name
+                if not normalized_key:
+                    catalog_skipped += 1
+                    continue
+                if normalized_key in cosine_filters_normalized:
+                    continue  # đã có trong event-based set
+                # Extract filter values từ YAML
+                vals = []
+                for detection in rule_data.sigma_values:
+                    if isinstance(detection, dict):
+                        vals.extend(extract_sigma_detection_values(detection, args.search_fields))
+                for filt in rule_data.filters:
+                    vals.extend(extract_filter_values(filt, event_paths))
+                if not vals:
+                    catalog_skipped += 1
+                    continue
+                normalized = normalize_samples(vals)
+                if normalized:
+                    cosine_filters_normalized[normalized_key] = normalized
+                    catalog_added += 1
+                else:
+                    catalog_skipped += 1
+            logger.info("Catalog expansion: added %d rules (skipped %d empty), total %d for Cosine",
+                        catalog_added, catalog_skipped, len(cosine_filters_normalized))
+
+    cosine_attributor = None
+    if args.cosine and cosine_filters_normalized:
+        logger.info("Building cosine attributor on shared vector space (%d rules)...",
+                    len(cosine_filters_normalized))
+        cosine_vectorizer = create_vectorizer(args.vectorization, ngram_range=ngram_range)
+        cosine_attributor = CosineRuleAttributor.fit(
+            cosine_filters_normalized, cosine_vectorizer,
+        )
+
+    # Save
+    result = {
+        "rule_models": rule_models,
+        "cosine_attributor": cosine_attributor,
+        "svc_params": svc_params,
+    }
+    info = {
+        "result_name": args.result_name,
+        "num_rules": trained_count,
+        "num_cosine_rules": len(cosine_filters_normalized) if cosine_attributor else 0,
+        "svc_params": svc_params,
+        "rules": list(rule_models.keys()),
+        "cosine_rules": sorted(cosine_filters_normalized.keys()) if cosine_attributor else [],
+        "cosine_enabled": cosine_attributor is not None,
+    }
+    save_result(result, f"train_rslt_{args.result_name}", args.out_dir, info=info)
+    logger.info("Attribution training complete.")
+
+
+if __name__ == "__main__":
+    main()
