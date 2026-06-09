@@ -23,6 +23,7 @@ from red.persist import load_result
 from red.data import resolve_event_paths
 from red.attribution import reciprocal_rank_fusion
 from red.rule_metadata import SigmaRuleIndex
+from red.sigma_exact import SigmaExactMatcher
 
 logger = logging.getLogger("detect_live")
 
@@ -144,6 +145,49 @@ def attribute_stage2(normalized: str, rule_models: dict, cosine_attributor,
     return reciprocal_rank_fusion([svm_ranking, cosine_ranking], k=rrf_k)[:top_k]
 
 
+def parse_preferred_sigma_ids(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip().lower() for item in value.split(",") if item.strip()]
+
+
+def sort_exact_matches(exact_matches: list, preferred_ids: list[str]) -> list:
+    if not exact_matches or not preferred_ids:
+        return exact_matches
+
+    def priority(match) -> tuple[int, str]:
+        sigma_id = match.sigma_id.lower()
+        for idx, preferred in enumerate(preferred_ids):
+            if sigma_id == preferred or sigma_id.startswith(preferred):
+                return idx, match.rule
+        return len(preferred_ids), match.rule
+
+    return sorted(exact_matches, key=priority)
+
+
+def promote_exact_matches(top_rules: list, exact_matches: list, top_k: int) -> list:
+    """Place exact Sigma matches before ML attribution guesses."""
+    if not exact_matches:
+        return top_rules
+
+    promoted = []
+    seen = set()
+    for match in exact_matches:
+        if match.rule in seen:
+            continue
+        promoted.append((match.rule, 1.0))
+        seen.add(match.rule)
+
+    for rule_name, score in top_rules:
+        if rule_name in seen:
+            continue
+        promoted.append((rule_name, score))
+        seen.add(rule_name)
+        if len(promoted) >= top_k:
+            break
+    return promoted[:top_k]
+
+
 def load_state(path: str, default_ts: str) -> str:
     if os.path.exists(path):
         with open(path) as f:
@@ -196,7 +240,25 @@ def main():
     parser.add_argument("--no-state", action="store_true")
     parser.add_argument("--max-iter", type=int, default=0)
     parser.add_argument("--batch-size", type=int, default=500)
+    parser.add_argument(
+        "--exact-sigma",
+        action="store_true",
+        help="Validate matching Sigma rules against each suspicious event and promote exact matches.",
+    )
+    parser.add_argument(
+        "--exact-sigma-max-matches",
+        type=int,
+        default=10,
+        help="Maximum exact Sigma matches to store in each alert.",
+    )
+    parser.add_argument(
+        "--exact-sigma-prefer-ids",
+        type=str,
+        default="",
+        help="Comma-separated Sigma UUIDs or prefixes to prefer when multiple exact rules fire.",
+    )
     args = parser.parse_args()
+    preferred_sigma_ids = parse_preferred_sigma_ids(args.exact_sigma_prefer_ids)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -236,6 +298,7 @@ def main():
 
     rules_dir = data_cfg.get("rules_dir")
     rule_index = None
+    exact_matcher = None
     if rules_dir:
         all_rule_dirs = [rules_dir]
         rules_base = os.path.dirname(os.path.expanduser(rules_dir))
@@ -246,6 +309,13 @@ def main():
         rule_index = SigmaRuleIndex.from_rules_dirs(all_rule_dirs)
         logger.info("SigmaRuleIndex: %d Sigma rules indexed for metadata enrichment",
                     len(rule_index))
+        if args.exact_sigma:
+            exact_matcher = SigmaExactMatcher.from_rules_dirs(
+                [rules_dir],
+                event_field_map=event_field_map,
+                search_fields=search_fields,
+            )
+            logger.info("Exact Sigma validation enabled for %s", rules_dir)
 
     normalizer = Normalizer()
 
@@ -307,6 +377,14 @@ def main():
                         normalized, rule_models, cosine_attributor,
                         args.method, args.top_k,
                     )
+                    exact_matches = (
+                        exact_matcher.match_event(event) if exact_matcher is not None else []
+                    )
+                    exact_matches = sort_exact_matches(exact_matches, preferred_sigma_ids)
+                    if exact_matches:
+                        top_rules = promote_exact_matches(
+                            top_rules, exact_matches, args.top_k,
+                        )
 
                     top_rule_name = top_rules[0][0] if top_rules else None
                     top_rules_enriched = []
@@ -323,6 +401,11 @@ def main():
                         "@timestamp": event.get("@timestamp"),
                         "red.detection_score": round(score, 4),
                         "red.attribution_method": args.method,
+                        "red.exact_sigma_match": bool(exact_matches),
+                        "red.exact_sigma_matches": [
+                            match.to_alert_dict()
+                            for match in exact_matches[:args.exact_sigma_max_matches]
+                        ],
                         "red.top_rule": top_rule_name,
                         "red.top_rules": top_rules_enriched,
                         "red.command_line": text,
