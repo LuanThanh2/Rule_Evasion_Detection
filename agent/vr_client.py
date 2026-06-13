@@ -10,6 +10,7 @@ Tham khảo: https://docs.velociraptor.app/docs/server_automation/server_api/
 """
 
 import os
+import re
 import json
 import logging
 from typing import Optional
@@ -195,11 +196,7 @@ _VQL_PROCESS_TREE = """
 LET flow <= collect_client(client_id=ClientId,
                             artifacts=['Windows.System.Pslist'],
                             timeout=60)
-SELECT Pid, Name, Exe, CommandLine, Username, Ppid,
-       Authenticode.Trusted AS Trusted,
-       Authenticode.IssuerName AS Publisher,
-       CreateTime
-FROM foreach(
+SELECT * FROM foreach(
     row={SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
          WHERE FlowId = flow.flow_id LIMIT 1},
     query={SELECT Pid, Name, Exe, CommandLine, Username, Ppid,
@@ -233,11 +230,7 @@ LET flow <= collect_client(client_id=ClientId,
                                 Calculate_Hash='Y'
                             )),
                             timeout=90)
-SELECT OSPath AS FullPath, Size,
-       MTime AS Modified,
-       BTime AS Created,
-       Hash.SHA256 AS SHA256
-FROM foreach(
+SELECT * FROM foreach(
     row={SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
          WHERE FlowId = flow.flow_id LIMIT 1},
     query={SELECT OSPath AS FullPath, Size,
@@ -252,10 +245,7 @@ _VQL_NETSTAT = """
 LET flow <= collect_client(client_id=ClientId,
                             artifacts=['Windows.Network.NetstatEnriched'],
                             timeout=60)
-SELECT Pid, Name AS ProcessName, Status,
-       Laddr.IP AS LocalIP, Laddr.Port AS LocalPort,
-       Raddr.IP AS RemoteIP, Raddr.Port AS RemotePort
-FROM foreach(
+SELECT * FROM foreach(
     row={SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
          WHERE FlowId = flow.flow_id LIMIT 1},
     query={SELECT Pid, Name AS ProcessName, Status,
@@ -264,7 +254,7 @@ FROM foreach(
            FROM source(client_id=ClientId, flow_id=flow.flow_id,
                        artifact='Windows.Network.NetstatEnriched')
            WHERE Status = 'ESTABLISHED'
-             AND NOT (RemoteIP =~ '^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|127\\.|169\\.254\\.)')}
+             AND NOT (Raddr.IP =~ '^(10\\.|192\\.168\\.|172\\.(1[6-9]|2[0-9]|3[01])\\.|127\\.|169\\.254\\.)')}
 )
 LIMIT 100
 """
@@ -320,41 +310,305 @@ def _run_vql(vql: str, client_id: str, env: Optional[dict] = None) -> list[dict]
         return rows
 
 
+# ── OS detection (hỏi thẳng Velociraptor, cache theo client_id) ───
+# Forensic phải đa-OS: lab có cả Windows (DESKTOP-IQAM883) lẫn Linux (WebServer
+# 'ubuntu'). Query host Linux bằng VQL Windows → rỗng → grade=missing (chính là
+# bug cũ). Detect OS trước rồi chọn đúng artifact.
+
+_OS_CACHE: dict = {}
+_VQL_DETECT_OS = "SELECT os_info.system AS os FROM clients(client_id=ClientId) LIMIT 1"
+
+
+def _detect_os(client_id: str) -> str:
+    """OS của client_id → 'windows' | 'linux' | 'darwin'. Cache RAM.
+
+    Mặc định 'windows' khi không xác định được (giữ tương thích lab Windows cũ).
+    """
+    if client_id in _OS_CACHE:
+        return _OS_CACHE[client_id]
+    osname = "windows"
+    try:
+        rows = _run_vql(_VQL_DETECT_OS, client_id)
+        if rows and rows[0].get("os"):
+            osname = str(rows[0]["os"]).strip().lower()
+    except Exception as e:
+        logger.warning("Không detect được OS cho %s: %s — mặc định windows", client_id, e)
+    _OS_CACHE[client_id] = osname
+    return osname
+
+
+# ── Helpers dựng cây tiến trình (dùng chung Windows + Linux) ──────
+
+def _to_int(v) -> Optional[int]:
+    """Ép Pid/Ppid về int. Linux.Sys.Pslist trả string ('1','0'); Windows trả int.
+
+    Bug Linux nếu không ép: so '0' == 0 → False → children luôn rỗng.
+    """
+    try:
+        return int(str(v).strip())
+    except (ValueError, TypeError, AttributeError):
+        return None
+
+
+def _build_process_tree(rows: list[dict], pid) -> tuple[dict, list, list]:
+    """List process phẳng → (target, parent_chain, children). Có guard chống loop."""
+    pid = _to_int(pid)
+    by_pid: dict[int, dict] = {}
+    ppid_of: dict[int, Optional[int]] = {}
+    for r in rows:
+        p = _to_int(r.get("Pid"))
+        if p is None:
+            continue
+        by_pid[p] = r
+        ppid_of[p] = _to_int(r.get("Ppid"))
+    if pid is None:
+        return {}, [], []
+    target = by_pid.get(pid, {})
+    children = [by_pid[p] for p, pp in ppid_of.items() if pp == pid]
+    parents: list[dict] = []
+    seen: set[int] = set()
+    cur = pid
+    for _ in range(12):
+        pp = ppid_of.get(cur)
+        if pp is None or pp in seen:
+            break
+        seen.add(pp)
+        parent = by_pid.get(pp)
+        if not parent:
+            break
+        parents.append(parent)
+        cur = pp
+    return target, parents, children
+
+
+def _is_external_ip(ip) -> bool:
+    """True nếu IP là external (không private/loopback/link-local/wildcard)."""
+    if not ip or not isinstance(ip, str):
+        return False
+    ip = ip.strip()
+    if ip in ("", "0.0.0.0", "::", "*", "::1"):
+        return False
+    return not re.match(
+        r"^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|127\.|169\.254\.|fe80|fc|fd)",
+        ip,
+    )
+
+
+# ── VQL Linux (đối xứng với block Windows ở trên) ────────────────
+
+_VQL_PROCESS_TREE_LINUX = """
+LET flow <= collect_client(client_id=ClientId,
+                            artifacts=['Linux.Sys.Pslist'],
+                            timeout=60)
+SELECT * FROM foreach(
+    row={SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
+         WHERE FlowId = flow.flow_id LIMIT 1},
+    query={SELECT Pid, Ppid, Name, CommandLine, Exe, Username, Hash.SHA256 AS SHA256
+           FROM source(client_id=ClientId, flow_id=flow.flow_id,
+                       artifact='Linux.Sys.Pslist')}
+)
+"""
+
+# Cột PHẲNG Laddr/Lport/Raddr/Rport/Pid/Status/ProcInfo (khác Windows lồng Laddr.IP)
+# → SELECT * rồi lọc ESTABLISHED + external IP trong Python.
+_VQL_NETSTAT_LINUX = """
+LET flow <= collect_client(client_id=ClientId,
+                            artifacts=['Linux.Network.NetstatEnriched'],
+                            timeout=60)
+SELECT * FROM foreach(
+    row={SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
+         WHERE FlowId = flow.flow_id LIMIT 1},
+    query={SELECT * FROM source(client_id=ClientId, flow_id=flow.flow_id,
+                                artifact='Linux.Network.NetstatEnriched')}
+)
+LIMIT 200
+"""
+
+# File dropper: 1 glob (SearchFilesGlob — biến thể GlobTable trả schema khác, null
+# OSPath). Brace-expansion bao thư mục writable hay bị drop; leaf chỉ script/archive/
+# hidden-script để giảm nhiễu (bắt cả /home/root/.adobe_update.sh qua '.*sh').
+# {,*/} = 0 hoặc 1 cấp con → bounded, không treo. LocalFilesystemOnly tránh mount mạng.
+_VQL_FILES_LINUX = """
+LET flow <= collect_client(client_id=ClientId,
+                            artifacts=['Linux.Search.FileFinder'],
+                            spec=dict(`Linux.Search.FileFinder`=dict(
+                                SearchFilesGlob='/{tmp,var/tmp,dev/shm,root,home/*}/{,*/}{.*sh,.*py,.*sh.*,*.sh,*.py,*.elf,*.bin,*.tar.gz,*.gz,*.tgz}',
+                                Calculate_Hash='Y',
+                                LocalFilesystemOnly='Y'
+                            )),
+                            timeout=120)
+SELECT * FROM foreach(
+    row={SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
+         WHERE FlowId = flow.flow_id LIMIT 1},
+    query={SELECT OSPath AS FullPath, Size, MTime AS Modified, Hash.SHA256 AS SHA256
+           FROM source(client_id=ClientId, flow_id=flow.flow_id,
+                       artifact='Linux.Search.FileFinder')}
+)
+LIMIT 200
+"""
+
+# Persistence: crontab (demo cài cron gọi .adobe_update.sh). Cột: User, Command, Path.
+_VQL_CRONTAB_LINUX = """
+LET flow <= collect_client(client_id=ClientId,
+                            artifacts=['Linux.Sys.Crontab'],
+                            timeout=60)
+SELECT 'cron' AS Source, User, Command, Path AS Location
+FROM foreach(
+    row={SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
+         WHERE FlowId = flow.flow_id LIMIT 1},
+    query={SELECT User, Command, Path
+           FROM source(client_id=ClientId, flow_id=flow.flow_id,
+                       artifact='Linux.Sys.Crontab')}
+)
+LIMIT 200
+"""
+
+# Lịch sử lệnh: bash history. Cột: Line, OSPath. (Lệnh chạy non-interactive qua
+# script .sh sẽ KHÔNG ở đây — nguồn đầy đủ là index auditd trong ES.)
+_VQL_BASH_HISTORY_LINUX = """
+LET flow <= collect_client(client_id=ClientId,
+                            artifacts=['Linux.Sys.BashHistory'],
+                            timeout=60)
+SELECT Line, OSPath AS HistoryFile
+FROM foreach(
+    row={SELECT * FROM watch_monitoring(artifact='System.Flow.Completion')
+         WHERE FlowId = flow.flow_id LIMIT 1},
+    query={SELECT Line, OSPath
+           FROM source(client_id=ClientId, flow_id=flow.flow_id,
+                       artifact='Linux.Sys.BashHistory')}
+)
+LIMIT 500
+"""
+
+# Heuristic: lệnh shell đáng ngờ (download / exfil / persistence / encoding).
+_SUSPICIOUS_CMD_RE = re.compile(
+    r"\b(curl|wget|nc|ncat|base64|openssl\s+enc|tar\s+|gzip|xxd|"
+    r"crontab|systemctl|chmod\s+\+x|/dev/tcp/|/dev/shm/|"
+    r"\.adobe|exfil|reverse|payload|mkfifo|bash\s+-i)\b",
+    re.IGNORECASE,
+)
+
+
+def _filter_suspicious_bash(rows: list[dict]) -> list[dict]:
+    return [r for r in rows
+            if r.get("Line") and _SUSPICIOUS_CMD_RE.search(str(r["Line"]))]
+
+
+# ── Linux query helpers ──────────────────────────────────────────
+
+def _linux_file_artifacts(client_id: str) -> dict:
+    """File dropper + cron persistence + bash history trên host Linux.
+
+    PID-independent → vẫn lấy được bằng chứng kể cả khi tiến trình tấn công đã thoát
+    (bằng chứng còn trên đĩa). Đây là cách lật grade từ 'missing' về thật cho alert cũ.
+    """
+    files: list[dict] = []
+    persistence: list[dict] = []
+    command_history: list[dict] = []
+    errors: list[str] = []
+
+    try:
+        raw_files = _run_vql(_VQL_FILES_LINUX, client_id)
+        # Dedupe theo path (brace-glob '{,*/}' có thể match trùng 1 file)
+        seen_paths: set = set()
+        for f in raw_files:
+            p = f.get("FullPath")
+            if p and p not in seen_paths:
+                seen_paths.add(p)
+                files.append(f)
+    except Exception as e:
+        logger.warning("Linux file query failed: %s", e)
+        errors.append(f"file_query: {e}")
+    try:
+        persistence = _run_vql(_VQL_CRONTAB_LINUX, client_id)
+    except Exception as e:
+        logger.warning("Linux crontab query failed: %s", e)
+        errors.append(f"crontab_query: {e}")
+    try:
+        command_history = _filter_suspicious_bash(_run_vql(_VQL_BASH_HISTORY_LINUX, client_id))
+    except Exception as e:
+        logger.warning("Linux bash history query failed: %s", e)
+        errors.append(f"bash_query: {e}")
+
+    has_evidence = bool(files or persistence or command_history)
+    grade = "high" if has_evidence else "low"
+    if errors and not has_evidence:
+        grade = "missing"
+
+    return {
+        "os": "linux",
+        "files_dropped": files,
+        "persistence": persistence,            # cron entries (User/Command/Location)
+        "command_history": command_history,    # bash history đáng ngờ
+        "_evidence_grade": grade,
+        **({"_query_errors": errors} if errors else {}),
+    }
+
+
+def _linux_network(client_id: str) -> dict:
+    """Kết nối external đang active trên host Linux (ESTABLISHED, non-private remote)."""
+    try:
+        rows = _run_vql(_VQL_NETSTAT_LINUX, client_id)
+    except Exception as e:
+        logger.warning("Velociraptor query failed (linux netstat): %s", e)
+        return {"os": "linux", "connections": [], "_evidence_grade": "missing",
+                "_real_query_failed": str(e)}
+    conns: list[dict] = []
+    for r in rows:
+        if str(r.get("Status", "")).upper() != "ESTABLISHED":
+            continue
+        raddr = r.get("Raddr")
+        if not _is_external_ip(raddr):
+            continue
+        proc = r.get("ProcInfo") or {}
+        conns.append({
+            "process": proc.get("Name") or r.get("Name"),
+            "pid": r.get("Pid") or proc.get("Pid"),
+            "command_line": proc.get("CommandLine"),
+            "local": f"{r.get('Laddr')}:{r.get('Lport')}",
+            "remote_ip": raddr,
+            "remote_port": r.get("Rport"),
+            "status": r.get("Status"),
+        })
+    return {"os": "linux", "connections": conns,
+            "_evidence_grade": "high" if conns else "low"}
+
+
 # ── Public API — gọi từ tools.py ─────────────────────────────────
 
 def get_process_tree_deep(client_id: str, pid: int) -> dict:
-    """Lấy cây tiến trình sâu (parent chain + children + ký số) từ host thật."""
+    """Lấy cây tiến trình sâu (parent chain + children + ký số/hash) từ host thật.
+
+    OS-aware: Windows → Windows.System.Pslist; Linux → Linux.Sys.Pslist.
+    """
     if not VR_USE_REAL:
         return _MOCK_PROCESS_TREE
 
     client_id = _resolve_client_id(client_id)
+    osname = _detect_os(client_id)
+    vql = _VQL_PROCESS_TREE_LINUX if osname == "linux" else _VQL_PROCESS_TREE
     try:
-        rows = _run_vql(_VQL_PROCESS_TREE, client_id)
-        # Tổ chức cây từ tất cả process: target → parent chain (up) + children (down)
-        by_pid = {int(r["Pid"]): r for r in rows if r.get("Pid") is not None}
-        target = by_pid.get(int(pid), {})
-        children = [r for r in rows if r.get("Ppid") == pid]
-        # Parent chain leo lên tới khi Ppid=0 hoặc không còn
-        parents: list[dict] = []
-        cur = target
-        for _ in range(8):  # max 8 levels
-            ppid = cur.get("Ppid") if cur else None
-            if not ppid:
-                break
-            cur = by_pid.get(int(ppid))
-            if not cur:
-                break
-            parents.append(cur)
-        return {
+        rows = _run_vql(vql, client_id)
+        target, parents, children = _build_process_tree(rows, pid)
+        result = {
+            "os": osname,
             "target_process": target,
             "parent_chain": parents,
             "children": children,
             "total_procs_scanned": len(rows),
             "_evidence_grade": "high" if target else ("low" if rows else "missing"),
         }
+        if rows and not target:
+            result["_note_vi"] = (
+                f"PID {pid} không còn trong process list (tiến trình đã thoát). "
+                "Host vẫn online — gọi vr_file_artifacts để lấy bằng chứng còn trên đĩa "
+                "(file dropper, cron persistence, lịch sử lệnh)."
+            )
+        return result
     except Exception as e:
-        logger.warning("Velociraptor query failed (process tree): %s", e)
+        logger.warning("Velociraptor query failed (process tree, os=%s): %s", osname, e)
         return {
+            "os": osname,
             "target_process": {},
             "parent_chain": [],
             "children": [],
@@ -375,6 +629,9 @@ def get_file_artifacts(client_id: str, since_minutes: int = 30) -> dict:
         return _MOCK_FILE_ARTIFACTS
 
     client_id = _resolve_client_id(client_id)
+    if _detect_os(client_id) == "linux":
+        return _linux_file_artifacts(client_id)
+
     files: list[dict] = []
     persistence: list[dict] = []
     errors: list[str] = []
@@ -421,6 +678,9 @@ def get_network_connections_deep(client_id: str, since_minutes: int = 30) -> dic
         return _MOCK_NETWORK
 
     client_id = _resolve_client_id(client_id)
+    if _detect_os(client_id) == "linux":
+        return _linux_network(client_id)
+
     try:
         rows = _run_vql(_VQL_NETSTAT, client_id, env={"SinceMinutes": since_minutes})
         return {"connections": rows, "_evidence_grade": "high" if rows else "low"}

@@ -48,10 +48,31 @@ from red.persist import load_result
 from red.data import resolve_event_paths
 from red.attribution import reciprocal_rank_fusion
 from red.rule_metadata import SigmaRuleIndex
+from red.sigma_exact import SigmaExactMatcher
 
 logger = logging.getLogger("detect_live_linux")
 
 STATE_FILE = ".detect_live_linux_state.json"
+
+
+def promote_exact_matches(top_rules, exact_matches, top_k):
+    """Layer-3: đặt luật Sigma FIRE-THẬT (logic xác nhận) lên trước phỏng đoán cosine."""
+    if not exact_matches:
+        return top_rules
+    promoted, seen = [], set()
+    for m in exact_matches:
+        if m.rule in seen:
+            continue
+        promoted.append((m.rule, 1.0))
+        seen.add(m.rule)
+    for rule_name, s in top_rules:
+        if rule_name in seen:
+            continue
+        promoted.append((rule_name, s))
+        seen.add(rule_name)
+        if len(promoted) >= top_k:
+            break
+    return promoted[:top_k]
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -249,6 +270,9 @@ def main():
     parser.add_argument("--max-iter", type=int, default=0,
                         help="Stop after N iterations (0 = run forever)")
     parser.add_argument("--batch-size", type=int, default=500)
+    parser.add_argument("--exact-sigma", action=argparse.BooleanOptionalAction, default=True,
+                        help="Layer-3: chạy logic Sigma trên event, đẩy luật fire-thật lên #1 "
+                             "(tắt bằng --no-exact-sigma)")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -311,6 +335,16 @@ def main():
             len(rule_index),
             all_rule_dirs,
         )
+
+    # ── Layer-3: Sigma-logic exact matcher (rerank attribution) ───────────────
+    exact_matcher = None
+    if all_rule_dirs and args.exact_sigma:
+        exact_matcher = SigmaExactMatcher.from_rules_dirs(
+            all_rule_dirs,
+            event_field_map=event_field_map,
+            search_fields=search_fields,
+        )
+        logger.info("Layer-3 BẬT — exact Sigma validation trên %d thư mục rule", len(all_rule_dirs))
 
     normalizer = Normalizer()
 
@@ -390,6 +424,11 @@ def main():
                         args.method, args.top_k,
                     )
 
+                    # Layer-3: luật Sigma thật sự fire trên event → đẩy lên #1
+                    exact_matches = exact_matcher.match_event(event) if exact_matcher else []
+                    if exact_matches:
+                        top_rules = promote_exact_matches(top_rules, exact_matches, args.top_k)
+
                     top_rule_name = top_rules[0][0] if top_rules else None
                     top_rules_enriched = []
                     for r, s in top_rules:
@@ -405,6 +444,8 @@ def main():
                         "@timestamp": event.get("@timestamp"),
                         "red.detection_score": round(score, 4),
                         "red.attribution_method": args.method,
+                        "red.exact_sigma_match": bool(exact_matches),
+                        "red.exact_sigma_matches": [m.to_alert_dict() for m in exact_matches],
                         "red.top_rule": top_rule_name,
                         "red.top_rules": top_rules_enriched,
                         "red.command_line": text,

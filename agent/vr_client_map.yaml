@@ -14,3 +14,6 @@
 WIN-01: C.1b622eacffe8b75d            # cho mock alert
 DESKTOP-2UQB61H: C.1b622eacffe8b75d   # demo VM cũ
 DESKTOP-IQAM883: C.cd6bfbb23aee7979   # demo VM mới (192.168.10.103, endpoint/123)
+
+# WebServer Linux (DMZ 192.168.50.100, hostname "ubuntu") — nguon auditd → red-alerts-linux:
+ubuntu: C.348bd65bf6fd3224           # Velociraptor Linux client, enroll 2026-06-12

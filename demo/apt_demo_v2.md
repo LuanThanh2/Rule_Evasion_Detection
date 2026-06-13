@@ -757,3 +757,166 @@ ai-investigations — end-to-end ~210 giây, chi phí ~2 cent/alert.
 - **RED rule catalog** (1,582 rules): `demo/RED_RULE_MAP.md`
 - **Q&A prep**: `demo/QA_PREP.md`
 - **Slides outline**: `demo/SLIDES_OUTLINE.md`
+
+---
+
+## 14. Lệnh gọn chạy 3 detector không dùng `nohup`
+
+Dùng mục này thay cho Section 5.2 nếu muốn chạy foreground trong cùng terminal.
+Khi cần dừng, nhấn `Ctrl+C`; trap sẽ kill cả 3 tiến trình con.
+
+### 14.1 Chạy liên tục từ hiện tại, quét lùi N phút
+
+```bash
+# LOOKBACK_MIN=0 nếu muốn bắt đầu đúng từ thời điểm chạy lệnh.
+# LOOKBACK_MIN=5 thường an toàn hơn vì bù độ trễ ingest từ endpoint vào ELK.
+LOOKBACK_MIN=5 INTERVAL=15 bash -lc '
+set -euo pipefail
+
+mkdir -p /tmp/red_demo_v2_logs
+SINCE=$(date -u -d "${LOOKBACK_MIN} minutes ago" +%Y-%m-%dT%H:%M:%S.000Z)
+echo "SINCE=$SINCE"
+
+cleanup() {
+  jobs -pr | xargs -r kill 2>/dev/null || true
+  wait 2>/dev/null || true
+}
+trap cleanup INT TERM EXIT
+
+run_detector() {
+  local tag="$1" cfg="$2" out_idx="$3" eid="$4" state="$5"
+  python3 scripts/detect_live.py \
+    --config "$cfg" \
+    --es-host "$ES_AUTH_HOST" --es-index "logs-windows.*" \
+    --out-index "$out_idx" --event-id "$eid" \
+    --threshold 0.5 --method cosine --timestamp-field @timestamp \
+    --interval "$INTERVAL" --state-file "$state" --since "$SINCE" \
+    >"/tmp/red_demo_v2_logs/detect_${tag}.log" 2>&1 &
+  echo "$tag PID: $!"
+}
+
+run_detector proc config/process_creation.yaml red-alerts-v2-proc 1 /tmp/.state_v2_proc.json
+run_detector reg  config/registry_event.yaml  red-alerts-v2-reg  13 /tmp/.state_v2_reg.json
+run_detector ps   config/powershell.yaml      red-alerts-v2-ps   4104 /tmp/.state_v2_ps.json
+
+echo "Logs: /tmp/red_demo_v2_logs/detect_{proc,reg,ps}.log"
+wait
+'
+```
+
+Verify ở terminal khác:
+
+```bash
+ps -ef | grep detect_live.py | grep -v grep | wc -l   # Expect: 3
+tail -f /tmp/red_demo_v2_logs/detect_*.log
+```
+
+### 14.2 Quét trong một khoảng thời gian cụ thể rồi tự thoát
+
+```bash
+START_UTC="2026-05-24T10:00:00Z" \
+END_UTC="2026-05-24T10:30:00Z" \
+INTERVAL=1 BATCH_SIZE=5000 MAX_ITER=5 bash -lc '
+set -euo pipefail
+
+mkdir -p /tmp/red_demo_v2_logs
+echo "RANGE: $START_UTC -> $END_UTC"
+
+run_detector_once() {
+  local tag="$1" cfg="$2" out_idx="$3" eid="$4"
+  python3 scripts/detect_live.py \
+    --config "$cfg" \
+    --es-host "$ES_AUTH_HOST" --es-index "logs-windows.*" \
+    --out-index "$out_idx" --event-id "$eid" \
+    --threshold 0.5 --method cosine --timestamp-field @timestamp \
+    --since "$START_UTC" --until "$END_UTC" \
+    --interval "$INTERVAL" --batch-size "$BATCH_SIZE" \
+    --max-iter "$MAX_ITER" --no-state \
+    >"/tmp/red_demo_v2_logs/range_${tag}.log" 2>&1 &
+  echo "$tag PID: $!"
+}
+
+run_detector_once proc config/process_creation.yaml red-alerts-v2-proc 1
+run_detector_once reg  config/registry_event.yaml  red-alerts-v2-reg  13
+run_detector_once ps   config/powershell.yaml      red-alerts-v2-ps   4104
+
+wait
+echo "Done. Logs: /tmp/red_demo_v2_logs/range_{proc,reg,ps}.log"
+'
+```
+
+`MAX_ITER * BATCH_SIZE` là số event tối đa mỗi detector có thể page qua trongV
+khoảng thời gian đó. Nếu range nhiều log, tăng `MAX_ITER` hoặc `BATCH_SIZE`.
+
+
+cd /path/to/Rule_Evasion_Detection
+set -a; . ./.env; set +a
+
+mkdir -p /tmp/red_demo_v2_logs
+SINCE=$(date -u -d '5 minutes ago' +%Y-%m-%dT%H:%M:%S.000Z)
+echo "SINCE=$SINCE"
+
+python3 scripts/detect_live.py \
+  --config config/process_creation.yaml \
+  --es-host "$ES_AUTH_HOST" --es-index "logs-windows.*" \
+  --out-index red-alerts-v2-proc --event-id 1 \
+  --threshold 0.5 --method cosine --timestamp-field @timestamp \
+  --interval 15 --state-file /tmp/.state_v2_proc.json --since "$SINCE" \
+  > /tmp/red_demo_v2_logs/detect_proc.log 2>&1 &
+
+python3 scripts/detect_live.py \
+  --config config/registry_event.yaml \
+  --es-host "$ES_AUTH_HOST" --es-index "logs-windows.*" \
+  --out-index red-alerts-v2-reg --event-id 13 \
+  --threshold 0.5 --method cosine --timestamp-field @timestamp \
+  --interval 15 --state-file /tmp/.state_v2_reg.json --since "$SINCE" \
+  > /tmp/red_demo_v2_logs/detect_reg.log 2>&1 &
+
+python3 scripts/detect_live.py \
+  --config config/powershell.yaml \
+  --es-host "$ES_AUTH_HOST" --es-index "logs-windows.*" \
+  --out-index red-alerts-v2-ps --event-id 4104 \
+  --threshold 0.5 --method cosine --timestamp-field @timestamp \
+  --interval 15 --state-file /tmp/.state_v2_ps.json --since "$SINCE" \
+  > /tmp/red_demo_v2_logs/detect_ps.log 2>&1 &
+
+wait
+
+
+cd /path/to/Rule_Evasion_Detection
+set -a; . ./.env; set +a
+
+START_UTC="2026-05-24T10:00:00Z"
+END_UTC="2026-05-24T10:30:00Z"
+
+mkdir -p /tmp/red_demo_v2_logs
+
+python3 scripts/detect_live.py \
+  --config config/process_creation.yaml \
+  --es-host "$ES_AUTH_HOST" --es-index "logs-windows.*" \
+  --out-index red-alerts-v2-proc --event-id 1 \
+  --threshold 0.5 --method cosine --timestamp-field @timestamp \
+  --since "$START_UTC" --until "$END_UTC" \
+  --interval 1 --batch-size 5000 --max-iter 5 --no-state \
+  > /tmp/red_demo_v2_logs/range_proc.log 2>&1 &
+
+python3 scripts/detect_live.py \
+  --config config/registry_event.yaml \
+  --es-host "$ES_AUTH_HOST" --es-index "logs-windows.*" \
+  --out-index red-alerts-v2-reg --event-id 13 \
+  --threshold 0.5 --method cosine --timestamp-field @timestamp \
+  --since "$START_UTC" --until "$END_UTC" \
+  --interval 1 --batch-size 5000 --max-iter 5 --no-state \
+  > /tmp/red_demo_v2_logs/range_reg.log 2>&1 &
+
+python3 scripts/detect_live.py \
+  --config config/powershell.yaml \
+  --es-host "$ES_AUTH_HOST" --es-index "logs-windows.*" \
+  --out-index red-alerts-v2-ps --event-id 4104 \
+  --threshold 0.5 --method cosine --timestamp-field @timestamp \
+  --since "$START_UTC" --until "$END_UTC" \
+  --interval 1 --batch-size 5000 --max-iter 5 --no-state \
+  > /tmp/red_demo_v2_logs/range_ps.log 2>&1 &
+
+wait
+

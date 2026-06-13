@@ -67,12 +67,51 @@ class MitreOutput(BaseModel):
     severity_baseline: str  # "low" | "medium" | "high" | "critical"
 
 
+_KIND_ALLOWED = {"process", "file", "registry", "network",
+                 "alert_correlation", "sigma_rules", "threat_intel", "wmi"}
+_KIND_ALIASES = {
+    "sigma_rule": "sigma_rules", "sigma": "sigma_rules", "rule": "sigma_rules",
+    "privilege": "process", "privilege_escalation": "process",
+    "process_tree": "process", "command": "process", "execution": "process",
+    "cron": "process", "crontab": "process", "service": "process",
+    "persistence": "file", "dropper": "file", "script": "file",
+    "data_pattern": "network", "exfil": "network", "exfiltration": "network",
+    "c2": "network", "connection": "network",
+    "ioc": "threat_intel", "intel": "threat_intel",
+    "correlation": "alert_correlation",
+}
+
+
 class ForensicEvidence(BaseModel):
-    """1 mảnh bằng chứng từ host (process / file / registry / network)."""
+    """1 mảnh bằng chứng từ host.
+
+    `kind` chỉ để PHÂN LOẠI/hiển thị — không điều khiển logic downstream. Vì vậy
+    coerce_kind nắn nhãn lệch của LLM về 1 trong 8 giá trị hợp lệ, và nhãn lạ →
+    fallback "process" thay vì raise → KHÔNG bao giờ vứt bằng chứng (description_vi
+    + raw mới là phần giá trị, không được mất).
+
+    Hợp lệ cho cả Windows lẫn Linux:
+    - process       : tiến trình / cây cha-con / privilege escalation
+    - file          : file dropper / script / archive trên đĩa
+    - registry      : Windows Run keys (Linux dùng "process"/"file" cho cron/service)
+    - network       : kết nối C2 / exfil / data pattern
+    - alert_correlation : tương quan nhiều alert
+    - sigma_rules   : rule Sigma liên quan
+    - threat_intel  : IOC / reputation
+    - wmi           : WMI subscription (Windows)
+    """
     kind: Literal["process", "file", "registry", "network", "alert_correlation", "sigma_rules", "threat_intel", "wmi"]
     description_vi: str
     raw: dict = Field(default_factory=dict)
     severity_contribution: Literal["high", "medium", "low", "exonerating"] = "medium"
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def coerce_kind(cls, v):
+        s = str(v).strip().lower()
+        if s in _KIND_ALLOWED:
+            return s
+        return _KIND_ALIASES.get(s, "process")
 
 
 class ForensicOutput(BaseModel):
