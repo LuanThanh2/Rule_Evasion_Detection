@@ -176,7 +176,7 @@ RED_DISABLE_INTELEX=1 "$PY" red_linux/scripts/detect_live_linux.py \
   --es-index "logs-auditd_manager.auditd-*" \
   --out-index red-alerts-linux \
   --threshold 0.46 --method cosine --top-k 10 \
-  --interval 15 --state-file /tmp/.state_linux.json --since "$SINCE" \
+  --interval 15 --no-state \
   > /tmp/red_demo_v2_logs/detect_linux.log 2>&1 &
 
 echo "Linux detector PID=$!"

@@ -41,4 +41,4 @@ output:
 
   # Stage 2 — cosine attribution về Sigma rule
   dir: models/linux_process_creation
-  attr_result_name: attr_ensemble
+  attr_result_name: attr_ensemble_portable

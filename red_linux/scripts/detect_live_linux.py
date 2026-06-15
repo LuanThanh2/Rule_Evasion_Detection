@@ -156,18 +156,22 @@ def poll_new_events(
 def extract_field(event: dict, paths: list) -> str:
     """Trích text từ event theo danh sách path ưu tiên.
     Hỗ trợ cả string lẫn list (process.args là mảng — tự join bằng dấu cách).
+    Trả về giá trị DÀI NHẤT trong tất cả path — tránh lấy process.title bị
+    auditd truncate (~200 ký tự) khi process.args có full content.
     """
+    best = ""
     for path in paths:
         obj = event
         for key in path.split("."):
             obj = obj.get(key) if isinstance(obj, dict) else None
+        val = ""
         if obj and isinstance(obj, str):
-            return obj
-        if obj and isinstance(obj, list):
-            joined = " ".join(str(x) for x in obj if x)
-            if joined:
-                return joined
-    return ""
+            val = obj
+        elif obj and isinstance(obj, list):
+            val = " ".join(str(x) for x in obj if x)
+        if len(val) > len(best):
+            best = val
+    return best
 
 
 def score_stage1(normalized: str, estimator, vectorizer, scaler, shift: float) -> float:
