@@ -112,7 +112,12 @@ async def daemon_loop(
     until: str | None,
     no_state: bool,
     query_string: str | None,
+    needs_agent_only: bool = False,
 ):
+    # Khi --needs-agent-only: chỉ lấy alerts Stage 2 không attribution được
+    if needs_agent_only and not query_string:
+        query_string = "red.needs_agent:true"
+
     state = load_state()
     if since:
         state["last_processed_timestamp"] = since
@@ -122,6 +127,7 @@ async def daemon_loop(
     logger.info("🤖 Agent daemon started")
     logger.info("   interval=%ds | dry_run=%s | max_iter=%s | score>=%.2f",
                 interval, dry_run, max_iter or "∞", score_threshold)
+    logger.info("   needs_agent_only=%s | query=%s", needs_agent_only, query_string or "(all)")
     logger.info("   last_processed=%s | total_processed=%d",
                 state.get("last_processed_timestamp", "(none — process all)"),
                 state.get("processed_count", 0))
@@ -211,6 +217,9 @@ def main():
                         help="Do not save .agent_daemon_state.json; useful for demo one-shot runs")
     parser.add_argument("--query-string", type=str, default=None,
                         help="Optional Elasticsearch query_string filter on red-alerts")
+    parser.add_argument("--needs-agent-only", action="store_true",
+                        help="Chỉ process alerts có red.needs_agent=true "
+                             "(confidence=unknown — Stage 2 không attribution được)")
     parser.add_argument("--skip-health-check", action="store_true",
                         help="Bỏ qua ES connection check")
     parser.add_argument("--red-index", type=str, default=None,
@@ -264,6 +273,7 @@ def main():
             until=args.until,
             no_state=args.no_state,
             query_string=args.query_string,
+            needs_agent_only=args.needs_agent_only,
         ))
     except KeyboardInterrupt:
         logger.info("Interrupted by user")

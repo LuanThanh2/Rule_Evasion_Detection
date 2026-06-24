@@ -73,5 +73,5 @@ evaluation:
 output:
   dir: models/registry_event
   result_name: ensemble
-  train_result_path: models/registry_event/train_rslt_ensemble.zip
+  train_result_path: models/registry_event/train_rslt_ensemble_portable.zip
   attr_result_name: attr_ensemble

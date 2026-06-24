@@ -30,7 +30,8 @@ Repo này phục vụ nghiên cứu, demo lab và thử nghiệm phòng thủ. C
 | Thành phần | Vai trò | Output chính |
 |---|---|---|
 | Stage 1 - Misuse Detection | Phân loại benign vs suspicious bằng SVM hoặc Ensemble SVM + Logistic Regression + ComplementNB | `detection_score` trong khoảng `[0, 1]` |
-| Stage 2 - Rule Attribution | Xếp hạng Sigma rule gần nhất bằng per-rule SVM, cosine similarity hoặc hybrid RRF | `top_rules`, `top_rule_sigma_*` |
+| Stage 2 - Rule Attribution | Xếp hạng Sigma rule gần nhất bằng cosine similarity TF-IDF (offline eval) | `top_rules`, `top_rule_sigma_*` |
+| Stage 2 Live Attribution | 2-pass Sigma-logic + payload decode (base64/hex/charcode) + confidence scoring | `red.evasion_technique`, `red.evaded_rule`, `red.confidence` |
 | ELK Integration | Đọc log từ Elasticsearch, chạy RED, ghi alert về index `red-alerts` | Alert dùng được trong Kibana |
 | Phase C - AI Agent | Multi-agent triage, hunt, MITRE mapping, forensic, response và report | Document trong `ai-investigations` |
 
@@ -39,6 +40,7 @@ Repo này phục vụ nghiên cứu, demo lab và thử nghiệm phòng thủ. C
 - Chuẩn hóa command line, ScriptBlockText, registry path và URL thành token ổn định hơn trước các biến thể né rule.
 - Stage 1 hỗ trợ EnsembleClassifier gồm SVM, Logistic Regression và Complement Naive Bayes.
 - Stage 2 có `CosineRuleAttributor` dùng cùng không gian TF-IDF cho rule filter values, phù hợp khi mở rộng catalog Sigma.
+- **Stage 2 Live** (`red/stage2_live.py`): 2-pass Sigma-logic engine + payload decode (base64/hex/charcode/gzip) + confidence scoring (`high/medium/low/unknown`). Output rõ nghĩa: `red.evasion_technique` (kỹ thuật né) và `red.evaded_rule` (rule bị né — ý đồ thật).
 - Alert được enrich metadata Sigma: filename, Sigma ID, title.
 - AI Agent có 8 module: Supervisor, Triage, Forensic, Hunt, RED Analyst, MITRE, Response, Report.
 
@@ -203,6 +205,51 @@ Các method hỗ trợ:
 | `svm` | Xếp hạng bằng per-rule SVM | So sánh baseline hoặc rule có đủ match/evasion data |
 | `cosine` | Xếp hạng bằng cosine similarity trên TF-IDF chung | Khuyến nghị cho catalog Sigma mở rộng |
 | `hybrid` | Reciprocal Rank Fusion giữa SVM và cosine | Thử nghiệm khi muốn kết hợp hai tín hiệu |
+
+### Stage 2 Live Attribution (production daemon)
+
+`red/stage2_live.py` cung cấp pipeline attribution **live** thay oracle tĩnh, tích hợp vào `detect_live_linux.py` qua `--stage2-mode live` (mặc định).
+
+**Luồng:**
+
+```
+event (Stage 1 malicious)
+    │
+PASS 1: SigmaExactMatcher(event_gốc)  → red.evasion_technique  (kỹ thuật né)
+    │
+DECODE: recursive_decode()             → decode chain (base64/hex/charcode/gzip, ≤4 lớp)
+    │
+PASS 2: SigmaExactMatcher(decoded)    → red.evaded_rule         (ý đồ thật)
+    │
+STAGE 3: confidence scoring
+    ├── high    — evaded_rule bị né bằng evasion_technique
+    ├── medium  — encoding fire, rule đích không xác nhận → cosine fallback
+    ├── low     — engine trống → cosine soft-attribution
+    └── unknown — cosine thấp → chuyển AI Agent behavioral analysis
+```
+
+**Alert fields mới so với legacy:**
+
+| Field | Ý nghĩa |
+|---|---|
+| `red.evasion_technique` | Tên rule kỹ thuật né (Rule B), vd `["Suspicious Encoded PowerShell Command"]` |
+| `red.evaded_rule` | Tên rule ý đồ thật (Rule A), vd `["Potential Invoke-Mimikatz"]` |
+| `red.confidence` | `high / medium / low / unknown` |
+| `red.decode_chain` | Từng lớp decode `[{depth, method, text}]` |
+| `red.needs_agent` | `true` khi unknown → tín hiệu cho AI Agent |
+
+Chạy self-test decode:
+
+```bash
+python3 -m red.stage2_live
+# decode self-test: 7/7 PASS
+```
+
+Chuyển về mode cũ (legacy cosine + promote_exact_matches):
+
+```bash
+python3 red_linux/scripts/detect_live_linux.py ... --stage2-mode legacy
+```
 
 ### Full Pipeline Helper
 

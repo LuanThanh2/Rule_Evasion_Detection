@@ -54,4 +54,4 @@ evaluation:
 output:
   dir: models/linux_atomic
   result_name: ensemble_atomic
-  train_result_path: models/linux_atomic/train_rslt_ensemble_atomic.zip
+  train_result_path: models/linux_atomic/train_rslt_ensemble_atomic_portable.zip

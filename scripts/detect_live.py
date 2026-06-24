@@ -22,12 +22,24 @@ from red.normalize import Normalizer
 from red.persist import load_result
 from red.data import resolve_event_paths
 from red.attribution import reciprocal_rank_fusion
-from red.rule_metadata import SigmaRuleIndex
+from red.rule_metadata import SigmaRuleIndex, normalize_title
 from red.sigma_exact import SigmaExactMatcher
+from red.stage2_live import LiveAttributor
 
 logger = logging.getLogger("detect_live")
 
 STATE_FILE = ".detect_live_state.json"
+
+LEVEL_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "informational": 4, "": 5}
+
+
+def _mitre_depth(tags: list) -> int:
+    """Negated max MITRE sub-technique depth — deeper = more specific = sort earlier."""
+    depth = 0
+    for t in tags:
+        if isinstance(t, str) and t.startswith("attack.t"):
+            depth = max(depth, t.count("."))
+    return -depth
 
 
 def mask_url_password(url: str) -> str:
@@ -257,6 +269,15 @@ def main():
         default="",
         help="Comma-separated Sigma UUIDs or prefixes to prefer when multiple exact rules fire.",
     )
+    parser.add_argument(
+        "--stage2-mode", choices=["legacy", "live"], default="live",
+        help="live (mặc định) = Stage 2 mới: 2-pass Sigma + decode + confidence; "
+             "legacy = cosine + promote_exact_matches cũ. live cần --exact-sigma.",
+    )
+    parser.add_argument(
+        "--min-text-len", type=int, default=15,
+        help="Bỏ qua event có command_line dưới N ký tự (tránh FP như '$global:?'). Default 15.",
+    )
     args = parser.parse_args()
     preferred_sigma_ids = parse_preferred_sigma_ids(args.exact_sigma_prefer_ids)
 
@@ -311,13 +332,27 @@ def main():
                     len(rule_index))
         if args.exact_sigma:
             exact_matcher = SigmaExactMatcher.from_rules_dirs(
-                [rules_dir],
+                all_rule_dirs,
                 event_field_map=event_field_map,
                 search_fields=search_fields,
             )
             logger.info("Exact Sigma validation enabled for %s", rules_dir)
 
     normalizer = Normalizer()
+
+    # ── Stage 2 live attributor (2-pass Sigma + decode + confidence) ─────────
+    live_attributor = None
+    if args.stage2_mode == "live" and exact_matcher is not None:
+        live_attributor = LiveAttributor(
+            matcher=exact_matcher,
+            cosine_attributor=cosine_attributor,
+            normalizer=normalizer,
+            event_field_map=event_field_map,
+            search_fields=search_fields,
+        )
+        logger.info("Stage 2 live mode BẬT (2-pass Sigma + decode + confidence scoring)")
+    elif args.stage2_mode == "live":
+        logger.warning("--stage2-mode live nhưng thiếu --exact-sigma/rules_dir → fallback legacy")
 
     if args.reset_state and os.path.exists(args.state_file):
         os.remove(args.state_file)
@@ -363,6 +398,8 @@ def main():
                     text = extract_field(event, event_paths)
                     if not text:
                         continue
+                    if len(text.strip()) < args.min_text_len:
+                        continue
 
                     normalized = normalizer.normalize(text)
                     if not normalized:
@@ -373,39 +410,56 @@ def main():
                     if score < args.threshold:
                         continue
 
-                    top_rules = attribute_stage2(
-                        normalized, rule_models, cosine_attributor,
-                        args.method, args.top_k,
-                    )
-                    exact_matches = (
-                        exact_matcher.match_event(event) if exact_matcher is not None else []
-                    )
-                    exact_matches = sort_exact_matches(exact_matches, preferred_sigma_ids)
-                    if exact_matches:
-                        top_rules = promote_exact_matches(
-                            top_rules, exact_matches, args.top_k,
+                    # ── Stage 2: live mode (2-pass) hoặc legacy ─────────────
+                    stage2_extra: dict = {}
+                    if live_attributor is not None:
+                        verdict = live_attributor.attribute(event, text)
+                        top_rule_name = verdict.top_rule
+                        top_rules = verdict.cosine_top or (
+                            [(r, 1.0) for r in (verdict.evaded_rule or verdict.evasion_technique)]
                         )
+                        stage2_extra = verdict.to_dict()
+                    else:
+                        # legacy: cosine + promote_exact_matches
+                        top_rules = attribute_stage2(
+                            normalized, rule_models, cosine_attributor,
+                            args.method, args.top_k,
+                        )
+                        exact_matches = (
+                            exact_matcher.match_event(event) if exact_matcher is not None else []
+                        )
+                        exact_matches = sort_exact_matches(exact_matches, preferred_sigma_ids)
+                        if exact_matches:
+                            top_rules = promote_exact_matches(
+                                top_rules, exact_matches, args.top_k,
+                            )
+                        top_rule_name = top_rules[0][0] if top_rules else None
+                        stage2_extra = {
+                            "red.exact_sigma_match": bool(exact_matches),
+                            "red.exact_sigma_matches": [
+                                match.to_alert_dict()
+                                for match in exact_matches[:args.exact_sigma_max_matches]
+                            ],
+                        }
 
-                    top_rule_name = top_rules[0][0] if top_rules else None
                     top_rules_enriched = []
-                    for r, s in top_rules:
+                    for r, s in top_rules[:args.top_k]:
                         entry = {"rule": r, "score": round(s, 4)}
                         if rule_index is not None:
-                            meta = rule_index.lookup_dict(r)
+                            meta = rule_index.lookup_dict(normalize_title(r))
                             entry["sigma_filename"] = meta.get("filename")
                             entry["sigma_id"] = meta.get("sigma_id")
                             entry["sigma_title"] = meta.get("title")
+                            entry["sigma_description"] = meta.get("description", "")
+                            entry["sigma_level"] = meta.get("level", "")
+                            entry["sigma_tags"] = meta.get("tags", [])
                         top_rules_enriched.append(entry)
 
                     alert = {
                         "@timestamp": event.get("@timestamp"),
                         "red.detection_score": round(score, 4),
                         "red.attribution_method": args.method,
-                        "red.exact_sigma_match": bool(exact_matches),
-                        "red.exact_sigma_matches": [
-                            match.to_alert_dict()
-                            for match in exact_matches[:args.exact_sigma_max_matches]
-                        ],
+                        "red.stage2_mode": args.stage2_mode,
                         "red.top_rule": top_rule_name,
                         "red.top_rules": top_rules_enriched,
                         "red.command_line": text,
@@ -414,19 +468,46 @@ def main():
                         "winlog.computer_name": event.get("winlog", {}).get("computer_name"),
                         "process": event.get("process", {}),
                         "user": event.get("user", {}),
+                        **stage2_extra,
                     }
                     if top_rule_name and rule_index is not None:
-                        meta = rule_index.lookup_dict(top_rule_name)
+                        meta = rule_index.lookup_dict(normalize_title(top_rule_name))
                         alert["red.top_rule_sigma_filename"] = meta.get("filename")
                         alert["red.top_rule_sigma_id"] = meta.get("sigma_id")
                         alert["red.top_rule_sigma_title"] = meta.get("title")
+                        alert["red.top_rule_sigma_description"] = meta.get("description", "")
+                        alert["red.top_rule_sigma_level"] = meta.get("level", "")
+                        alert["red.top_rule_sigma_tags"] = meta.get("tags", [])
+
+                    if rule_index is not None:
+                        evaded = stage2_extra.get("red.evaded_rule") or []
+                        alert["red.evaded_rules_meta"] = [
+                            {
+                                "rule": r,
+                                **rule_index.lookup_dict(normalize_title(r)),
+                            }
+                            for r in evaded
+                        ]
+                        if evaded:
+                            evaded_meta = [(r, rule_index.lookup_dict(normalize_title(r))) for r in evaded]
+                            evaded_sorted = sorted(
+                                evaded_meta,
+                                key=lambda rm: (
+                                    LEVEL_ORDER.get(rm[1].get("level", ""), 5),
+                                    _mitre_depth(rm[1].get("tags", [])),
+                                ),
+                            )
+                            alert["red.primary_rule"] = evaded_sorted[0][0]
+                        else:
+                            alert["red.primary_rule"] = top_rule_name
 
                     es_index(args.es_host, args.out_index, alert)
                     n_alerts += 1
 
                     logger.info(
-                        "[ALERT] host=%s  score=%.3f  top=%s | %s",
-                        alert["host.name"], score, alert["red.top_rule"], text[:100],
+                        "[ALERT] host=%s  score=%.3f  conf=%s  top=%s | %s",
+                        alert["host.name"], score, alert.get("red.confidence", "legacy"),
+                        alert["red.top_rule"], text[:100],
                     )
 
                 since_ts = last_ts

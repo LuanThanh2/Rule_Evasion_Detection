@@ -61,12 +61,22 @@ class SigmaRuleMeta:
     sigma_id: str        # UUID
     title: str           # Human-readable title
     normalized: str      # internal key (= RED rule_models key)
+    description: str = ""         # Sigma rule description
+    level: str = ""               # informational/low/medium/high/critical
+    tags: list = None             # MITRE ATT&CK tags, e.g. ["attack.t1070.001"]
+
+    def __post_init__(self):
+        if self.tags is None:
+            self.tags = []
 
     def to_dict(self) -> dict:
         return {
             "filename": self.filename,
             "sigma_id": self.sigma_id,
             "title": self.title,
+            "description": self.description,
+            "level": self.level,
+            "tags": self.tags,
         }
 
 
@@ -121,12 +131,19 @@ class SigmaRuleIndex:
                         continue
                     normalized = normalize_title(title)
                     relpath = os.path.relpath(full_path, rules_dir)
+                    description = rule.get("description", "")
+                    level = rule.get("level", "")
+                    raw_tags = rule.get("tags", [])
+                    tags = [str(t) for t in raw_tags] if isinstance(raw_tags, list) else []
                     meta = SigmaRuleMeta(
                         filename=f,
                         relpath=relpath,
                         sigma_id=str(sigma_id),
                         title=title,
                         normalized=normalized,
+                        description=description,
+                        level=level,
+                        tags=tags,
                     )
                     # Có thể collide nếu 2 rule cùng title → giữ file đầu, log warning
                     if normalized in self._by_normalized:

@@ -15,9 +15,15 @@ Train → Validate → Evaluate → Attribution
 - Input: command line / ScriptBlockText / TargetObject / URL strings
 - Output: score ∈ [0,1] sau MCC scaling, threshold sweep → P/R/F1/MCC
 
-**Stage 2 — Rule Attribution** (`train_attribution.py` → `eval_attribution.py`):
+**Stage 2 — Rule Attribution** (`train_attribution.py` → `eval_attribution.py` → `red/stage2_live.py`):
 - Với mỗi event bị đánh dấu suspicious, xác định rule Sigma nào bị evasion
 - Đánh giá: top-k hit rate
+- ⚠️ Cosine KHÔNG cần training data có nhãn — chỉ dùng rule filter values (detection conditions từ Sigma YAML) để tính similarity. Match events (14 rules Linux / 37+6+6 rules Windows) chỉ dùng làm GROUND TRUTH ĐỂ ĐÁNH GIÁ accuracy, KHÔNG phải để train. Đừng gọi match events là "dữ liệu huấn luyện Stage 2".
+
+**Stage 2 Live** (`red/stage2_live.py` — production daemon):
+- 2-pass SigmaExactMatcher + payload decode (base64/hex/charcode) + confidence scoring
+- Output: `red.evasion_technique` (kỹ thuật né) / `red.evaded_rule` (ý đồ thật) / `red.confidence`
+- Tích hợp vào `detect_live_linux.py` qua `--stage2-mode live` (mặc định)
 
 ## Cấu trúc thư mục
 
@@ -31,6 +37,9 @@ red/                  # Core library
   data.py             # Benign loader (txt/jsonl/json/csv), load_rule_set, extract_filter_values
   persist.py          # save_result / load_result (pickle + ZIP)
   visualize.py        # plot_pr_threshold, plot_attribution
+  stage2_live.py      # Stage 2 live: 2-pass SigmaExactMatcher + decode + confidence scoring
+  sigma_exact.py      # SigmaExactMatcher in-process (Layer-3 + Stage 2 live engine)
+  rule_metadata.py    # SigmaRuleIndex — enrich alert với sigma_id/title/filename
 
 scripts/              # Entry points
   run_stage1.py       # Gộp train + validate + evaluate (khuyến nghị)
@@ -105,6 +114,43 @@ models/               # Output .zip từ train (gitignored)
 - `registry_event`: thêm `Image`, `User`, `EventType`
 - Cần thiết để catch rule check `ParentImage` (e.g., SSH-based parent-child rules)
 
+### Stage 2 Live Attribution (red/stage2_live.py — 2026-06-20)
+
+Thay oracle tĩnh (`atomic_fired.jsonl` / Hayabusa) bằng pipeline live 2-pass:
+
+```
+PASS 1: SigmaExactMatcher.match_event(event_gốc)     → evasion_technique (Rule B)
+DECODE: recursive_decode() — Python stdlib, tối đa 4 lớp
+        base64 (UTF-16LE/UTF-8) / hex / charcode [char]/chr() / gzip lồng trong b64
+PASS 2: SigmaExactMatcher.match_event(synth_decoded)  → evaded_rule (Rule A)
+```
+
+**Confidence scoring (tích hợp trong Stage 2, bỏ oracle tĩnh):**
+
+| evasion_technique | evaded_rule | Cosine | Confidence |
+|---|---|---|---|
+| Fire (encoding) | Fire | — | **high** — "evaded_rule bị né bằng evasion_technique" |
+| Fire (direct)   | —   | — | **high** — "fire thẳng, không cần decode" |
+| Fire (encoding) | TRỐNG | Top X | **medium** — "X có thể bị né" |
+| TRỐNG | — | Top X ≥ 0.10 | **low** — soft attribution |
+| TRỐNG | — | TRỐNG | **unknown** → AI Agent behavioral |
+
+**Alert fields mới:**
+- `red.evasion_technique` — rule kỹ thuật né (Rule B), ví dụ `["Suspicious Encoded PowerShell Command"]`
+- `red.evaded_rule` — rule ý đồ thật (Rule A), ví dụ `["Potential Invoke-Mimikatz"]`
+- `red.confidence` — `high/medium/low/unknown`
+- `red.decode_chain` — từng lớp decode `[{depth, method, text}]`
+- `red.needs_agent` — `true` khi unknown → chuyển AI Agent
+
+**Engine:** `SigmaExactMatcher` in-process (cùng Layer-3 đã có) — portable, ~ms/event, không deps ngoài.  
+**Zircolite** giữ vai trò oracle offline (`atomic_zircolite.py`), KHÔNG gọi per-event live.  
+**detect_live_linux.py** thêm flag `--stage2-mode live|legacy` (mặc định `live`).
+
+### RED_DISABLE_INTELEX default đổi thành "1" (2026-06-20)
+`red/models.py` đổi default `RED_DISABLE_INTELEX` từ `"0"` → `"1"` → train mặc định pure sklearn,
+portable sang elk_server (Xeon E5-2696 v4, không có AVX-512). Bật lại oneDAL khi cần tốc độ:
+`RED_DISABLE_INTELEX=0 python train.py ...`
+
 ### Stage 2 extract_filter_values (Fix #4 đã apply)
 - Case-insensitive field match, bỏ `_` → `parent_image` = `ParentImage`
 - Auto-extract `keywords:` section + list of plain strings; recursive nested dict
@@ -153,7 +199,7 @@ done
 python3 scripts/train_attribution.py --config config/process_creation.yaml
 python3 scripts/eval_attribution.py --config config/process_creation.yaml --method cosine
 
-# Stage 3 — Layer-3 Sigma-logic validator (Windows)
+# Layer-3 offline validator Windows (script tên stage3, KHÔNG phải Stage 3 pipeline)
 # Đánh giá offline trên match events EVTX (ground-truth fired thật, không dùng evasion-sinh-từ-match)
 python3 scripts/stage3_layer3_windows.py                              # tất cả 3 event type
 python3 scripts/stage3_layer3_windows.py --event-type process_creation  # chỉ proc
@@ -226,6 +272,54 @@ EOF
 scikit-learn, numpy, pyyaml, luqum, tqdm, matplotlib, seaborn, paramiko
 Optional: cuml (NVIDIA GPU), sklearnex (Intel CPU acceleration)
 ```
+
+---
+
+## Luận văn — Vấn đề cần nhớ (cập nhật 2026-06-19)
+
+### Stage 2 — Khái niệm quan trọng KHÔNG được nhầm
+
+**Cosine KHÔNG dùng match events để train.** Cosine chỉ cần rule filter values (chuỗi detection condition trích từ Sigma YAML, ví dụ `['mimikatz', 'sekurlsa']`). Match events (14 rules Linux / 37+6+6 rules Windows) **chỉ là ground truth để đánh giá accuracy**, không phải training data.
+
+**Đánh giá accuracy Stage 2 chạy trên match events, không phải evasion:**
+- Match event có đáp án sẵn (biết fire rule nào → từ atomic_fired.jsonl hoặc Hayabusa)
+- Cosine predict rule → so với ground truth → tính top-k hit rate
+- Evasion variants KHÔNG có ground truth xác minh được → không đo accuracy trực tiếp
+- → Limitation thật: top-1=38.2% chỉ đo trên match events; không biết chắc Cosine đúng hay sai trên evasion
+
+**Pipeline tạo dữ liệu Linux malicious:**
+1. `atomic_to_malicious.py`: đọc ART YAML → trích lệnh Linux shell → `atomic_malicious.jsonl`
+2. `atomic_zircolite.py`: tạo synthetic SYSCALL+EXECVE events → chạy Zircolite → `atomic_fired.jsonl` (có trường `fired: [{id, title}]`)
+- `fired: []` = lệnh né được hết Sigma (evasion thật)
+- `fired: [{...}]` = lệnh match rule này (dùng làm ground truth Stage 2)
+
+### Dữ liệu cho 3.3.1 (chưa viết xong)
+
+**Windows (3 event types):**
+| Event type | Benign | Malicious (match) | Evasion |
+|---|---|---|---|
+| process_creation | 1,828 | 368 (37 rules) | 437 |
+| powershell | 4,266 | 136 (6 rules) | — |
+| registry_event | 11,776 | 89 (6 rules) | — |
+| **Tổng** | **17,870** | **593** | **437** |
+
+**Linux (process_creation only):**
+- Benign: 17,548
+- Malicious: 3,387 (14 rules) → top rules: file_and_directory_discovery_linux (1955), system_owner_or_user_discovery_linux (638), file_deletion (337), ...
+- Evasion: 66
+
+**Split:**
+- Benign + malicious: 70% train / 15% valid / 15% test
+- Evasion: 50% valid / 50% test (không có train)
+- Match events: 70% train / 30% test (không có valid split)
+
+### Pending — Mục 3.3.1 và 3.3.5 chưa viết
+
+Cần viết lại (kiểu CIC-IDS2017):
+- **Bảng class distribution**: class name, số mẫu, % — giống IoT-23/CIC-IDS2017
+- **Bảng split**: chỉ ghi % (70/15/15), footnote về evasion 50/50 và match events không có valid
+- Giải thích Hayabusa (Windows EVTX → match events) và Zircolite (Linux auditd → atomic_fired.jsonl)
+- Linux 14 rules: full table trong main text; Windows 49 rules: gom theo MITRE tactic + appendix
 
 ---
 

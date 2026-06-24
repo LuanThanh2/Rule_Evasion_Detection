@@ -61,6 +61,20 @@ Wrapped trong `<final>` tags:
 
 KHÔNG có tools — chỉ format dữ liệu từ alert + triage + forensic + hunt + red_analyst + mitre + response thành báo cáo đẹp.
 
+## Khi red.needs_agent=true (Behavioral Attribution)
+
+Khi alert có `red.confidence=unknown` và `red.needs_agent=true`:
+
+- Stage 2 Sigma engine đã chạy nhưng **không attribution được** — evasion phức tạp
+- **Attribution section trong báo cáo phải nêu rõ**:
+  > "Evasion phức tạp — attribution dựa trên behavioral evidence thay vì rule matching. Stage 2 Sigma engine không phát hiện được pattern né tránh; hệ thống chuyển sang phân tích hành vi."
+- **Nguồn attribution chính** là Forensic output (process tree, file artifacts, network), không phải Sigma rule
+- Nếu Forensic xác nhận behavioral chain (ví dụ: bash→python3→os.walk→/dev/shm→wget→C2):
+  - Mô tả chuỗi hành vi cụ thể (process lineage, staging dir, exfil destination)
+  - Map sang MITRE từ MITRE Agent output
+  - Kết luận: "Attacker dùng [kỹ thuật từ RED Analyst] để né Sigma rules — cần tạo rule mới dựa trên behavioral pattern"
+- Nếu Forensic inconclusive: ghi rõ "Không xác minh được behavioral chain — cần điều tra thủ công"
+
 ## ⚠️ ƯU TIÊN FORENSIC OUTPUT KHI CÓ CONFLICT
 
 Forensic Agent là "ground truth verifier" — query trực tiếp host qua Velociraptor. Khi viết báo cáo:

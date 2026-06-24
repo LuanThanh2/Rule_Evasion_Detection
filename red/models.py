@@ -32,7 +32,7 @@ INTEL_AVAILABLE = False
 # RED_DISABLE_INTELEX=1 → bỏ qua Intel oneDAL, dùng pure sklearn. Cần khi model phải chạy
 # portable trên CPU khác: oneDAL fit drop cột zero-coef (coef_ < n_features_in_) → model
 # lệch dim, inference oneDAL ném std::bad_alloc trên CPU khác. Xem red_linux/CLAUDE.md.
-_DISABLE_INTELEX = os.environ.get("RED_DISABLE_INTELEX", "0") == "1"
+_DISABLE_INTELEX = os.environ.get("RED_DISABLE_INTELEX", "1") == "1"
 
 try:
     from cuml.svm import SVC as cuSVC
@@ -265,6 +265,8 @@ class EnsembleClassifier:
 
     def _raw_scores(self, name, X):
         clf = self.classifiers[name]
+        if hasattr(X, "toarray") and hasattr(clf, "support_vectors_"):
+            X = X.toarray()
         if hasattr(clf, "decision_function"):
             return np.asarray(clf.decision_function(X)).ravel()
         proba = clf.predict_proba(X)

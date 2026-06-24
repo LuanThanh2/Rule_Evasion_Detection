@@ -31,6 +31,11 @@ data:
     - User
     - OriginalFileName
     - CurrentDirectory
+    - Description
+    - FileVersion
+    - Company
+    - Product
+    - Hashes
   # Mapping Sigma field name → list JSON paths để đọc event/log dict
   # Thứ tự = priority (path đầu tiên có giá trị thì dùng)
   event_field_map:
@@ -57,6 +62,21 @@ data:
     CurrentDirectory:
       - process.working_directory
       - winlog.event_data.CurrentDirectory
+    Description:
+      - process.pe.description
+      - winlog.event_data.Description
+    FileVersion:
+      - process.pe.file_version
+      - winlog.event_data.FileVersion
+    Company:
+      - process.pe.company
+      - winlog.event_data.Company
+    Product:
+      - process.pe.product
+      - winlog.event_data.Product
+    Hashes:
+      - process.hash.md5
+      - winlog.event_data.Hashes
   max_benign_samples: 30000        # cap Stage 1 benign — tránh OOM/quá chậm với LMD lớn
   max_attribution_benign: 15000    # cap Stage 2 per-rule benign — giảm thời gian fit nhiều lần
 
@@ -84,5 +104,5 @@ evaluation:
 output:
   dir: models/process_creation
   result_name: ensemble                  # tên model chính (Ensemble)
-  train_result_path: models/process_creation/train_rslt_ensemble.zip
+  train_result_path: models/process_creation/train_rslt_ensemble_portable.zip
   attr_result_name: attr_ensemble

@@ -175,11 +175,35 @@ RED_DISABLE_INTELEX=1 "$PY" red_linux/scripts/detect_live_linux.py \
   --es-host "$ES_AUTH_HOST" \
   --es-index "logs-auditd_manager.auditd-*" \
   --out-index red-alerts-linux \
-  --threshold 0.46 --method cosine --top-k 10 \
-  --interval 15 --no-state \
+  --threshold 0.52 --method cosine --top-k 10 \
+  --interval 15 --state-file /tmp/.state_linux.json --since "$SINCE" \
   > /tmp/red_demo_v2_logs/detect_linux.log 2>&1 &
 
 echo "Linux detector PID=$!"
+
+
+# Kill detector cũ
+kill 36285
+
+# Chạy lại (từ thư mục project)
+cd /home/ubuntu/rule_evasion_detection/Rule_Evasion_Detection
+source ~/venvs/rule_evasion_env/bin/activate
+set -a; . ./.env; set +a
+mkdir -p /tmp/red_demo_v2_logs
+
+PY="$HOME/venvs/rule_evasion_env/bin/python"
+
+RED_DISABLE_INTELEX=1 "$PY" red_linux/scripts/detect_live_linux.py \
+  --config config/detect_live_linux.yml \
+  --es-host "$ES_AUTH_HOST" \
+  --es-index "logs-auditd_manager.auditd-*" \
+  --out-index red-alerts-linux \
+  --threshold 0.52 --method cosine --top-k 10 \
+  --interval 15 --no-state \
+  > /tmp/red_demo_v2_logs/detect_linux.log 2>&1 
+
+echo "PID=$!"
+
 ```
 
 Dung:
@@ -240,17 +264,18 @@ python3 -m agent.daemon --red-index "red-alerts-linux" \
 **B. One-shot theo `_id`** — investigate dung 1 Linux alert (thay `<DOC_ID>`):
 
 ```bash
-cd ~/rule_evasion_detection/Rule_Evasion_Detection || exit 1
-source ~/venvs/rule_evasion_env/bin/activate
-set -a; . ./.env; set +a
-
-DOC_ID="<dan _id vao day>"    # vd Xo0hvZ4BmkchXZ6B8CQ3
-SINCE_AGENT=$(date -u -d '24 hour ago' +%Y-%m-%dT%H:%M:%SZ)
-
 # Verify _id truoc khi chay
 curl -sk "$ES_AUTH_HOST/red-alerts-linux/_search" -H 'Content-Type: application/json' \
   -d "{\"query\":{\"query_string\":{\"query\":\"_id:\\\"$DOC_ID\\\"\"}}}" \
   | python3 -c "import json,sys; print('hits =', json.load(sys.stdin)['hits']['total']['value'])"
+  
+cd ~/rule_evasion_detection/Rule_Evasion_Detection || exit 1
+source ~/venvs/rule_evasion_env/bin/activate
+set -a; . ./.env; set +a
+
+SINCE_AGENT=$(date -u -d '24 hour ago' +%Y-%m-%dT%H:%M:%SZ)
+DOC_ID="<dan _id vao day>"    # vd Xo0hvZ4BmkchXZ6B8CQ3
+
 
 PYTHONUNBUFFERED=1 python3 -m agent.daemon \
   --red-index "red-alerts-linux" \
@@ -291,6 +316,112 @@ for h in d['hits']['hits']:
           f\"verdict={f.get('forensic_verdict_vi','?')} \"
           f\"conf={f.get('confidence',0):.2f}\")
 "
+```
+
+---
+
+## 6U. [UNKNOWN → AI AGENT] Chay agent cho alert confidence=unknown
+
+Khi Stage 2 khong attribution duoc (Sigma engine khong fire, cosine duoi nguong),
+alert duoc danh dau `red.needs_agent=true` va `red.confidence=unknown`.
+Dung section nay de chay agent pipeline phan tich behavioral evidence thay vi rule matching.
+
+> **Luong:** Stage 2 unknown → `red.needs_agent:true` trong ES → agent poll → Forensic
+> (Velociraptor: process tree, /dev/shm, network) → MITRE map → Report:
+> "Evasion phuc tap — attribution dua tren behavioral evidence thay vi rule matching"
+
+### 6U.1 Kiem tra co alert unknown khong
+
+```bash
+set -a; . ./.env; set +a
+
+# Windows
+curl -sk "$ES_AUTH_HOST/red-alerts-v2-*/_count" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"term":{"red.needs_agent":true}}}' \
+  | python3 -c "import json,sys; print('Windows unknown:', json.load(sys.stdin)['count'])"
+
+# Linux
+curl -sk "$ES_AUTH_HOST/red-alerts-linux/_count" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"term":{"red.needs_agent":true}}}' \
+  | python3 -c "import json,sys; print('Linux unknown:', json.load(sys.stdin)['count'])"
+```
+
+### 6U.2 Chay agent chi xu ly alert unknown (Windows)
+
+```bash
+cd ~/rule_evasion_detection/Rule_Evasion_Detection || exit 1
+source ~/venvs/rule_evasion_env/bin/activate
+set -a; . ./.env; set +a
+
+SINCE_AGENT=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+
+PYTHONUNBUFFERED=1 python3 -m agent.daemon \
+  --red-index "red-alerts-v2-*" \
+  --needs-agent-only \
+  --since "$SINCE_AGENT" \
+  --max-iter 5 --batch-limit 3 \
+  2>&1 | tee /tmp/red_demo_v2_logs/agent_unknown_win.log
+```
+
+### 6U.3 Chay agent chi xu ly alert unknown (Linux)
+
+```bash
+cd ~/rule_evasion_detection/Rule_Evasion_Detection || exit 1
+source ~/venvs/rule_evasion_env/bin/activate
+set -a; . ./.env; set +a
+
+SINCE_AGENT=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+
+PYTHONUNBUFFERED=1 python3 -m agent.daemon \
+  --red-index "red-alerts-linux" \
+  --needs-agent-only \
+  --since "$SINCE_AGENT" \
+  --max-iter 5 --batch-limit 3 \
+  2>&1 | tee /tmp/red_demo_v2_logs/agent_unknown_linux.log
+```
+
+> `--needs-agent-only` tu dong them filter `red.needs_agent:true` vao query ES.
+> Tuong duong `--query-string "red.needs_agent:true"` nhung ro rang hon khi demo.
+
+### 6U.4 Verify ket qua — attribution behavioral
+
+```bash
+set -a; . ./.env; set +a
+
+curl -sk "$ES_AUTH_HOST/ai-investigations/_search?size=5&sort=timestamp:desc" \
+  -H 'Content-Type: application/json' \
+  -d '{"query":{"exists":{"field":"forensic.process_tree_summary_vi"}}}' \
+  | python3 -c "
+import json, sys
+d = json.load(sys.stdin)
+print(f'Total behavioral investigations: {d[\"hits\"][\"total\"][\"value\"]}')
+for h in d['hits']['hits']:
+    s = h['_source']
+    ra = s.get('red_analyst', {}) or {}
+    forensic = s.get('forensic', {}) or {}
+    mitre = s.get('mitre', {}) or {}
+    report = s.get('report', {}) or {}
+    print()
+    print(f'  inv_id   = {s.get(\"investigation_id\",\"?\")}')
+    print(f'  severity = {(s.get(\"triage\") or {}).get(\"severity\",\"?\")}')
+    print(f'  evasion  = {ra.get(\"evasion_technique\",\"?\")} (conf={ra.get(\"confidence\",0):.2f})')
+    print(f'  forensic = grade={forensic.get(\"evidence_grade\",\"?\")} c2={forensic.get(\"c2_confirmed\",\"?\")}')
+    print(f'  mitre    = {mitre.get(\"primary_technique\",\"?\")} / {mitre.get(\"primary_tactic\",\"?\")}')
+    print(f'  title    = {report.get(\"title_vi\",\"\")[:80]}')
+"
+```
+
+Dong log mong doi:
+
+```text
+[RED Analyst] BEHAVIORAL ATTRIBUTION MODE — red.confidence=unknown, red.needs_agent=true.
+...
+✓ Forensic: grade=high, verdict=confirmed_malicious, persistence=True, c2=True
+✓ MITRE: T1005 / T1041 / T1053.003
+✓ Report: "Evasion phuc tap — attribution dua tren behavioral evidence thay vi rule matching"
+→ Indexed: ai-investigations/INV-<12hex>
 ```
 
 ---
@@ -381,13 +512,13 @@ cd ~/rule_evasion_detection/Rule_Evasion_Detection || exit 1
 source ~/venvs/rule_evasion_env/bin/activate
 set -a; . ./.env; set +a
 
-export RUN_ID="<RunId>"   # vi du cae65ce1
-SINCE_AGENT=$(date -u -d '15 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
+export RUN_ID="xOnjyp4BmkchXZ6B95Fp"   # vi du cae65ce1
+SINCE_AGENT=$(date -u -d '120 minutes ago' +%Y-%m-%dT%H:%M:%SZ)
 
 PYTHONUNBUFFERED=1 python3 -m agent.daemon \
   --red-index "red-alerts-v2-*" \
   --max-iter 1 --batch-limit 1 --no-state \
-  --score-threshold 0.9 --since "$SINCE_AGENT" \
+  --score-threshold 0.5 --since "$SINCE_AGENT" \
   --query-string "*${RUN_ID}*" \
   2>&1 | tee /tmp/red_demo_v2_logs/agent_one_shot.log
 ```
@@ -407,7 +538,7 @@ PYTHONUNBUFFERED=1 python3 -m agent.daemon \
 ```bash
 source ~/venvs/rule_evasion_env/bin/activate
 set -a; . ./.env; set +a
-DOC_ID="<dan _id vao day>"   # vd kcI5VZ4B8R8CqW49PR4Z
+DOC_ID="xOnjyp4BmkchXZ6B95Fp"   # vd kcI5VZ4B8R8CqW49PR4Z
 SINCE_AGENT=$(date -u -d '3 hour ago' +%Y-%m-%dT%H:%M:%SZ)
 
 # (tuy chon) verify _id co ton tai — khong ton token
@@ -505,3 +636,4 @@ Bang flag tham khao nhanh:
 | `--no-state` | Khong luu `.agent_daemon_state.json` (one-shot/lap lai) |
 | `--reset-state` | Xoa state, process lai tu dau |
 | `--dry-run` | Investigate (VAN ton token) nhung khong ghi ES |
+| `--needs-agent-only` | Chi xu ly alert co `red.needs_agent=true` (confidence=unknown) — behavioral attribution mode |

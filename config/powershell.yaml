@@ -75,5 +75,5 @@ evaluation:
 output:
   dir: models/powershell
   result_name: ensemble
-  train_result_path: models/powershell/train_rslt_ensemble.zip
+  train_result_path: models/powershell/train_rslt_ensemble_portable.zip
   attr_result_name: attr_ensemble

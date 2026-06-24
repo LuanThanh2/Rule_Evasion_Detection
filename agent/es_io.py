@@ -204,6 +204,15 @@ def normalize_alert_source(src: dict) -> dict:
         "red.top_rule": "red.top_rule",
         "red.top_rules": "red.top_rules",
         "red.command_line": "red.command_line",
+        # Stage 2 live fields
+        "red.confidence": "red.confidence",
+        "red.needs_agent": "red.needs_agent",
+        "red.evasion_technique": "red.evasion_technique",
+        "red.evaded_rule": "red.evaded_rule",
+        "red.decode_chain": "red.decode_chain",
+        "red.report": "red.report",
+        "red.stage2_mode": "red.stage2_mode",
+        "red.cosine_top": "red.cosine_top",
     }
     for dotted_key, nested_path in dotted_to_nested.items():
         if dotted_key in alert:
