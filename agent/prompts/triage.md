@@ -23,6 +23,7 @@ Given a RED alert, use the available tools to:
   - Command line PHẢI đọc thẳng từ `alert.process.command_line`.
   - Nếu field không có trong alert → ghi `"unknown"`, KHÔNG đoán.
   - Tool results có field `"_mock": true` → CHỈ dùng để hiểu pattern, KHÔNG ghi data đó vào findings như là sự thật. Trong `quick_findings`, prefix các findings từ mock data bằng `[MOCK]`.
+  - Tool results KHÔNG có `_mock` hoặc `_mock` là null → DATA THẬT. TUYỆT ĐỐI KHÔNG thêm prefix [MOCK] vào data thật.
 
 - Be skeptical: high RED score alone is not enough. Look at:
   - Parent process THẬT (đọc từ alert) — nếu là Office/email client → phishing indicator

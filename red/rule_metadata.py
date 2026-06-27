@@ -64,6 +64,7 @@ class SigmaRuleMeta:
     description: str = ""         # Sigma rule description
     level: str = ""               # informational/low/medium/high/critical
     tags: list = None             # MITRE ATT&CK tags, e.g. ["attack.t1070.001"]
+    detection_yaml: str = ""      # raw YAML content — for AI Agent
 
     def __post_init__(self):
         if self.tags is None:
@@ -77,6 +78,7 @@ class SigmaRuleMeta:
             "description": self.description,
             "level": self.level,
             "tags": self.tags,
+            "detection_yaml": self.detection_yaml,
         }
 
 
@@ -122,7 +124,8 @@ class SigmaRuleIndex:
                 full_path = os.path.join(root, f)
                 try:
                     with open(full_path, encoding="utf-8") as fh:
-                        rule = yaml.safe_load(fh)
+                        raw_content = fh.read()
+                    rule = yaml.safe_load(raw_content)
                     if not isinstance(rule, dict):
                         continue
                     title = rule.get("title")
@@ -144,6 +147,7 @@ class SigmaRuleIndex:
                         description=description,
                         level=level,
                         tags=tags,
+                        detection_yaml=raw_content,
                     )
                     # Có thể collide nếu 2 rule cùng title → giữ file đầu, log warning
                     if normalized in self._by_normalized:

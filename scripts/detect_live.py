@@ -332,7 +332,7 @@ def main():
                     len(rule_index))
         if args.exact_sigma:
             exact_matcher = SigmaExactMatcher.from_rules_dirs(
-                all_rule_dirs,
+                [rules_dir],
                 event_field_map=event_field_map,
                 search_fields=search_fields,
             )
@@ -442,26 +442,11 @@ def main():
                             ],
                         }
 
-                    top_rules_enriched = []
-                    for r, s in top_rules[:args.top_k]:
-                        entry = {"rule": r, "score": round(s, 4)}
-                        if rule_index is not None:
-                            meta = rule_index.lookup_dict(normalize_title(r))
-                            entry["sigma_filename"] = meta.get("filename")
-                            entry["sigma_id"] = meta.get("sigma_id")
-                            entry["sigma_title"] = meta.get("title")
-                            entry["sigma_description"] = meta.get("description", "")
-                            entry["sigma_level"] = meta.get("level", "")
-                            entry["sigma_tags"] = meta.get("tags", [])
-                        top_rules_enriched.append(entry)
-
                     alert = {
                         "@timestamp": event.get("@timestamp"),
                         "red.detection_score": round(score, 4),
                         "red.attribution_method": args.method,
                         "red.stage2_mode": args.stage2_mode,
-                        "red.top_rule": top_rule_name,
-                        "red.top_rules": top_rules_enriched,
                         "red.command_line": text,
                         "host.name": event.get("host", {}).get("name", "unknown"),
                         "winlog.event_id": event.get("winlog", {}).get("event_id"),
@@ -470,19 +455,13 @@ def main():
                         "user": event.get("user", {}),
                         **stage2_extra,
                     }
-                    if top_rule_name and rule_index is not None:
-                        meta = rule_index.lookup_dict(normalize_title(top_rule_name))
-                        alert["red.top_rule_sigma_filename"] = meta.get("filename")
-                        alert["red.top_rule_sigma_id"] = meta.get("sigma_id")
-                        alert["red.top_rule_sigma_title"] = meta.get("title")
-                        alert["red.top_rule_sigma_description"] = meta.get("description", "")
-                        alert["red.top_rule_sigma_level"] = meta.get("level", "")
-                        alert["red.top_rule_sigma_tags"] = meta.get("tags", [])
 
                     if rule_index is not None:
                         evaded = stage2_extra.get("red.evaded_rule") or []
+                        _csmap = {x["rule"]: x["score"] for x in stage2_extra.get("red.cosine_top", [])}
                         alert["red.evaded_rules_meta"] = [
                             {
+                                "score": _csmap.get(r, 0),
                                 "rule": r,
                                 **rule_index.lookup_dict(normalize_title(r)),
                             }
@@ -501,13 +480,16 @@ def main():
                         else:
                             alert["red.primary_rule"] = top_rule_name
 
+                    # Schema cleanup 2026-06-25: bo truong trai phang trung lap
+                    alert.pop("red.top_rule", None)
+                    alert.pop("red.evaded_rule", None)
                     es_index(args.es_host, args.out_index, alert)
                     n_alerts += 1
 
                     logger.info(
                         "[ALERT] host=%s  score=%.3f  conf=%s  top=%s | %s",
                         alert["host.name"], score, alert.get("red.confidence", "legacy"),
-                        alert["red.top_rule"], text[:100],
+                        top_rule_name, text[:100],
                     )
 
                 since_ts = last_ts

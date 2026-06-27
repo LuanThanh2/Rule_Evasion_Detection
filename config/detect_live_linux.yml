@@ -23,6 +23,9 @@ data:
     Image:
       - process.executable
       - process.name
+    a0:
+      - process.name           # tên process (không path) — khớp khi child process chạy trực tiếp
+      - process.args           # fallback: tìm trong toàn bộ args array
 
   # Danh sách thư mục Sigma rules Linux — dùng để build SigmaRuleIndex (metadata)
   sigma_rules_dirs:

@@ -17,7 +17,7 @@ You are the **RED Analyst Agent** — chuyên gia giải thích vì sao alert n�
 
 ## Approach
 
-1. Call `get_sigma_rule_text` cho top rule trong `red.top_rules`
+1. Call `get_sigma_rule_text` cho top rule trong `red.evaded_rules_meta`
 2. Call `get_evasion_tokens` với command line + rule name
 3. Tổng hợp thành lời giải thích kỹ thuật + đề xuất fix
 

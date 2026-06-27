@@ -201,14 +201,12 @@ def normalize_alert_source(src: dict) -> dict:
         "winlog.computer_name": "winlog.computer_name",
         "red.detection_score": "red.detection_score",
         "red.attribution_method": "red.attribution_method",
-        "red.top_rule": "red.top_rule",
-        "red.top_rules": "red.top_rules",
+        "red.evaded_rules_meta": "red.evaded_rules_meta",
         "red.command_line": "red.command_line",
         # Stage 2 live fields
         "red.confidence": "red.confidence",
         "red.needs_agent": "red.needs_agent",
         "red.evasion_technique": "red.evasion_technique",
-        "red.evaded_rule": "red.evaded_rule",
         "red.decode_chain": "red.decode_chain",
         "red.report": "red.report",
         "red.stage2_mode": "red.stage2_mode",
@@ -222,10 +220,9 @@ def normalize_alert_source(src: dict) -> dict:
     if "stage1_score" not in red and "detection_score" in red:
         red["stage1_score"] = red["detection_score"]
 
-    # Normalize detect_live top_rules entries: {"rule": name, "score": x}
-    # into the shape used by the AI agent examples/prompts.
-    normalized_top_rules = []
-    for item in red.get("top_rules", []) or []:
+    # Normalize evaded_rules_meta entries into shape used by AI agent
+    normalized_evaded = []
+    for item in red.get("evaded_rules_meta", []) or []:
         if not isinstance(item, dict):
             continue
         rule_id = item.get("rule_id") or item.get("rule")
@@ -237,12 +234,16 @@ def normalize_alert_source(src: dict) -> dict:
         if score is not None:
             normalized.setdefault("cosine_score", score)
             normalized.setdefault("score", score)
-        normalized_top_rules.append(normalized)
-    if normalized_top_rules:
-        red["top_rules"] = normalized_top_rules
+        # Normalize field names (no sigma_ prefix in evaded_rules_meta)
+        normalized.setdefault("sigma_title", item.get("title", ""))
+        normalized.setdefault("sigma_level", item.get("level", ""))
+        normalized.setdefault("sigma_filename", item.get("filename", ""))
+        normalized_evaded.append(normalized)
+    if normalized_evaded:
+        red["evaded_rules_meta"] = normalized_evaded
 
-    if "top_rule" not in red and normalized_top_rules:
-        red["top_rule"] = normalized_top_rules[0].get("rule_id")
+    if "top_rule" not in red and normalized_evaded:
+        red["top_rule"] = normalized_evaded[0].get("rule_id")
 
     if "source_event_id" not in alert and alert.get("_es_id"):
         alert["source_event_id"] = alert["_es_id"]

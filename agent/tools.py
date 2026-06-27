@@ -23,6 +23,7 @@ ES_PASSWORD = os.environ.get("ES_PASSWORD", "")
 ES_AUTH = (ES_USER, ES_PASSWORD) if ES_PASSWORD else None
 ES_RED_INDEX = os.environ.get("ES_RED_INDEX", "red-alerts")
 ES_VERIFY = os.environ.get("ES_VERIFY_SSL", "true").lower() != "false"
+ES_SYSMON_INDEX = os.environ.get("ES_SYSMON_INDEX", ".ds-logs-windows.sysmon_operational-*")
 
 
 # ── Tool implementations ──────────────────────────────────────────
@@ -74,10 +75,43 @@ def get_process_tree(host: str, command_line: str) -> dict:
             "_mock": True,
             "interpretation": "outlook.exe spawn powershell → curl: nghi vấn email phishing → execution → C2",
         }
-    return {"tree": "real ES query not implemented yet", "_todo": True}
+    try:
+        query = {
+            "query": {"bool": {"must": [
+                {"term": {"host.name": host}},
+                {"term": {"winlog.event_id": 1}},
+                {"range": {"@timestamp": {"gte": "now-2h"}}},
+            ]}},
+            "size": 20,
+            "sort": [{"@timestamp": "desc"}],
+            "_source": ["@timestamp", "process.pid", "process.name",
+                        "process.parent.pid", "process.parent.name",
+                        "process.command_line", "user.name"],
+        }
+        r = requests.post(
+            f"{ES_HOST}/{ES_SYSMON_INDEX}/_search",
+            json=query, auth=ES_AUTH, timeout=10, verify=ES_VERIFY,
+        )
+        hits = r.json().get("hits", {}).get("hits", [])
+        tree = []
+        for h in hits:
+            s = h["_source"]
+            p = s.get("process", {})
+            tree.append({
+                "timestamp": s.get("@timestamp"),
+                "pid": p.get("pid"),
+                "name": p.get("name"),
+                "command_line": (p.get("command_line") or "")[:200],
+                "parent_pid": p.get("parent", {}).get("pid"),
+                "parent_name": p.get("parent", {}).get("name"),
+                "user": s.get("user", {}).get("name"),
+            })
+        return {"tree": tree, "count": len(tree)}
+    except Exception as e:
+        return {"error": str(e), "tree": [], "count": 0}
 
 
-def get_network_connections(host: str, timeframe_minutes: int = 30) -> dict:
+def get_network_connections(host: str, timeframe_minutes: int = 1440) -> dict:
     """Lấy network connections của host trong N phút qua."""
     if not USE_REAL_ES:
         return {
@@ -92,7 +126,37 @@ def get_network_connections(host: str, timeframe_minutes: int = 30) -> dict:
             "_mock": True,
             "interpretation": "WIN-01 đang gọi 1.2.3.4 qua cả HTTPS + HTTP từ powershell + curl → C2 channel",
         }
-    return {"connections": [], "_todo": "real ES query for network events"}
+    try:
+        query = {
+            "query": {"bool": {"must": [
+                {"term": {"host.name": host}},
+                {"term": {"winlog.event_id": 3}},
+                {"range": {"@timestamp": {"gte": f"now-{timeframe_minutes}m"}}},
+            ]}},
+            "size": 20,
+            "sort": [{"@timestamp": "desc"}],
+            "_source": ["@timestamp", "destination.ip", "destination.port",
+                        "source.ip", "process.name", "network.protocol"],
+        }
+        r = requests.post(
+            f"{ES_HOST}/{ES_SYSMON_INDEX}/_search",
+            json=query, auth=ES_AUTH, timeout=10, verify=ES_VERIFY,
+        )
+        hits = r.json().get("hits", {}).get("hits", [])
+        connections = []
+        for h in hits:
+            s = h["_source"]
+            connections.append({
+                "timestamp": s.get("@timestamp"),
+                "src_ip": s.get("source", {}).get("ip"),
+                "dst_ip": s.get("destination", {}).get("ip"),
+                "dst_port": s.get("destination", {}).get("port"),
+                "protocol": s.get("network", {}).get("protocol"),
+                "process": s.get("process", {}).get("name"),
+            })
+        return {"connections": connections, "count": len(connections)}
+    except Exception as e:
+        return {"error": str(e), "connections": [], "count": 0}
 
 
 def search_threat_intel(indicator: str) -> dict:
@@ -116,7 +180,12 @@ def search_threat_intel(indicator: str) -> dict:
             "indicator": indicator, "reputation": "unknown",
             "note": "IOC chưa có trong threat intel db",
         }
-    return {"_todo": "tích hợp VirusTotal/AbuseIPDB API thật"}
+    # Không có external API — trả về không có intel thay vì _todo
+    return {
+        "indicator": indicator,
+        "reputation": "unknown",
+        "note": "Không có threat intel database. Cần kiểm tra thủ công qua VirusTotal/AbuseIPDB.",
+    }
 
 
 def get_sigma_rule_text(rule_name: str) -> dict:
@@ -141,8 +210,30 @@ def get_sigma_rule_text(rule_name: str) -> dict:
         info = rules.get(rule_name)
         if info:
             return info
-        return {"rule_name": rule_name, "_todo": "rule chưa cache, query Sigma rule store"}
-    return {"_todo": "đọc trực tiếp từ rules_dir hoặc API"}
+        return {"rule_name": rule_name, "note": "Rule không có trong cache mock"}
+    import os, glob
+    SIGMA_RULES_DIR = os.environ.get("SIGMA_RULES_DIR", "/home/ubuntu/data/sigma/rules")
+    # Search by filename or title match
+    pattern = rule_name.lower().replace(" ", "_").replace("/", "_")
+    candidates = glob.glob(f"{SIGMA_RULES_DIR}/**/*.yml", recursive=True)
+    for path in candidates:
+        fname = os.path.basename(path).replace(".yml", "").lower()
+        if fname == pattern or fname in pattern or pattern in fname:
+            try:
+                yaml_text = open(path).read()
+                # Extract level and id from YAML
+                level = "unknown"
+                rule_id = ""
+                for line in yaml_text.splitlines():
+                    if line.strip().startswith("level:"):
+                        level = line.split(":", 1)[1].strip()
+                    if line.strip().startswith("id:"):
+                        rule_id = line.split(":", 1)[1].strip()
+                return {"rule_name": rule_name, "yaml": yaml_text,
+                        "level": level, "id": rule_id, "path": path}
+            except Exception as e:
+                return {"error": str(e), "rule_name": rule_name}
+    return {"rule_name": rule_name, "note": f"Rule '{rule_name}' không tìm thấy trong {SIGMA_RULES_DIR}"}
 
 
 def get_evasion_tokens(command_line: str, rule_name: str) -> dict:
@@ -235,7 +326,7 @@ def suggest_containment(host: str, severity: str, has_credential_access: bool = 
             "rationale_template": "Page SOC on-call analyst",
         })
 
-    return {"recommended_actions": actions, "_mock": True}
+    return {"recommended_actions": actions}
 
 
 def send_telegram(message_summary: str, severity: str = "MEDIUM") -> dict:

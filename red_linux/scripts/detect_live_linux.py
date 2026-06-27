@@ -47,13 +47,44 @@ from red.normalize import Normalizer
 from red.persist import load_result
 from red.data import resolve_event_paths
 from red.attribution import reciprocal_rank_fusion
-from red.rule_metadata import SigmaRuleIndex
+from red.rule_metadata import SigmaRuleIndex, normalize_title
 from red.sigma_exact import SigmaExactMatcher
 from red.stage2_live import LiveAttributor
 
 logger = logging.getLogger("detect_live_linux")
 
 STATE_FILE = ".detect_live_linux_state.json"
+
+LEVEL_ORDER = {"critical": 0, "high": 1, "medium": 2, "low": 3, "informational": 4, "": 5}
+
+
+def _mitre_depth(tags: list) -> int:
+    """Negated max MITRE sub-technique depth — deeper = more specific = sort earlier."""
+    depth = 0
+    for t in tags:
+        if isinstance(t, str) and t.startswith("attack.t"):
+            depth = max(depth, t.count("."))
+    return -depth
+
+
+def parse_preferred_sigma_ids(value: str | None) -> list[str]:
+    if not value:
+        return []
+    return [item.strip().lower() for item in value.split(",") if item.strip()]
+
+
+def sort_exact_matches(exact_matches: list, preferred_ids: list[str]) -> list:
+    if not exact_matches or not preferred_ids:
+        return exact_matches
+
+    def priority(match) -> tuple[int, str]:
+        sigma_id = match.sigma_id.lower()
+        for idx, preferred in enumerate(preferred_ids):
+            if sigma_id == preferred or sigma_id.startswith(preferred):
+                return idx, match.rule
+        return len(preferred_ids), match.rule
+
+    return sorted(exact_matches, key=priority)
 
 
 def promote_exact_matches(top_rules, exact_matches, top_k):
@@ -274,6 +305,18 @@ def main():
     parser.add_argument("--exact-sigma", action=argparse.BooleanOptionalAction, default=True,
                         help="Layer-3: chạy logic Sigma trên event, đẩy luật fire-thật lên #1 "
                              "(tắt bằng --no-exact-sigma)")
+    parser.add_argument(
+        "--exact-sigma-max-matches",
+        type=int,
+        default=10,
+        help="Maximum exact Sigma matches to store in each alert.",
+    )
+    parser.add_argument(
+        "--exact-sigma-prefer-ids",
+        type=str,
+        default="",
+        help="Comma-separated Sigma UUIDs or prefixes to prefer when multiple exact rules fire.",
+    )
     parser.add_argument("--stage2-mode", choices=["legacy", "live"], default="live",
                         help="live (mặc định) = Stage 2/3 mới: 2-pass Sigma + decode + confidence; "
                              "legacy = cosine + promote_exact_matches cũ")
@@ -282,6 +325,7 @@ def main():
         help="Bỏ qua event có command_line dưới N ký tự (tránh FP ngắn). Default 15.",
     )
     args = parser.parse_args()
+    preferred_sigma_ids = parse_preferred_sigma_ids(args.exact_sigma_prefer_ids)
 
     logging.basicConfig(
         level=logging.INFO,
@@ -352,7 +396,7 @@ def main():
             event_field_map=event_field_map,
             search_fields=search_fields,
         )
-        logger.info("Layer-3 BẬT — exact Sigma validation trên %d thư mục rule", len(all_rule_dirs))
+        logger.info("Stage 2 Sigma Matcher: loaded %d rule dirs", len(all_rule_dirs))
 
     # ── Stage 2/3 live attributor (2-pass Sigma + decode + confidence) ───────
     live_attributor = None
@@ -364,7 +408,7 @@ def main():
             event_field_map=event_field_map,
             search_fields=search_fields,
         )
-        logger.info("Stage 2/3 live mode BẬT (2-pass Sigma + decode + confidence scoring)")
+        logger.info("Stage 2 live mode BẬT (Pass 1 Sigma + decode + Pass 2 Sigma + cosine + confidence)")
 
     normalizer = Normalizer()
 
@@ -457,23 +501,17 @@ def main():
                             args.method, args.top_k,
                         )
                         exact_matches = exact_matcher.match_event(event) if exact_matcher else []
+                        exact_matches = sort_exact_matches(exact_matches, preferred_sigma_ids)
                         if exact_matches:
                             top_rules = promote_exact_matches(top_rules, exact_matches, args.top_k)
                         top_rule_name = top_rules[0][0] if top_rules else None
                         stage2_extra = {
                             "red.exact_sigma_match": bool(exact_matches),
-                            "red.exact_sigma_matches": [m.to_alert_dict() for m in exact_matches],
+                            "red.exact_sigma_matches": [
+                                m.to_alert_dict()
+                                for m in exact_matches[:args.exact_sigma_max_matches]
+                            ],
                         }
-
-                    top_rules_enriched = []
-                    for r, s in top_rules[:args.top_k]:
-                        entry = {"rule": r, "score": round(s, 4)}
-                        if rule_index is not None:
-                            meta = rule_index.lookup_dict(r)
-                            entry["sigma_filename"] = meta.get("filename")
-                            entry["sigma_id"] = meta.get("sigma_id")
-                            entry["sigma_title"] = meta.get("title")
-                        top_rules_enriched.append(entry)
 
                     alert = {
                         "@timestamp": event.get("@timestamp"),
@@ -481,7 +519,6 @@ def main():
                         "red.attribution_method": args.method,
                         "red.stage2_mode": args.stage2_mode,
                         "red.top_rule": top_rule_name,
-                        "red.top_rules": top_rules_enriched,
                         "red.command_line": text,
                         "host.name": event.get("host", {}).get("name", "unknown"),
                         "host.os.type": "linux",
@@ -490,11 +527,42 @@ def main():
                         "auditd": event.get("auditd", {}),
                         **stage2_extra,
                     }
-                    if top_rule_name and rule_index is not None:
-                        meta = rule_index.lookup_dict(top_rule_name)
-                        alert["red.top_rule_sigma_filename"] = meta.get("filename")
-                        alert["red.top_rule_sigma_id"] = meta.get("sigma_id")
-                        alert["red.top_rule_sigma_title"] = meta.get("title")
+
+                    if rule_index is not None:
+                        evaded = stage2_extra.get("red.evaded_rule") or []
+                        if evaded:
+                            # Sigma fired: populate from evaded rules (score=1.0 = exact match)
+                            alert["red.evaded_rules_meta"] = [
+                                {
+                                    "score": 1.0,
+                                    "rule": r,
+                                    **rule_index.lookup_dict(normalize_title(r)),
+                                }
+                                for r in evaded
+                            ]
+                            evaded_meta = [
+                                (r, rule_index.lookup_dict(normalize_title(r)))
+                                for r in evaded
+                            ]
+                            evaded_sorted = sorted(
+                                evaded_meta,
+                                key=lambda rm: (
+                                    LEVEL_ORDER.get(rm[1].get("level", ""), 5),
+                                    _mitre_depth(rm[1].get("tags", [])),
+                                ),
+                            )
+                            alert["red.primary_rule"] = evaded_sorted[0][0]
+                        else:
+                            # Cosine fallback: populate from top_rules cosine attribution
+                            alert["red.evaded_rules_meta"] = [
+                                {
+                                    "score": round(s, 4),
+                                    "rule": r,
+                                    **rule_index.lookup_dict(normalize_title(r)),
+                                }
+                                for r, s in top_rules[:args.top_k]
+                            ]
+                            alert["red.primary_rule"] = top_rule_name
 
                     es_index(args.es_host, args.out_index, alert)
                     n_alerts += 1

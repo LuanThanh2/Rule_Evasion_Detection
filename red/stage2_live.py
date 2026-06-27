@@ -444,13 +444,19 @@ class LiveAttributor:
             decoded_layers=layers,
         )
 
+        # Effective encoding evidence: sigma rule title OR auto-detected decode layers
+        # enc_titles requires a sigma rule with encoding keyword in its title to fire.
+        # eff_enc falls back to the layer method if no such rule exists.
+        eff_enc = enc_titles if enc_titles else ([l.method for l in layers[:1]] if layers else [])
+
         # HIGH — encoding fire + rule đích fire sau decode
-        if enc_titles and rule_a:
+        if eff_enc and rule_a:
             v.confidence = "high"
+            v.evasion_technique = eff_enc
             v.top_rule = rule_a[0]
             chain = "→".join(l.method for l in layers)
             v.report = (
-                f"Rule '{rule_a[0]}' bị né bằng kỹ thuật '{enc_titles[0]}'. "
+                f"Rule '{rule_a[0]}' bị né bằng kỹ thuật '{eff_enc[0]}'. "
                 f"Giải mã {len(layers)} lớp ({chain}) lộ ý đồ thật."
             )
             return v
@@ -471,13 +477,14 @@ class LiveAttributor:
         # MEDIUM — encoding fire nhưng Pass 2 Sigma không match
         # Pass 3: chạy cosine trên decoded_text (thay vì raw_text)
         # → tìm rules giống nội dung decoded nhất → dùng làm evaded_rule
-        if enc_titles:
+        if eff_enc:
             cosine_on_decoded = self._cosine_rank(_expand_char_codes(decoded_text)) if decoded_text else []
             if cosine_on_decoded:
                 top_name, top_score = cosine_on_decoded[0]
                 v.evaded_rule = [name for name, _ in cosine_on_decoded[:3]]
                 v.cosine_top = cosine_on_decoded
                 v.top_rule = top_name
+                v.evasion_technique = eff_enc
                 chain = "→".join(l.method for l in layers)
                 if top_score >= 0.65:
                     v.confidence = "high"
@@ -486,16 +493,17 @@ class LiveAttributor:
                 else:
                     v.confidence = "low"
                 v.report = (
-                    f"Rule '{top_name}' (cosine={top_score:.3f}) bị né bằng kỹ thuật '{enc_titles[0]}'. "
+                    f"Rule '{top_name}' (cosine={top_score:.3f}) bị né bằng kỹ thuật '{eff_enc[0]}'. "
                     f"Giải mã {len(layers)} lớp ({chain}); "
                     f"Sigma Pass 2 miss → cosine fallback trên decoded."
                 )
                 return v
             v.confidence = "medium"
             v.cosine_top = self._cosine_rank(raw_text)
-            v.top_rule = v.cosine_top[0][0] if v.cosine_top else enc_titles[0]
+            v.top_rule = v.cosine_top[0][0] if v.cosine_top else eff_enc[0]
+            v.evasion_technique = eff_enc
             v.report = (
-                f"Phát hiện kỹ thuật né '{enc_titles[0]}' nhưng cosine không "
+                f"Phát hiện kỹ thuật né '{eff_enc[0]}' nhưng cosine không "
                 f"xác định được rule đích. Gợi ý: '{v.top_rule}'."
             )
             return v

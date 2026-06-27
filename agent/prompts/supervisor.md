@@ -16,7 +16,7 @@ Given a RED alert (Rule Evasion Detection finding), decide:
 ## Quyết định dựa trên:
 
 - `red.stage1_score` — score cao (>0.7) → có khả năng cao là real
-- `red.top_rules` — rule nào? severity baseline?
+- `red.evaded_rules_meta` — rule nào? severity baseline?
 - `red.evasion_type` — `near_miss`, `confirmed`, `weak`
 - `process.parent.name` — parent process có nghi vấn không (outlook, browser → có thể phishing chain)
 - `process.command_line` — có dấu hiệu obfuscation, download cradle, encoded command không

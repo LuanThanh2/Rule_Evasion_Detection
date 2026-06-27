@@ -445,6 +445,21 @@ Kibana Security Alerts dùng **ECS** queries (`process.*`, `powershell.*`) — N
 
 Stage 2 Limitation: TF-IDF chỉ "gần token", không validate Sigma detection logic → TIE thắng theo insertion order. Roadmap: Layer 3 Sigma validator.
 
+### Schema cleanup output alert (2026-06-25)
+
+Đã bỏ 8 trường output trùng lặp (bản trải phẳng của `red.top_rules` / `red.evaded_rules_meta`) khỏi pipeline **Windows**:
+- **Xóa:** `red.top_rule`, `red.top_rule_sigma_{filename,id,title,description,level,tags}`, `red.evaded_rule`.
+- **Giữ:** `red.top_rules` (kèm score), `red.evaded_rules_meta`, `red.primary_rule`, `red.cosine_top`, `red.command_line`, `red.detection_score`, `red.confidence`, `red.report`, `red.decode_chain`, `red.evasion_technique`.
+- **Sửa ở:** `scripts/detect_live.py` (pop 2 key trước `es_index` + bỏ block `top_rule_sigma_*` + log dùng `top_rule_name`) và `agent/es_io.py` (gỡ 2 dòng map chết). Lưu ý `red.evaded_rule` vẫn giữ nội bộ trong `stage2_live.to_dict()` để build `evaded_rules_meta`, chỉ pop khỏi alert.
+- **Backup:** `*.bak_schema_20260625`.
+- **Lý do hướng xóa:** `top_rules`/`evaded_rules_meta` là superset; 8 trường kia chỉ là bản rút gọn nằm trong chúng. Xóa ngược lại sẽ mất rule #2-4 + score.
+
+**CÒN CẦN SỬA (chưa làm):**
+- `red_linux/scripts/detect_live_linux.py` — bản Linux y hệt, vẫn ghi 8 trường này. Áp cùng cleanup nếu muốn output Linux/Windows nhất quán.
+- `scripts/detect_batch.py` — dùng `top_rule_sigma_*` riêng (không prefix `red.`), luồng batch khác → chưa đụng.
+- Docs `demo/README.md`, `red_linux/demo/DEMO_LINUX_2.md` còn tham chiếu `red.top_rule` / `red.top_rule_sigma_*` → stale, cần cập nhật.
+- Chồng lấn còn lại (CỐ Ý giữ): `red.top_rules` ↔ `red.evaded_rules_meta` cùng liệt kê rule khớp nhưng khác vai trò (top_rules có score/cosine; evaded_rules_meta là rule "ý đồ thật") → KHÔNG gộp.
+
 ### Issues chưa fix trong code
 
 - **`push_alerts.py` HTTPS**: không có `verify=False` → crash trên self-signed ELK. Workaround: dùng `curl` bulk NDJSON (xem Section 6.3 trong `apt_demo_defense_present.md`). Fix đúng: thêm `--no-verify-ssl` flag đọc `ES_VERIFY_SSL` env.
