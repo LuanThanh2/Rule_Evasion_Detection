@@ -184,6 +184,9 @@ class ReportOutput(BaseModel):
     summary_vi: str
     full_markdown_vi: str
     recommended_actions_vi: list[str] = Field(default_factory=list)
+    full_report_url: Optional[str] = None
+    kibana_case_id: Optional[str] = None
+    kibana_case_url: Optional[str] = None
 
 
 class AgentMetadata(BaseModel):

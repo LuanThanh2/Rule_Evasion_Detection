@@ -104,6 +104,9 @@ AI_INDEX_MAPPING = {
                     "summary_vi": {"type": "text"},
                     "full_markdown_vi": {"type": "text"},
                     "recommended_actions_vi": {"type": "text"},
+                    "full_report_url": {"type": "keyword"},
+                    "kibana_case_id": {"type": "keyword"},
+                    "kibana_case_url": {"type": "keyword"},
                 },
             },
             "agent_metadata": {
