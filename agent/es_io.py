@@ -104,6 +104,9 @@ AI_INDEX_MAPPING = {
                     "summary_vi": {"type": "text"},
                     "full_markdown_vi": {"type": "text"},
                     "recommended_actions_vi": {"type": "text"},
+                    "full_report_url": {"type": "keyword"},
+                    "kibana_case_id": {"type": "keyword"},
+                    "kibana_case_url": {"type": "keyword"},
                 },
             },
             "agent_metadata": {
@@ -155,6 +158,7 @@ def write_investigation(inv: Investigation) -> dict:
     Document ID = investigation_id (idempotent — chạy lại không tạo dup).
     """
     doc = inv.model_dump(mode="json", exclude_none=False)
+    _sanitize_forensic_raw_fields(doc)
     r = requests.put(
         f"{ES_HOST}/{ES_AI_INDEX}/_doc/{inv.investigation_id}",
         auth=ES_AUTH,
@@ -166,6 +170,24 @@ def write_investigation(inv: Investigation) -> dict:
         raise RuntimeError(f"Index failed ({r.status_code}): {r.text}")
     return r.json()
 
+def _sanitize_forensic_raw_fields(doc: dict) -> None:
+    """Prevent dynamic ES mappings from rejecting arbitrary forensic raw fields."""
+    forensic = doc.get("forensic")
+    if not isinstance(forensic, dict):
+        return
+
+    artifacts = forensic.get("suspicious_artifacts")
+    if not isinstance(artifacts, list):
+        return
+
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        raw = artifact.get("raw")
+        if not isinstance(raw, dict) or not raw:
+            continue
+        artifact["raw_json"] = json.dumps(raw, ensure_ascii=False, sort_keys=True)
+        artifact["raw"] = {}
 
 # ── Alert read ──────────────────────────────────────────────────────
 def _ensure_path(obj: dict, path: str) -> dict:

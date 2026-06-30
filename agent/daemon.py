@@ -41,6 +41,10 @@ from agent.es_io import (
     save_state,
     reset_state,
 )
+from agent.kibana_cases import (
+    compact_report_for_dashboard,
+    create_case_for_investigation,
+)
 
 logger = logging.getLogger("agent.daemon")
 
@@ -92,7 +96,19 @@ async def process_alert(alert: dict, dry_run: bool = False) -> bool:
     if dry_run:
         logger.info("[dry-run] không ghi ES — investigation_id=%s", inv.investigation_id)
         return True
-
+    try:
+        case_id, case_url = create_case_for_investigation(inv)
+        if inv.report:
+            inv.report.kibana_case_id = case_id
+            inv.report.kibana_case_url = case_url
+            inv.report.full_report_url = case_url
+            inv.report.full_markdown_vi = compact_report_for_dashboard(inv, case_url)
+            if case_url:
+                logger.info("→ Full report URL: %s", case_url)
+    except Exception as e:
+        logger.exception("Kibana case creation failed: %s", e)
+        if inv.report:
+            inv.report.full_markdown_vi = compact_report_for_dashboard(inv, None)
     try:
         result = write_investigation(inv)
         logger.info("→ Indexed: %s/%s", result.get("_index"), result.get("_id"))
