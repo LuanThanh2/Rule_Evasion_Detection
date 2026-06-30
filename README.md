@@ -1,90 +1,187 @@
 # Rule Evasion Detection (RED)
 
-RED là hệ thống phát hiện hành vi né tránh luật Sigma trên Windows Event Logs.
-Pipeline chính gồm:
+RED là hệ thống phát hiện hành vi né tránh luật Sigma trên log Windows/Linux và hỗ trợ điều tra alert bằng AI Agent SOC Triage.
 
-- Stage 1: phát hiện event đáng ngờ bằng mô hình ML trên đặc trưng text.
-- Stage 2: quy kết event đáng ngờ về Sigma rule có khả năng bị né.
-- Phase C: AI Agent SOC Triage đọc alert RED, điều tra thêm bằng evidence và sinh báo cáo tiếng Việt.
-
-Repo này phục vụ nghiên cứu, demo lab và thử nghiệm phòng thủ. Các script demo chỉ nên chạy trong môi trường kiểm thử có kiểm soát.
-
-## Mục Lục
-
-- [Tổng Quan](#tổng-quan)
-- [Kết Quả Hiện Có](#kết-quả-hiện-có)
-- [Yêu Cầu](#yêu-cầu)
-- [Cài Đặt](#cài-đặt)
-- [Cấu Trúc Repo](#cấu-trúc-repo)
-- [Chạy Pipeline ML](#chạy-pipeline-ml)
-- [ELK Integration](#elk-integration)
-- [AI Agent SOC Triage](#ai-agent-soc-triage)
-- [Demo Windows Lab](#demo-windows-lab)
-- [Chuẩn Bị Dữ Liệu](#chuẩn-bị-dữ-liệu)
-- [Config](#config)
-- [Script Thường Dùng](#script-thường-dùng)
-- [Troubleshooting](#troubleshooting)
+Branch này được đóng gói theo hướng **runtime demo thực tế**: có code chạy live, model đã train, Sigma rule catalog, AI Agent, và bộ Velociraptor phục vụ forensic thật trong lab. Các script train/evaluate, report nghiên cứu, payload demo và dataset thô đã được loại khỏi bản nộp này để repo gọn hơn.
 
 ## Tổng Quan
 
-| Thành phần | Vai trò | Output chính |
-|---|---|---|
-| Stage 1 - Misuse Detection | Phân loại benign vs suspicious bằng SVM hoặc Ensemble SVM + Logistic Regression + ComplementNB | `detection_score` trong khoảng `[0, 1]` |
-| Stage 2 - Rule Attribution | Xếp hạng Sigma rule gần nhất bằng cosine similarity TF-IDF (offline eval) | `top_rules`, `top_rule_sigma_*` |
-| Stage 2 Live Attribution | 2-pass Sigma-logic + payload decode (base64/hex/charcode) + confidence scoring | `red.evasion_technique`, `red.evaded_rule`, `red.confidence` |
-| ELK Integration | Đọc log từ Elasticsearch, chạy RED, ghi alert về index `red-alerts` | Alert dùng được trong Kibana |
-| Phase C - AI Agent | Multi-agent triage, hunt, MITRE mapping, forensic, response và report | Document trong `ai-investigations` |
+RED xử lý log từ Elasticsearch theo pipeline nhiều lớp:
 
-Điểm chính của RED:
+1. Stage 1 - ML Misuse Detection  
+   Phân loại event benign/suspicious bằng model ML đã train trên đặc trưng text như command line, ScriptBlockText, registry path.
 
-- Chuẩn hóa command line, ScriptBlockText, registry path và URL thành token ổn định hơn trước các biến thể né rule.
-- Stage 1 hỗ trợ EnsembleClassifier gồm SVM, Logistic Regression và Complement Naive Bayes.
-- Stage 2 có `CosineRuleAttributor` dùng cùng không gian TF-IDF cho rule filter values, phù hợp khi mở rộng catalog Sigma.
-- **Stage 2 Live** (`red/stage2_live.py`): 2-pass Sigma-logic engine + payload decode (base64/hex/charcode/gzip) + confidence scoring (`high/medium/low/unknown`). Output rõ nghĩa: `red.evasion_technique` (kỹ thuật né) và `red.evaded_rule` (rule bị né — ý đồ thật).
-- Alert được enrich metadata Sigma: filename, Sigma ID, title.
-- AI Agent có 8 module: Supervisor, Triage, Forensic, Hunt, RED Analyst, MITRE, Response, Report.
+2. Stage 2 - Rule Attribution  
+   Xếp hạng Sigma rule có khả năng bị né bằng cosine TF-IDF và metadata Sigma.
 
-## Kết Quả Hiện Có
+3. Stage 2 Live - Sigma Logic + Decode  
+   Với alert suspicious, hệ thống chạy Sigma exact matching, decode payload obfuscation như base64/hex/charcode/gzip, rồi xác định:
+   - `red.evasion_technique`: rule/kỹ thuật né bị kích hoạt.
+   - `red.evaded_rule`: rule/ý đồ thật có thể đã bị né.
+   - `red.confidence`: `high`, `medium`, `low`, hoặc `unknown`.
 
-Các số liệu dưới đây lấy từ các file `models/*/*_info.json` hiện có trong repo. Khi train lại, hãy ưu tiên số liệu mới trong chính các file output.
+4. AI Agent SOC Triage  
+   Agent đọc alert RED, điều tra thêm bằng Elasticsearch/Velociraptor, map MITRE, đề xuất response và ghi báo cáo tiếng Việt vào Elasticsearch.
 
-### Stage 1 - Misuse Detection
+## Thành Phần Chính
 
-| Event type | Threshold | Precision | Recall | F1 | MCC | Ghi chú |
-|---|---:|---:|---:|---:|---:|---|
-| `process_creation` | 0.50 | 99.67% | 100.00% | 99.83% | 99.81% | `models/process_creation/eval_rslt_ensemble_f1_info.json` |
-| `powershell` | 0.46 | 99.05% | 100.00% | 99.52% | 99.51% | optimal threshold; default 0.50 có precision 100.00%, recall 99.04% |
-| `registry_event` | 0.50 | 100.00% | 100.00% | 100.00% | 100.00% | `models/registry_event/eval_rslt_ensemble_f1_info.json` |
+| Thành phần | Vai trò |
+|---|---|
+| `red/` | Core engine dùng chung cho Windows và Linux: normalize, load model, attribution, Sigma exact, Stage 2 live. |
+| `scripts/detect_live.py` | Daemon Windows: poll Elasticsearch, chạy Stage 1/2, ghi alert về index RED. |
+| `scripts/detect_batch.py` | Chạy detection offline trên JSONL, dùng để test nhanh event export. |
+| `red_linux/scripts/detect_live_linux.py` | Daemon Linux/auditd: poll auditd ECS logs, chạy RED và ghi `red-alerts-linux`. |
+| `agent/` | Multi-Agent SOC Triage: Supervisor, Triage, Forensic, Hunt, RED Analyst, MITRE, Response, Report. |
+| `models/` | Model runtime đã train: Stage 1 portable và Stage 2 attribution. |
+| `data/sigma/rules/` | Sigma rule catalog dùng cho attribution, metadata enrich và exact matching. |
+| `config/` | Config field mapping, model path, rule path cho Windows/Linux event types. |
+| `velociraptor/` | Binary/config/script cài Velociraptor để Forensic Agent query evidence thật. |
+| `run/` | Script menu để chạy detector và AI Agent khi demo. |
 
-### Stage 2 - Rule Attribution
+## Cấu Trúc Thư Mục
 
-| Event type | Method | Top-1 | Top-3 | Top-5 | File |
-|---|---|---:|---:|---:|---|
-| `process_creation` | cosine | 68.79% | 92.62% | 97.32% | `models/process_creation/eval_attr_cosine_attr_ensemble_info.json` |
-| `powershell` | cosine | 84.62% | 100.00% | 100.00% | `models/powershell/eval_attr_cosine_attr_ensemble_info.json` |
-| `registry_event` | cosine | 78.89% | 100.00% | 100.00% | `models/registry_event/eval_attr_cosine_attr_ensemble_info.json` |
+```text
+Rule_Evasion_Detection/
++-- red/                         # Core RED runtime
++-- scripts/
+|   +-- detect_live.py            # Windows live detector
+|   +-- detect_batch.py           # Offline JSONL detector
++-- red_linux/
+|   +-- scripts/
+|       +-- detect_live_linux.py  # Linux/auditd live detector
++-- agent/                        # AI Agent SOC Triage
+|   +-- agents/                   # 8 specialized agents
+|   +-- prompts/                  # System prompts
+|   +-- daemon.py                 # Agent daemon đọc RED alerts
+|   +-- run.py                    # Chạy một alert
+|   +-- vr_client.py              # Velociraptor client wrapper
+|   +-- vr_client_map.yaml        # Map host.name -> Velociraptor client_id
++-- config/
+|   +-- process_creation.yaml
+|   +-- powershell.yaml
+|   +-- registry_event.yaml
+|   +-- detect_live_linux.yml
+|   +-- linux_atomic.yaml
+|   +-- linux_process_creation.yaml
++-- models/
+|   +-- process_creation/
+|   +-- powershell/
+|   +-- registry_event/
+|   +-- linux_atomic/
+|   +-- linux_process_creation/
++-- data/
+|   +-- sigma/
+|       +-- rules/                # Windows/Linux Sigma YAML catalog
++-- velociraptor/                 # Velociraptor runtime + installer files
++-- run/
+|   +-- detect.sh                 # Menu chạy RED detector
+|   +-- agent.sh                  # Menu chạy AI Agent
++-- requirements.txt
++-- README.md
+```
 
-Catalog cosine hiện có trong model attribution:
+## Model Và Rule Catalog
 
-| Event type | Per-rule SVM rules | Cosine rules |
-|---|---:|---:|
-| `process_creation` | 200 | 1129 |
-| `powershell` | 25 | 208 |
-| `registry_event` | 23 | 242 |
+Các model runtime chính:
+
+```text
+models/process_creation/train_rslt_ensemble_portable.zip
+models/process_creation/train_rslt_attr_ensemble.zip
+
+models/powershell/train_rslt_ensemble_portable.zip
+models/powershell/train_rslt_attr_ensemble.zip
+
+models/registry_event/train_rslt_ensemble_portable.zip
+models/registry_event/train_rslt_attr_ensemble.zip
+
+models/linux_atomic/train_rslt_ensemble_atomic_portable.zip
+models/linux_process_creation/train_rslt_attr_ensemble_portable.zip
+```
+
+Sigma rules nằm trong:
+
+```text
+data/sigma/rules/
+```
+
+Trong lab hiện tại, một số config vẫn trỏ về `~/data/sigma/rules/...`. Khi chạy trên máy mới, có hai lựa chọn:
+
+1. Copy rule catalog từ repo sang đúng path `~/data/sigma/rules/`.
+2. Hoặc sửa `rules_dir` / `sigma_rules_dirs` trong `config/*.yaml` sang `data/sigma/rules/...`.
+
+Dataset train thô không bắt buộc để chạy runtime. Log thật được đọc trực tiếp từ Elasticsearch.
+
+## Pipeline Chạy Thật
+
+### Windows
+
+```text
+Elasticsearch logs-windows.*
+        |
+        v
+scripts/detect_live.py
+        |
+        +-- Stage 1: ML score benign/suspicious
+        +-- Stage 2 live: Sigma exact + decode + cosine attribution
+        |
+        v
+red-alerts-v2-proc / red-alerts-v2-reg / red-alerts-v2-ps
+```
+
+Windows event types:
+
+| Config | Event ID | Output index |
+|---|---:|---|
+| `config/process_creation.yaml` | 1 | `red-alerts-v2-proc` |
+| `config/registry_event.yaml` | 13 | `red-alerts-v2-reg` |
+| `config/powershell.yaml` | 4104 | `red-alerts-v2-ps` |
+
+### Linux
+
+```text
+Elasticsearch logs-auditd_manager.auditd-*
+        |
+        v
+red_linux/scripts/detect_live_linux.py
+        |
+        +-- Stage 1: Linux atomic portable model
+        +-- Stage 2 live: Linux Sigma exact + attribution
+        |
+        v
+red-alerts-linux
+```
+
+### AI Agent
+
+```text
+RED alert index
+        |
+        v
+agent.daemon
+        |
+        +-- Triage
+        +-- Forensic evidence via Velociraptor
+        +-- Hunt / RED Analyst / MITRE
+        +-- Response
+        +-- Vietnamese report
+        |
+        v
+ai-investigations
+```
 
 ## Yêu Cầu
 
 - Python 3.10+.
-- Linux/macOS cho pipeline train/evaluate. Repo hiện đang dùng đường dẫn kiểu Linux.
-- Windows VM có Sysmon, PowerShell logging và Elastic Agent nếu chạy demo live.
-- Elasticsearch/Kibana nếu dùng ELK integration hoặc AI Agent daemon.
-- DeepSeek API key nếu dùng AI Agent.
-- Tùy chọn: Velociraptor nếu muốn Forensic Agent lấy evidence thật từ host.
+- Elasticsearch/Kibana đang nhận Windows/Linux logs.
+- Windows endpoint có Sysmon, PowerShell Script Block Logging, Elastic Agent.
+- Linux endpoint có Elastic Agent Auditd Manager.
+- DeepSeek API key hoặc OpenAI-compatible API key cho AI Agent.
+- Velociraptor server/client nếu muốn Forensic Agent lấy evidence thật.
 
 ## Cài Đặt
 
 ```bash
-cd ~/KLTN/KLTN/Rule_Evasion_Detection/rule_evasion_detection
+cd /path/to/Rule_Evasion_Detection
 
 python3 -m venv ~/venvs/rule_evasion_env
 source ~/venvs/rule_evasion_env/bin/activate
@@ -92,541 +189,205 @@ source ~/venvs/rule_evasion_env/bin/activate
 pip install -r requirements.txt
 ```
 
-Tùy chọn tăng tốc:
-
-```bash
-# NVIDIA GPU, cần CUDA phù hợp
-pip install cuml-cu12
-
-# Intel CPU acceleration đã có trong requirements.txt
-pip install scikit-learn-intelex
-```
-
-RED tự ưu tiên backend theo thứ tự: NVIDIA GPU, Intel oneDAL, scikit-learn CPU thường.
-
-Nếu dùng AI Agent:
-
-```bash
-cp .env.example .env
-nano .env
-```
-
-Các biến tối thiểu:
-
-```text
-DEEPSEEK_API_KEY=sk-your-deepseek-key
-ES_HOST=https://192.168.10.10:9200      # ES có thể HTTPS — set ES_VERIFY_SSL=false nếu self-signed
-ES_USER=elastic
-ES_PASSWORD=your-es-password
-ES_VERIFY_SSL=false                      # cho self-signed cert
-ES_RED_INDEX=red-alerts*                 # wildcard match cả live + replay indices
-ES_AI_INDEX=ai-investigations
-AGENT_MAX_ITERATIONS=12                  # ceiling chung cho mọi ReAct agent
-```
-
-Lưu ý:
-- Module `agent` tự load `.env` với `override=True` → giá trị trong `.env` thắng biến shell (fix 2026-05-23).
-- `detect_live.py` không tự load `.env` và cũng không có option `--es-user` / `--es-password`; khi cần xác thực, hãy đặt credential trong `--es-host`, ví dụ `http://elastic:PASSWORD@10.10.20.100:9200`.
-- Nếu shell có biến `ES_RED_INDEX` cũ (ví dụ `red-alerts`), `unset ES_RED_INDEX` trước khi chạy. Từ 2026-05-23 `agent/__init__.py` đã dùng `override=True` nên .env thắng, nhưng cẩn thận với script không qua module `agent`.
-
-## Cấu Trúc Repo
-
-```text
-rule_evasion_detection/
-├── agent/                 # Multi-agent SOC triage
-├── config/                # YAML config cho từng event type
-├── data/                  # Dữ liệu nhỏ hoặc placeholder trong repo
-├── demo/                  # Script và tài liệu demo Windows lab
-├── models/                # Model/result đã train
-├── red/                   # Core RED: normalize, data, model, attribution, evaluate
-├── scripts/               # CLI train/evaluate/ELK/data prep
-├── .env.example           # Template cấu hình agent/ELK
-├── requirements.txt
-└── README.md
-```
-
-Phần lớn dataset và Sigma catalog được cấu hình ở `~/data/...`, không nằm trực tiếp trong repo.
-
-## Chạy Pipeline ML
-
-Luôn activate virtualenv trước:
-
-```bash
-source ~/venvs/rule_evasion_env/bin/activate
-cd ~/KLTN/KLTN/Rule_Evasion_Detection/rule_evasion_detection
-```
-
-### Stage 1 - Train, Validate, Evaluate
-
-Lệnh khuyến nghị cho Ensemble SVM + LR + CNB:
-
-```bash
-python3 scripts/run_stage1.py --config config/process_creation.yaml
-python3 scripts/run_stage1.py --config config/powershell.yaml
-python3 scripts/run_stage1.py --config config/registry_event.yaml
-```
-
-Chạy baseline SVM đơn để so sánh:
-
-```bash
-python3 scripts/run_stage1.py --config config/process_creation.yaml --no-ensemble --result-name svm_baseline
-```
-
-Output chính:
-
-```text
-models/<event_type>/train_rslt_<name>.zip
-models/<event_type>/valid_rslt_<name>.zip
-models/<event_type>/eval_rslt_<name>.zip
-models/<event_type>/eval_rslt_<name>_info.json
-```
-
-### Stage 2 - Train Và Evaluate Attribution
-
-```bash
-python3 scripts/train_attribution.py --config config/process_creation.yaml
-python3 scripts/eval_attribution.py --config config/process_creation.yaml --method cosine
-```
-
-Chạy cho các event type còn lại:
-
-```bash
-python3 scripts/train_attribution.py --config config/powershell.yaml
-python3 scripts/eval_attribution.py --config config/powershell.yaml --method cosine
-
-python3 scripts/train_attribution.py --config config/registry_event.yaml
-python3 scripts/eval_attribution.py --config config/registry_event.yaml --method cosine
-```
-
-Các method hỗ trợ:
-
-| Method | Ý nghĩa | Khi dùng |
-|---|---|---|
-| `svm` | Xếp hạng bằng per-rule SVM | So sánh baseline hoặc rule có đủ match/evasion data |
-| `cosine` | Xếp hạng bằng cosine similarity trên TF-IDF chung | Khuyến nghị cho catalog Sigma mở rộng |
-| `hybrid` | Reciprocal Rank Fusion giữa SVM và cosine | Thử nghiệm khi muốn kết hợp hai tín hiệu |
-
-### Stage 2 Live Attribution (production daemon)
-
-`red/stage2_live.py` cung cấp pipeline attribution **live** thay oracle tĩnh, tích hợp vào `detect_live_linux.py` qua `--stage2-mode live` (mặc định).
-
-**Luồng:**
-
-```
-event (Stage 1 malicious)
-    │
-PASS 1: SigmaExactMatcher(event_gốc)  → red.evasion_technique  (kỹ thuật né)
-    │
-DECODE: recursive_decode()             → decode chain (base64/hex/charcode/gzip, ≤4 lớp)
-    │
-PASS 2: SigmaExactMatcher(decoded)    → red.evaded_rule         (ý đồ thật)
-    │
-STAGE 3: confidence scoring
-    ├── high    — evaded_rule bị né bằng evasion_technique
-    ├── medium  — encoding fire, rule đích không xác nhận → cosine fallback
-    ├── low     — engine trống → cosine soft-attribution
-    └── unknown — cosine thấp → chuyển AI Agent behavioral analysis
-```
-
-**Alert fields mới so với legacy:**
-
-| Field | Ý nghĩa |
-|---|---|
-| `red.evasion_technique` | Tên rule kỹ thuật né (Rule B), vd `["Suspicious Encoded PowerShell Command"]` |
-| `red.evaded_rule` | Tên rule ý đồ thật (Rule A), vd `["Potential Invoke-Mimikatz"]` |
-| `red.confidence` | `high / medium / low / unknown` |
-| `red.decode_chain` | Từng lớp decode `[{depth, method, text}]` |
-| `red.needs_agent` | `true` khi unknown → tín hiệu cho AI Agent |
-
-Chạy self-test decode:
-
-```bash
-python3 -m red.stage2_live
-# decode self-test: 7/7 PASS
-```
-
-Chuyển về mode cũ (legacy cosine + promote_exact_matches):
-
-```bash
-python3 red_linux/scripts/detect_live_linux.py ... --stage2-mode legacy
-```
-
-### Full Pipeline Helper
-
-Repo có `scripts/run_pipeline.py` để chạy train, validate, evaluate, train attribution, eval attribution và plot:
-
-```bash
-python3 scripts/run_pipeline.py --config config/process_creation.yaml
-```
-
-Lưu ý: `run_pipeline.py` không đảm bảo Ensemble và không chạy `eval_attribution.py --method cosine`. Khuyến nghị dùng `run_stage1.py` + các lệnh Stage 2 riêng như hai phần trên.
-
-## ELK Integration
-
-### Export Log Từ Elasticsearch
-
-```bash
-python3 scripts/elk_export.py \
-  --es-host http://elastic:PASSWORD@10.10.20.100:9200 \
-  --es-index "logs-winlog.*" \
-  --event-id 1 \
-  --since 24h \
-  --out exported_process_creation.jsonl
-```
-
-Event ID thường dùng:
-
-| Event type | Event ID | Ghi chú |
-|---|---:|---|
-| `process_creation` | 1 | Sysmon Process Create |
-| `powershell` | 4104 | PowerShell Script Block Logging |
-| `registry_event` | 12, 13, 14 | Sysmon registry create/set/rename; chạy live riêng cho từng ID nếu cần |
-
-### Batch Detection
-
-```bash
-python3 scripts/detect_batch.py \
-  --config config/process_creation.yaml \
-  --events exported_process_creation.jsonl \
-  --threshold 0.5 \
-  --method cosine \
-  --top-k 5 \
-  --out red_alerts.jsonl
-```
-
-Đẩy alert JSONL lên Elasticsearch:
-
-```bash
-python3 scripts/push_alerts.py \
-  --alerts red_alerts.jsonl \
-  --es-host http://10.10.20.100:9200 \
-  --es-user elastic \
-  --es-password "$ES_PASSWORD" \
-  --es-index red-alerts
-```
-
-### Live Detection
-
-```bash
-python3 scripts/detect_live.py \
-  --config config/process_creation.yaml \
-  --es-host http://elastic:PASSWORD@10.10.20.100:9200 \
-  --es-index "logs-winlog.*" \
-  --out-index red-alerts \
-  --event-id 1 \
-  --threshold 0.5 \
-  --method cosine \
-  --interval 60
-```
-
-Backfill một khoảng thời gian cụ thể:
-
-```bash
-python3 scripts/detect_live.py \
-  --config config/process_creation.yaml \
-  --es-host http://elastic:PASSWORD@10.10.20.100:9200 \
-  --es-index "logs-winlog.*" \
-  --out-index red-alerts \
-  --event-id 1 \
-  --since 30m \
-  --until now \
-  --no-state \
-  --max-iter 1 \
-  --threshold 0.5 \
-  --method cosine
-```
-
-State file mặc định là `.detect_live_state.json`. Dùng `--reset-state` khi muốn quét lại từ đầu.
-
-### Convert Sigma Sang Elastic Rules
-
-Nếu Kibana chưa có Detection Rules, chuyển Sigma YAML sang Elastic NDJSON. Đường dẫn
-dưới đây dùng `~/data/sigma/...` — sửa lại theo môi trường của bạn nếu khác.
-
-```bash
-python3 scripts/convert_sigma_to_elastic.py \
-  --index-pattern "logs-windows.*" \
-  --index-pattern "winlogbeat-*" \
-  --field-profile winlog-raw \
-  --out data/sigma/elastic_rules/windows_sigma_elastic_winlog_raw.ndjson
-```
-
-> ⚠️ Index pattern phải khớp với data stream thật. Trên lab IQAM883 (Elastic Agent v9)
-> là `logs-windows.*` (có chữ **s**), KHÔNG phải `logs-winlog.*`.
-
-Import qua Kibana UI:
-
-```text
-Kibana -> Security -> Rules -> Import rules
-```
-
-Hoặc import bằng API. Lưu ý Kibana chạy **HTTP** trên port 5601 (chỉ Elasticsearch
-là HTTPS), nên `--kibana-url` phải dùng `http://`:
-
-```bash
-python3 scripts/convert_sigma_to_elastic.py \
-  --skip-convert \
-  --out data/sigma/elastic_rules/windows_sigma_elastic_winlog_raw.ndjson \
-  --import-to-kibana \
-  --kibana-url http://192.168.10.10:5601 \
-  --kibana-user elastic \
-  --kibana-password "$KIBANA_PASSWORD" \
-  --import-chunk-size 200 \
-  --import-timeout 300
-```
-
-Dùng `--field-profile winlog-raw` khi log còn ở field gốc như `winlog.event_data.CommandLine`. Nếu log đã chuẩn ECS, có thể bỏ option này.
-
-**Kết quả thực tế trên lab IQAM883 (2026-05-23)**: import 1,620/1,624 rules thành công
-qua 9 chunks × 200 (mất ~3 phút). 4 rule fail vì `Invalid UUID` (Sigma rule id không
-phải UUID format — Kibana reject).
-
-## AI Agent SOC Triage
-
-AI Agent nhận alert từ `red-alerts`, chạy workflow điều tra và ghi kết quả vào `ai-investigations`.
-
-### Chạy Một Alert
-
-```bash
-python3 -m agent.run --quiet --save /tmp/red_investigation.json
-```
-
-Dùng alert JSON riêng:
-
-```bash
-python3 -m agent.run --alert-file red_alert.json --quiet --save /tmp/red_investigation.json
-```
-
-Cho tool query Elasticsearch thật:
-
-```bash
-python3 -m agent.run --es-real --alert-file red_alert.json --quiet
-```
-
-### Daemon
-
-Dry-run một vòng, không ghi Elasticsearch:
-
-```bash
-python3 -m agent.daemon \
-  --dry-run \
-  --max-iter 1 \
-  --score-threshold 0.5
-```
-
-Chạy daemon thật:
-
-```bash
-python3 -m agent.daemon \
-  --interval 60 \
-  --score-threshold 0.5 \
-  --batch-limit 20
-```
-
-Các option hữu ích:
-
-| Option | Ý nghĩa |
-|---|---|
-| `--reset-state` | Xóa `.agent_daemon_state.json`, cho phép process lại alert cũ |
-| `--since <ISO>` | Override timestamp bắt đầu, ví dụ `2026-05-20T08:00:00Z` |
-| `--no-state` | Không lưu state, tiện cho demo one-shot |
-| `--query-string` | Lọc alert bằng Elasticsearch query string |
-| `--skip-health-check` | Bỏ kiểm tra Elasticsearch ban đầu |
-
-### Velociraptor Forensic Mode
-
-Mặc định Forensic Agent dùng mock evidence. Để query Velociraptor thật:
-
-```text
-VR_USE_REAL=1
-VR_API_CONFIG=/etc/velociraptor/api.config.yaml
-VR_CLIENT_MAP_FILE=agent/vr_client_map.yaml
-```
-
-Cài thêm package:
+Nếu chạy Forensic Agent thật với Velociraptor:
 
 ```bash
 pip install pyvelociraptor grpcio pyyaml
 ```
 
-Cập nhật `agent/vr_client_map.yaml` để map `host.name` trong alert sang Velociraptor `client_id`.
+## Cấu Hình `.env`
 
-## Demo Windows Lab
-
-Các script Windows chính:
-
-| Script | Log tạo ra | Config RED |
-|---|---|---|
-| `demo/process_creation_scenarios.ps1` | Sysmon Event ID 1 | `config/process_creation.yaml` |
-| `demo/powershell_scenarios.ps1` | PowerShell Event ID 4104 | `config/powershell.yaml` |
-| `demo/registry_scenarios.ps1` | Sysmon Event ID 12/13/14 | `config/registry_event.yaml` |
-| `demo/apt_demo_scenario.ps1` | EID 1, 4104, 12/13/14, 4624 | nhiều event type — xem bên dưới |
-
-Ví dụ trên Windows VM:
-
-```powershell
-Set-ExecutionPolicy Bypass -Scope Process -Force
-.\process_creation_scenarios.ps1 -Scenario benign
-.\process_creation_scenarios.ps1 -Scenario baseline
-.\process_creation_scenarios.ps1 -Scenario evasion -SleepSeconds 20
-.\process_creation_scenarios.ps1 -Scenario chain
-```
-
-Chạy thử không tạo tiến trình thật:
-
-```powershell
-.\process_creation_scenarios.ps1 -Scenario evasion -DryRun
-```
-
-Tài liệu hỗ trợ:
-
-- `demo/README.md`: hướng dẫn demo end-to-end.
-- `demo/apt_demo_scenario.md`: giải thích từng phase và Sigma rule match.
-- `demo/apt_demo_scenario_demo_present.md`: lời thoại, kết quả kiểm thử, Q&A cho buổi bảo vệ (KLTN).
-- `demo/RED_RULE_MAP.md`: mapping RED rule ↔ Sigma metadata.
-- `demo/QA_PREP.md`: câu hỏi thường gặp khi bảo vệ/demo.
-- `demo/SLIDES_OUTLINE.md`: outline slide.
-
-## Chuẩn Bị Dữ Liệu
-
-Các config mặc định trỏ về `~/data/...`. Tạo dữ liệu theo cấu trúc sau:
-
-```text
-~/data/
-├── benign/
-│   ├── process_creation/benign_train.txt
-│   ├── powershell/benign_train.txt
-│   └── registry_event/benign_train.txt
-└── sigma/
-    ├── rules/windows/process_creation/
-    ├── rules/windows/powershell/
-    ├── rules/windows/registry/
-    ├── events_hayabusa/windows/process_creation/
-    ├── events_hayabusa/windows/powershell/
-    └── events_hayabusa/windows/registry_event/
-```
-
-Script chuyển đổi dữ liệu:
+Tạo file `.env` ở root repo:
 
 ```bash
-# LMD -> benign process_creation / registry_event
-python3 scripts/lmd_to_benign.py --lmd-dir /path/to/lmd --output-dir ~/data/benign
-
-# MPSD benign PowerShell -> benign_train.txt
-python3 scripts/mpsd_to_benign.py --mpsd-dir /path/to/powershell_benign_dataset --output-dir ~/data/benign/powershell
-
-# SecRepo Squid access.log -> benign proxy URLs
-python3 scripts/secrepo_to_benign.py --input /path/to/access.log --output-dir ~/data/benign/proxy_web
-
-# Hayabusa JSONL -> match events
-python3 scripts/hayabusa_to_matches.py \
-  --input hayabusa_output.jsonl \
-  --output-dir ~/data/sigma/events_hayabusa/windows/process_creation \
-  --event-type process_creation
-
-# Sinh evasion variants từ match events
-python3 scripts/generate_evasions.py --config config/process_creation.yaml
-```
-
-Nếu cần split benign 80/20:
-
-```bash
-python3 scripts/split_benign.py \
-  --input ~/data/benign/process_creation/benign_train.txt \
-  --train-ratio 0.8
-```
-
-## Config
-
-Mỗi file trong `config/` mô tả một event type.
-
-| Config | Trạng thái | Ghi chú |
-|---|---|---|
-| `config/process_creation.yaml` | chính | Sysmon process creation, nhiều field command/process/parent |
-| `config/powershell.yaml` | chính | ScriptBlockText, ContextInfo, Payload, Data, HostApplication |
-| `config/registry_event.yaml` | chính | TargetObject, Details, Image, User, EventType |
-| `config/proxy_web.yaml` | thử nghiệm | URL/proxy web, chưa phải luồng demo chính |
-
-Các block quan trọng:
-
-| Block | Ý nghĩa |
-|---|---|
-| `data.benign_train` | file benign train |
-| `data.benign_valid` | file benign validation; hiện thường trỏ cùng file train cho deployment-style evaluation |
-| `data.rules_dir` | thư mục Sigma YAML |
-| `data.events_dir` | match events đã convert |
-| `data.evasions_dir` | evasion variants |
-| `data.search_fields` | tên field trong Sigma rule |
-| `data.event_field_map` | mapping Sigma field sang JSON path trong log thật |
-| `training` | vectorizer, CV, scoring, malicious sample source |
-| `scaling` | MCC scaler để đưa decision score về `[0, 1]` |
-| `output` | thư mục và tên artifact model/result |
-
-## Script Thường Dùng
-
-Tất cả script CLI đều hỗ trợ `--help`:
-
-```bash
-python3 scripts/run_stage1.py --help
-python3 scripts/train_attribution.py --help
-python3 scripts/detect_live.py --help
-python3 -m agent.daemon --help
-```
-
-| Mục đích | Lệnh |
-|---|---|
-| Stage 1 gộp train/validate/evaluate | `python3 scripts/run_stage1.py --config config/process_creation.yaml` |
-| Train Stage 1 riêng | `python3 scripts/train.py --config config/process_creation.yaml --ensemble` |
-| Validate Stage 1 riêng | `python3 scripts/validate.py --config config/process_creation.yaml` |
-| Evaluate Stage 1 riêng | `python3 scripts/evaluate.py --config config/process_creation.yaml` |
-| Train Stage 2 | `python3 scripts/train_attribution.py --config config/process_creation.yaml` |
-| Evaluate Stage 2 cosine | `python3 scripts/eval_attribution.py --config config/process_creation.yaml --method cosine` |
-| Batch detect JSONL | `python3 scripts/detect_batch.py --config config/process_creation.yaml --events exported.jsonl --method cosine` |
-| Live detect Elasticsearch | `python3 scripts/detect_live.py --config config/process_creation.yaml --es-host http://host:9200` |
-| Convert Sigma sang Elastic | `python3 scripts/convert_sigma_to_elastic.py --field-profile winlog-raw --out rules.ndjson` |
-| AI Agent một alert | `python3 -m agent.run --alert-file alert.json --quiet` |
-| AI Agent daemon | `python3 -m agent.daemon --interval 60 --score-threshold 0.5` |
-
-## Troubleshooting
-
-### `Benign file not found`
-
-Kiểm tra đường dẫn trong config, ví dụ:
-
-```bash
-ls ~/data/benign/process_creation/benign_train.txt
-```
-
-Nếu dữ liệu nằm nơi khác, sửa `data.benign_train` trong file YAML hoặc truyền tham số trực tiếp cho script.
-
-### `Events dir not found`
-
-Stage 1 có thể fallback sang `rule_filters` nếu thiếu match events, nhưng Stage 2 cần `events_dir`. Hãy chạy converter Hayabusa/OTRF hoặc cập nhật `data.events_dir`.
-
-### `DEEPSEEK_API_KEY chưa set`
-
-Tạo `.env` từ `.env.example` và điền API key:
-
-```bash
-cp .env.example .env
 nano .env
 ```
 
-Sau đó chạy agent từ thư mục repo để module `agent` load đúng `.env`.
+Ví dụ cấu hình lab:
 
-### Không thấy alert trong Kibana
+```text
+# Elasticsearch
+ES_AUTH_HOST=https://elastic:YOUR_PASSWORD@192.168.10.10:9200
+ES_HOST=https://192.168.10.10:9200
+ES_USER=elastic
+ES_PASSWORD=YOUR_PASSWORD
+ES_VERIFY_SSL=false
 
-- Kiểm tra index nguồn: `logs-winlog.*`, `winlogbeat-*` hoặc index lab đang dùng.
-- Kiểm tra Event ID đúng với config.
-- Với `detect_live.py`, kiểm tra `.detect_live_state.json`; dùng `--reset-state` hoặc `--no-state --since ... --until now` khi backfill.
-- Với Elastic Detection Rules, rule chạy theo lịch nên alert Sigma có thể xuất hiện muộn hơn alert RED.
+# RED / AI Agent indices
+ES_RED_INDEX=red-alerts-v2-*
+ES_AI_INDEX=ai-investigations
 
-### Registry event có nhiều Event ID
+# LLM
+DEEPSEEK_API_KEY=sk-your-key
+DEEPSEEK_BASE_URL=https://api.deepseek.com
+DEEPSEEK_MODEL=deepseek-chat
+AGENT_MAX_ITERATIONS=12
+AGENT_TEMPERATURE=0.2
+AGENT_LOG_LEVEL=INFO
 
-`detect_live.py` nhận một `--event-id` mỗi tiến trình. Với registry, chạy riêng cho 12, 13 và 14 nếu cần cover đầy đủ.
+# Velociraptor real forensic mode
+VR_USE_REAL=1
+VR_API_CONFIG=velociraptor/api.config.yaml
+VR_CLIENT_MAP_FILE=agent/vr_client_map.yaml
+VR_QUERY_TIMEOUT=60
+
+# Optional: Kibana Cases
+KIBANA_CASES_ENABLED=0
+KIBANA_URL=http://192.168.10.10:5601
+KIBANA_USER=elastic
+KIBANA_PASSWORD=YOUR_PASSWORD
+KIBANA_SPACE_ID=default
+```
+
+Lưu ý:
+
+- `run/detect.sh` dùng `ES_AUTH_HOST`.
+- `agent/` dùng `ES_HOST`, `ES_USER`, `ES_PASSWORD`, `ES_RED_INDEX`, `ES_AI_INDEX`.
+- `agent/__init__.py` tự load `.env` với `override=True`, nên giá trị trong `.env` sẽ thắng biến shell.
+
+## Chạy RED Detector
+
+### Chạy bằng menu
+
+```bash
+source ~/venvs/rule_evasion_env/bin/activate
+./run/detect.sh
+```
+
+Menu hỗ trợ:
+
+```text
+1) Windows live
+2) Linux live
+3) Windows + Linux live
+4) Windows range
+5) Linux range
+6) Windows + Linux range
+7) Stop detector
+8) Đổi ngưỡng phát hiện
+```
+
+Chạy nhanh không cần menu:
+
+```bash
+./run/detect.sh win-live
+./run/detect.sh linux-live
+./run/detect.sh both-live
+```
+
+Log detector nằm ở:
+
+```text
+/tmp/red_demo_v2_logs/
+```
+
+## Chạy AI Agent SOC Triage
+
+### Chạy bằng menu
+
+```bash
+source ~/venvs/rule_evasion_env/bin/activate
+./run/agent.sh
+```
+
+Menu hỗ trợ:
+
+```text
+1) Investigate 1 Windows alert theo _id
+2) Quét Windows alerts theo khoảng thời gian
+3) Investigate 1 Linux alert theo _id
+4) Quét Linux alerts theo khoảng thời gian
+9) Stop agent.daemon
+```
+
+Script sẽ đếm alert trước, ước tính chi phí LLM, hỏi xác nhận rồi mới chạy.
+
+Output chính:
+
+```text
+ai-investigations
+```
+
+Nếu bật Kibana Cases (`KIBANA_CASES_ENABLED=1`), Agent sẽ tạo case trong Kibana và lưu URL vào investigation document.
+
+## Velociraptor Real Forensic Mode
+
+Forensic Agent có thể chạy mock mode hoặc real mode.
+
+Real mode cần:
+
+```text
+VR_USE_REAL=1
+VR_API_CONFIG=velociraptor/api.config.yaml
+VR_CLIENT_MAP_FILE=agent/vr_client_map.yaml
+```
+
+`agent/vr_client_map.yaml` map `host.name` trong RED alert sang Velociraptor `client_id`.
+
+Ví dụ:
+
+```yaml
+DESKTOP-IQAM883: C.cd6bfbb23aee7979
+linux-endpoint: C.xxxxxxxxxxxxxxxx
+```
+
+Các file cài đặt Velociraptor đi kèm:
+
+```text
+velociraptor/velociraptor
+velociraptor/velociraptor-server-0.76.1.amd64.deb
+velociraptor/velociraptor_client_0.76.1_amd64.deb
+velociraptor/windows_client/*.exe
+velociraptor/windows_client/*.msi
+velociraptor/windows_client/install_velociraptor_client_windows.ps1
+velociraptor/windows_client/install_velociraptor_client_windows.cmd
+```
+
+## Các Index Elasticsearch Thường Dùng
+
+| Index | Mục đích |
+|---|---|
+| `logs-windows.*` | Windows logs từ Elastic Agent. |
+| `logs-auditd_manager.auditd-*` | Linux auditd logs. |
+| `red-alerts-v2-proc` | RED alerts cho Windows process creation. |
+| `red-alerts-v2-reg` | RED alerts cho Windows registry. |
+| `red-alerts-v2-ps` | RED alerts cho PowerShell. |
+| `red-alerts-linux` | RED alerts cho Linux auditd. |
+| `ai-investigations` | Báo cáo AI Agent. |
+
+## Triển Khai Thật Cần Chú Ý
+
+- Repo này có Velociraptor config và binary phục vụ lab thật. Nếu đưa lên GitHub public, nên cân nhắc tách secrets/config thật ra ngoài repo.
+- Không commit `.env` chứa password/API key.
+- `detect_live.py` không tự đọc `ES_USER`/`ES_PASSWORD`; truyền credential qua `--es-host`, ví dụ `https://elastic:PASSWORD@192.168.10.10:9200`.
+- AI Agent có gọi LLM thật, sẽ phát sinh chi phí theo số alert điều tra.
+- Nếu Elasticsearch dùng self-signed certificate, đặt `ES_VERIFY_SSL=false` cho Agent. Các detector live hiện đang gọi Elasticsearch với `verify=False`.
+- Với Linux inference, nên giữ `RED_DISABLE_INTELEX=1` để tránh lỗi portable khi model SVM chạy trên CPU khác.
+- Nếu chạy trên máy khác lab, kiểm tra lại:
+  - `ES_AUTH_HOST`, `ES_HOST`, user/password Elasticsearch.
+  - `rules_dir` và `sigma_rules_dirs` trong `config/*.yaml`.
+  - model path trong `config/*.yaml`.
+  - `VR_API_CONFIG` và `agent/vr_client_map.yaml`.
+  - index pattern Windows/Linux có đúng với data stream thật không.
+
+## Kiểm Tra Nhanh
+
+Kiểm tra model/rules có đủ:
+
+```bash
+ls models/process_creation/train_rslt_ensemble_portable.zip
+ls models/powershell/train_rslt_ensemble_portable.zip
+ls models/registry_event/train_rslt_ensemble_portable.zip
+ls models/linux_atomic/train_rslt_ensemble_atomic_portable.zip
+find data/sigma/rules -name "*.yml" | wc -l
+```
+
+Kiểm tra decode engine:
+
+```bash
+python3 -m red.stage2_live
+```
 
 ## Ghi Chú An Toàn
 
-- Chỉ chạy các script demo trong lab hoặc VM đã chuẩn bị.
-- Không dùng `export_evasion_scripts.py --mode execute` ngoài môi trường kiểm thử.
-- AI Agent chỉ đề xuất containment; các action có tác động thật vẫn cần phê duyệt của người vận hành.
+RED và các thành phần Velociraptor trong repo này dành cho môi trường lab/demo phòng thủ. Chỉ chạy detector, agent và forensic collection trên hệ thống mà bạn có quyền giám sát.
